@@ -26,10 +26,12 @@ def start():
         logger.info("定时调度已关闭 (SCHEDULE_ENABLED=false)")
         return
     _scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
+    seen: set[str] = set()
     for time_str in settings.schedule_times.split(","):
         time_str = time_str.strip()
-        if not time_str:
+        if not time_str or time_str in seen:
             continue
+        seen.add(time_str)
         hour, minute = time_str.split(":")
         _scheduler.add_job(_job, CronTrigger(day_of_week="mon-fri",
                                              hour=int(hour), minute=int(minute)),
