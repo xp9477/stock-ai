@@ -5,7 +5,7 @@ from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..data import market
-from ..models import EquitySnapshot, Position
+from ..models import EquitySnapshot, Order, Position
 from . import broker
 
 logger = logging.getLogger(__name__)
@@ -88,7 +88,12 @@ def execute_decision(db: Session, run_id: int | None, code: str, name: str,
     if action == "buy":
         delta = target_value - current_value
         if delta < price * 100:
-            return None
+            order = Order(run_id=run_id, code=code, name=name, side="buy",
+                          price=price, qty=0, amount=0, fee=0, status="rejected",
+                          reject_reason=f"目标加仓金额 {delta:.0f} 元不足一手({price * 100:.0f} 元)")
+            db.add(order)
+            db.commit()
+            return broker.FillResult(False, order, order.reject_reason)
         return broker.buy(db, run_id, code, name, price, pct_change, delta)
 
     if action == "sell":
