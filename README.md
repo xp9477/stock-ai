@@ -90,5 +90,4 @@ cd backend && .venv/bin/pytest tests/ -v
 
 ## 维护者说明
 
-- CI: `.github/workflows/docker.yml`,push 到 main 自动构建并推送 `latest` 与 `sha-<commit>` 双 tag 到 GHCR。
-- 首次 CI 运行后,镜像包默认私有:到 GitHub → Packages → `stock-ai` → Package settings → Change visibility 设为 Public,他人才能免登录拉取。
+- CI: `.github/workflows/docker.yml`,push 到 main 自动构建 amd64 镜像并推送 `latest` 与 `sha-<commit>` 双 tag 到 GHCR(包已继承仓库公开可见性,可匿名拉取)。
