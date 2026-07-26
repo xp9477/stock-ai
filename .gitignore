@@ -4,7 +4,7 @@ __pycache__/
 backend/.env
 backend/*.db
 .env
-data/
+/data/
 node_modules/
 frontend/dist/
 .pytest_cache/
