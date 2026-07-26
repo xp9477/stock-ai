@@ -1,0 +1,13 @@
+services:
+  stock-ai:
+    image: ghcr.io/xp9477/stock-ai:latest
+    container_name: stock-ai
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
