@@ -7,11 +7,12 @@
         <el-menu-item index="/runs">决策记录</el-menu-item>
         <el-menu-item index="/watchlist">股池管理</el-menu-item>
         <el-menu-item index="/orders">交易记录</el-menu-item>
+        <el-menu-item index="/models">模型管理</el-menu-item>
       </el-menu>
       <div class="actions">
         <el-tag v-if="status.running" type="warning" effect="dark">决策进行中…</el-tag>
         <el-tag v-else-if="status.schedule_enabled" type="success">
-          调度中 · 下次 {{ status.next_run || '-' }}
+          {{ status.schedule_times }} · 下次决策 {{ status.next_run || '-' }}
         </el-tag>
         <el-tag v-else type="info">调度已关闭</el-tag>
         <el-button type="primary" :loading="triggering" :disabled="status.running" @click="trigger">

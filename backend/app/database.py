@@ -27,3 +27,11 @@ def init_db():
     from . import models  # noqa: F401
 
     Base.metadata.create_all(engine)
+
+    from .seed import seed_models
+
+    db = SessionLocal()
+    try:
+        seed_models(db)
+    finally:
+        db.close()

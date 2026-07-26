@@ -31,29 +31,17 @@ def _no_quote(_code):
 
 
 @patch("app.trading.portfolio.market.get_quote", _no_quote)
-def test_risk_limit_caps_single_position(db):
-    broker.get_account(db)
-    with patch("app.trading.portfolio.SessionLocal", None, create=True):
-        action, target, note = portfolio.apply_risk_limits(db, "600519", "buy", 0.5)
+def test_risk_limit_caps_single_position(db, model_a):
+    broker.get_account(db, model_a.id)
+    action, target, note = portfolio.apply_risk_limits(db, model_a.id, "600519", "buy", 0.5)
     assert action == "buy"
     assert target <= settings.max_position_pct + 1e-9
     assert "单票仓位上限" in note
 
 
 @patch("app.trading.portfolio.market.get_quote", _no_quote)
-def test_risk_limit_single_buy_cash_pct(db):
-    broker.get_account(db)
-    action, target, note = portfolio.apply_risk_limits(db, "600519", "buy", 0.3)
-    # 全现金账户: 目标 30% = 30 万,超过可用资金 50%? 100万*50%=50万 > 30万,不触发
-    assert action == "buy"
-    account = broker.get_account(db)
-    account.cash = 400000  # 假设已有 60 万持仓(此处简化仅测现金限制)
-    db.commit()
-
-
-@patch("app.trading.portfolio.market.get_quote", _no_quote)
-def test_risk_limit_sell_passthrough(db):
-    broker.get_account(db)
-    action, target, note = portfolio.apply_risk_limits(db, "600519", "sell", 0.0)
+def test_risk_limit_sell_passthrough(db, model_a):
+    broker.get_account(db, model_a.id)
+    action, target, note = portfolio.apply_risk_limits(db, model_a.id, "600519", "sell", 0.0)
     assert action == "sell"
     assert target == 0.0

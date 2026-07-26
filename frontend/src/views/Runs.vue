@@ -19,9 +19,9 @@
       </el-table-column>
       <el-table-column label="决策摘要">
         <template #default="{ row }">
-          <el-tag v-for="item in row.summary" :key="item.code" size="small" class="mr"
+          <el-tag v-for="(item, i) in row.summary" :key="i" size="small" class="mr"
             :type="actionType(item.action)">
-            {{ item.name }} {{ actionText(item.action) }}
+            {{ item.model }}·{{ item.name }} {{ actionText(item.action) }}
           </el-tag>
         </template>
       </el-table-column>

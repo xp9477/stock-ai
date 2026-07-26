@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
 from app import models  # noqa: F401
+from app.models import Model
 
 
 @pytest.fixture()
@@ -20,3 +21,27 @@ def db():
     session = Session()
     yield session
     session.close()
+
+
+@pytest.fixture()
+def model_a(db):
+    model = Model(name="模型A", model_id="model-a", type="llm")
+    db.add(model)
+    db.commit()
+    return model
+
+
+@pytest.fixture()
+def model_b(db):
+    model = Model(name="模型B", model_id="model-b", type="llm")
+    db.add(model)
+    db.commit()
+    return model
+
+
+@pytest.fixture()
+def model_c(db):
+    model = Model(name="模型C", model_id="model-c", type="llm")
+    db.add(model)
+    db.commit()
+    return model

@@ -20,13 +20,13 @@ def get_client() -> OpenAI:
     return _client
 
 
-def chat(system: str, user: str, retries: int = 2) -> str:
-    """调用 LLM,失败重试 retries 次,最终失败抛出异常。"""
+def chat(system: str, user: str, model: str, retries: int = 2) -> str:
+    """调用指定模型,失败重试 retries 次,最终失败抛出异常。"""
     last_err: Exception | None = None
     for attempt in range(retries + 1):
         try:
             resp = get_client().chat.completions.create(
-                model=settings.llm_model,
+                model=model,
                 temperature=settings.llm_temperature,
                 messages=[
                     {"role": "system", "content": system},

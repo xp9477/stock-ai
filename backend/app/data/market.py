@@ -108,6 +108,36 @@ def get_news(code: str) -> list[dict]:
 
 
 @ttl_cache(1800)
+def get_index_daily(symbol: str) -> pd.DataFrame:
+    """指数日线(新浪),symbol 如 sh000001 / sh000300。"""
+    df = ak.stock_zh_index_daily(symbol=symbol)
+    df = df.rename(columns={"date": "日期", "open": "开盘", "close": "收盘",
+                            "high": "最高", "low": "最低", "volume": "成交量"})
+    df["日期"] = df["日期"].astype(str)
+    close = df["收盘"].astype(float)
+    df["涨跌幅"] = (close.pct_change() * 100).round(2)
+    return df
+
+
+def market_overview_text() -> str:
+    """大盘环境文本:上证指数 + 沪深300 近 30 日概览,供市场环境分析师。"""
+    lines = []
+    for symbol, label in (("sh000001", "上证指数"), ("sh000300", "沪深300")):
+        df = get_index_daily(symbol).tail(30)
+        last = df.iloc[-1]
+        chg_5 = (float(last["收盘"]) / float(df.iloc[-6]["收盘"]) - 1) * 100 if len(df) >= 6 else 0
+        chg_20 = (float(last["收盘"]) / float(df.iloc[-21]["收盘"]) - 1) * 100 if len(df) >= 21 else 0
+        lines.append(
+            f"【{label}】最新收盘 {last['收盘']}({last['日期']}),"
+            f"当日涨跌 {last['涨跌幅']}%,近5日 {chg_5:+.2f}%,近20日 {chg_20:+.2f}%")
+        lines.append(f"近30日收盘序列(日期,收盘,涨跌幅%):")
+        for _, row in df.iterrows():
+            lines.append(f"{row['日期']}, {row['收盘']}, {row['涨跌幅']}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@ttl_cache(1800)
 def get_hs300_history() -> pd.DataFrame:
     """沪深300 指数日线(新浪),列名对齐东财风格。"""
     df = ak.stock_zh_index_daily(symbol="sh000300")

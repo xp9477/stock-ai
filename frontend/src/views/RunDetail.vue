@@ -3,40 +3,57 @@
     <el-page-header @back="$router.push('/runs')" :content="`决策详情 #${$route.params.id}`" class="mb" />
     <el-alert v-if="detail.error" type="error" :title="detail.error" class="mb" />
 
-    <el-card v-for="stock in detail.stocks || []" :key="stock.code" class="mb">
-      <template #header>
-        <div class="stock-header">
-          <span class="stock-title">{{ stock.name || '' }} ({{ stock.code }})</span>
-          <template v-if="stock.decision">
-            <el-tag :type="actionType(stock.decision.action)" effect="dark">
-              {{ actionText(stock.decision.action) }}
-              <template v-if="stock.decision.action !== 'hold'">
-                → 目标仓位 {{ (stock.decision.target_position_pct * 100).toFixed(1) }}%
+    <el-tabs v-model="activeModel" type="border-card" v-if="(detail.models || []).length">
+      <el-tab-pane v-for="slot in detail.models" :key="slot.model_pk"
+        :label="slot.model" :name="String(slot.model_pk)">
+        <el-collapse v-if="slot.market_report || slot.reflection" class="mb">
+          <el-collapse-item v-if="slot.market_report" name="market">
+            <template #title><b>🌐 大盘环境报告</b></template>
+            <div class="markdown" v-html="render(slot.market_report)" />
+          </el-collapse-item>
+          <el-collapse-item v-if="slot.reflection" name="reflect">
+            <template #title><b>🪞 本轮反思</b></template>
+            <div class="markdown" v-html="render(slot.reflection)" />
+          </el-collapse-item>
+        </el-collapse>
+
+        <el-card v-for="stock in slot.stocks" :key="stock.code" class="mb">
+          <template #header>
+            <div class="stock-header">
+              <span class="stock-title">{{ stock.name || '' }} ({{ stock.code }})</span>
+              <template v-if="stock.decision">
+                <el-tag :type="actionType(stock.decision.action)" effect="dark">
+                  {{ actionText(stock.decision.action) }}
+                  <template v-if="stock.decision.action !== 'hold'">
+                    → 目标仓位 {{ (stock.decision.target_position_pct * 100).toFixed(1) }}%
+                  </template>
+                </el-tag>
+                <span class="confidence">信心 {{ (stock.decision.confidence * 100).toFixed(0) }}%</span>
               </template>
-            </el-tag>
-            <span class="confidence">信心 {{ (stock.decision.confidence * 100).toFixed(0) }}%</span>
+            </div>
           </template>
-        </div>
-      </template>
 
-      <el-alert v-if="stock.decision?.error" type="error" :title="'分析失败: ' + stock.decision.error"
-        :closable="false" class="mb" />
-      <el-alert v-else-if="stock.decision" type="info" :title="stock.decision.reason" :closable="false" class="mb" />
+          <el-alert v-if="stock.decision?.error" type="error"
+            :title="'分析失败: ' + stock.decision.error" :closable="false" class="mb" />
+          <el-alert v-else-if="stock.decision" type="info" :title="stock.decision.reason"
+            :closable="false" class="mb" />
 
-      <el-collapse>
-        <el-collapse-item v-for="agent in stock.agents" :key="agent.agent" :name="agent.agent">
-          <template #title>
-            <b>{{ agentName(agent.agent) }}</b>
-            <span class="time">{{ agent.created_at }}</span>
-          </template>
-          <div class="markdown" v-html="render(agent.output)" />
-          <el-divider v-if="agent.input_summary" content-position="left">输入摘要</el-divider>
-          <pre v-if="agent.input_summary" class="input-summary">{{ agent.input_summary }}</pre>
-        </el-collapse-item>
-      </el-collapse>
-    </el-card>
+          <el-collapse>
+            <el-collapse-item v-for="agent in stock.agents" :key="agent.agent" :name="agent.agent">
+              <template #title>
+                <b>{{ agentName(agent.agent) }}</b>
+                <span class="time">{{ agent.created_at }}</span>
+              </template>
+              <div class="markdown" v-html="render(agent.output)" />
+              <el-divider v-if="agent.input_summary" content-position="left">输入摘要</el-divider>
+              <pre v-if="agent.input_summary" class="input-summary">{{ agent.input_summary }}</pre>
+            </el-collapse-item>
+          </el-collapse>
+        </el-card>
+      </el-tab-pane>
+    </el-tabs>
 
-    <el-empty v-if="!loading && !(detail.stocks || []).length" description="该轮无分析数据" />
+    <el-empty v-if="!loading && !(detail.models || []).length" description="该轮无分析数据" />
   </div>
 </template>
 
@@ -50,6 +67,7 @@ import api from '../api/index.js'
 const route = useRoute()
 const detail = ref({})
 const loading = ref(true)
+const activeModel = ref('')
 
 const AGENT_NAMES = {
   technical: '🔍 技术分析师', fundamental: '📊 基本面分析师', news: '📰 新闻情绪分析师',
@@ -65,6 +83,9 @@ const render = (text) => marked.parse(text || '')
 onMounted(async () => {
   try {
     detail.value = await api.getRunDetail(route.params.id)
+    if ((detail.value.models || []).length) {
+      activeModel.value = String(detail.value.models[0].model_pk)
+    }
   } catch (err) {
     ElMessage.error(err.message)
   } finally {

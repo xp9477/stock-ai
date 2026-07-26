@@ -6,13 +6,18 @@ class Settings(BaseSettings):
 
     llm_base_url: str = "https://api.deepseek.com"
     llm_api_key: str = ""
-    llm_model: str = "deepseek-chat"
     llm_temperature: float = 0.7
 
     initial_cash: float = 1_000_000.0
 
     schedule_enabled: bool = True
-    schedule_times: str = "10:00,11:00,13:30,14:30"
+    daily_decision_time: str = "14:35"
+    monitor_interval_minutes: int = 15
+
+    # 盘中复审阈值
+    take_profit_review_pct: float = 0.15
+    stop_loss_review_pct: float = -0.08
+    deep_loss_pct: float = -0.15
 
     db_path: str = "stock_ai.db"
 
