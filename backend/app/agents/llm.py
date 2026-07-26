@@ -25,12 +25,13 @@ def chat(system: str, user: str, model: str, retries: int = 2) -> str:
     last_err: Exception | None = None
     for attempt in range(retries + 1):
         try:
+            # 指令并入 user 消息:部分中转端点会丢弃/覆盖 system 消息
             resp = get_client().chat.completions.create(
                 model=model,
                 temperature=settings.llm_temperature,
                 messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
+                    {"role": "user",
+                     "content": f"【你的角色与任务】\n{system}\n\n【输入材料】\n{user}"},
                 ],
             )
             return resp.choices[0].message.content or ""
