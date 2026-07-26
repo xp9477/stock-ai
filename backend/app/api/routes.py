@@ -103,9 +103,12 @@ def reset_account(db: Session = Depends(get_db)):
     db.query(Decision).delete()
     db.query(AgentOutput).delete()
     db.query(Run).delete()
+    from ..config import settings
+
     account = db.query(Account).first()
     if account:
-        account.cash = account.initial_cash
+        account.cash = settings.initial_cash
+        account.initial_cash = settings.initial_cash
     db.commit()
     return {"ok": True}
 
