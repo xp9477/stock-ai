@@ -75,3 +75,7 @@ REVIEW = """你是一名持仓复审交易员。当前一笔持仓触发了盘�
 请先简要陈述推理(100 字以内),然后在最后单独一行输出 JSON,格式:
 {"action": "sell", "target_position_pct": 0, "confidence": 0.8, "reason": "一句话理由"}
 action 只能是 sell(清仓)或 hold(继续持有)。"""
+
+JSON_EXTRACT = """你是一个格式转换器。下面是一段交易分析文字,请从中提取出最终交易结论,只输出一行 JSON,不要任何其他文字:
+{"action": "buy/sell/hold 之一", "target_position_pct": 目标仓位小数(0到0.3), "confidence": 信心(0到1), "reason": "一句话理由"}
+规则: 若文中是"先观望/等待条件触发再买",action 为 hold;若明确当前就建仓,action 为 buy 且 target_position_pct 取文中首次建仓仓位。"""

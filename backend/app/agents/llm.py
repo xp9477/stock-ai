@@ -42,14 +42,33 @@ def chat(system: str, user: str, model: str, retries: int = 2) -> str:
     raise RuntimeError(f"LLM 调用失败: {last_err}")
 
 
+def decide_with_fallback(output: str, model: str) -> dict | None:
+    """解析决策 JSON;失败时追加一次轻量调用让模型提取结论。"""
+    decision = parse_decision_json(output)
+    if decision is not None:
+        return decision
+    from . import prompts
+
+    try:
+        extracted = chat(prompts.JSON_EXTRACT, output[-3000:], model, retries=1)
+        return parse_decision_json(extracted)
+    except Exception as err:  # noqa: BLE001
+        logger.warning("JSON 提取兜底失败: %s", err)
+        return None
+
+
 def parse_decision_json(text: str) -> dict | None:
     """从 LLM 输出中提取决策 JSON,失败返回 None。"""
-    match = re.search(r"\{[^{}]*\}", text, re.DOTALL)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError:
+    data = None
+    for raw in reversed(re.findall(r"\{[^{}]*\}", text, re.DOTALL)):
+        try:
+            candidate = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and "action" in candidate:
+            data = candidate
+            break
+    if data is None:
         return None
     action = str(data.get("action", "")).lower()
     if action not in ("buy", "sell", "hold"):

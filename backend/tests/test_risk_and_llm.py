@@ -45,3 +45,23 @@ def test_risk_limit_sell_passthrough(db, model_a):
     action, target, note = portfolio.apply_risk_limits(db, model_a.id, "600519", "sell", 0.0)
     assert action == "sell"
     assert target == 0.0
+
+
+def test_parse_decision_json_picks_last_valid_object():
+    text = ('表格数据 {"col": 1} 中间还有 {"foo": "bar"}\n'
+            '最终 {"action": "buy", "target_position_pct": 0.2, "confidence": 0.6, "reason": "ok"}')
+    result = llm.parse_decision_json(text)
+    assert result["action"] == "buy"
+    assert result["target_position_pct"] == 0.2
+
+
+def test_decide_with_fallback_uses_extractor():
+    with patch("app.agents.llm.chat",
+               return_value='{"action": "hold", "target_position_pct": 0, "confidence": 0.5, "reason": "观望"}'):
+        result = llm.decide_with_fallback("长篇分析,没有 JSON 结论", "test-model")
+    assert result["action"] == "hold"
+
+
+def test_decide_with_fallback_gives_up_gracefully():
+    with patch("app.agents.llm.chat", side_effect=RuntimeError("LLM down")):
+        assert llm.decide_with_fallback("没有 JSON", "test-model") is None

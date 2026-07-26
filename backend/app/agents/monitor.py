@@ -81,7 +81,7 @@ def review_position(db: Session, pos: Position, price: float, pct_change: float,
         try:
             output = llm.chat(prompts.REVIEW, review_input, model_id, retries=1)
             detail = output
-            decision = llm.parse_decision_json(output)
+            decision = llm.decide_with_fallback(output, model_id)
         except Exception as err:  # noqa: BLE001
             detail = f"复审 LLM 调用失败: {err}"
     else:

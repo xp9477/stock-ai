@@ -144,7 +144,7 @@ def analyze_stock(db: Session, run_id: int, model: Model, code: str, name: str,
     )
     trader_output = llm.chat(prompts.TRADER, trader_input, model_id)
     _save_output(db, run_id, model.id, code, "trader", position_ctx, trader_output)
-    trader_decision = llm.parse_decision_json(trader_output)
+    trader_decision = llm.decide_with_fallback(trader_output, model_id)
     if trader_decision is None:
         trader_decision = {"action": "hold", "target_position_pct": 0.0,
                            "confidence": 0.0, "reason": "交易员输出解析失败,降级为持有"}
@@ -155,7 +155,7 @@ def analyze_stock(db: Session, run_id: int, model: Model, code: str, name: str,
     )
     risk_output = llm.chat(prompts.RISK, risk_input, model_id)
     _save_output(db, run_id, model.id, code, "risk", "审核交易员决策", risk_output)
-    final = llm.parse_decision_json(risk_output)
+    final = llm.decide_with_fallback(risk_output, model_id)
     if final is None:
         final = trader_decision
 
