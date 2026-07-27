@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     daily_decision_time: str = "14:35"
     monitor_interval_minutes: int = 15
 
+    # 自动选股
+    stock_select_enabled: bool = True
+    stock_select_time: str = "14:05"
+    pool_max: int = 8
+
     # 盘中复审阈值
     take_profit_review_pct: float = 0.15
     stop_loss_review_pct: float = -0.08

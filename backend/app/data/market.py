@@ -173,3 +173,57 @@ def validate_code(code: str) -> dict | None:
     if "ST" in quote["name"].upper():
         return None
     return quote
+
+
+# ---------- 自动选股 ----------
+
+# 初筛阈值常量
+SCREEN_MIN_PRICE = 3.0
+SCREEN_MAX_PRICE = 100.0
+SCREEN_MIN_TURNOVER = 2e8       # 成交额 ≥ 2 亿
+SCREEN_MIN_PCT = -3.0           # 当日涨跌幅下限(避免接飞刀)
+SCREEN_MAX_PCT = 7.0            # 当日涨跌幅上限(避免追涨停)
+SCREEN_TOP_N = 30
+
+
+@ttl_cache(600)
+def get_market_snapshot() -> pd.DataFrame:
+    """全市场实时快照(新浪),约 5000+ 只,耗时 ~20s,缓存 10 分钟。"""
+    return ak.stock_zh_a_spot()
+
+
+def screen_candidates(exclude_codes: set[str] | None = None,
+                      snapshot: pd.DataFrame | None = None) -> list[dict]:
+    """规则初筛候选股:普通沪深 A 股、非 ST、价格/流动性/涨跌幅过滤,
+    按成交额降序取前 SCREEN_TOP_N。"""
+    exclude_codes = exclude_codes or set()
+    df = snapshot if snapshot is not None else get_market_snapshot()
+    out = []
+    for _, row in df.iterrows():
+        symbol = str(row["代码"])  # 如 sh600519 / bj920000
+        code = symbol[-6:]
+        if not symbol.startswith(("sh", "sz")):
+            continue
+        if not code.startswith(("60", "00", "30", "68")):
+            continue
+        if code in exclude_codes:
+            continue
+        name = str(row["名称"])
+        if "ST" in name.upper() or "退" in name:
+            continue
+        try:
+            price = float(row["最新价"])
+            pct = float(row["涨跌幅"])
+            turnover = float(row["成交额"])
+        except (TypeError, ValueError):
+            continue
+        if not (SCREEN_MIN_PRICE <= price <= SCREEN_MAX_PRICE):
+            continue
+        if turnover < SCREEN_MIN_TURNOVER:
+            continue
+        if not (SCREEN_MIN_PCT <= pct <= SCREEN_MAX_PCT):
+            continue
+        out.append({"code": code, "name": name, "price": price,
+                    "pct_change": pct, "turnover": turnover})
+    out.sort(key=lambda x: x["turnover"], reverse=True)
+    return out[:SCREEN_TOP_N]

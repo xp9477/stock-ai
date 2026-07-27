@@ -153,6 +153,8 @@ def list_watchlist(db: Session = Depends(get_db)):
             pass
         items.append({
             "id": item.id, "code": item.code, "name": item.name,
+            "source": item.source, "miss_count": item.miss_count,
+            "select_reason": item.select_reason,
             "price": quote["price"] if quote else None,
             "pct_change": quote["pct_change"] if quote else None,
         })
@@ -174,6 +176,19 @@ def add_watchlist(body: WatchlistAdd, db: Session = Depends(get_db)):
     db.add(item)
     db.commit()
     return {"id": item.id, "code": code, "name": quote["name"]}
+
+
+@router.post("/watchlist/auto-select")
+def trigger_auto_select(background: BackgroundTasks, db: Session = Depends(get_db)):
+    from ..agents import selector as selector_mod
+    from ..agents import engine as engine_mod
+
+    if selector_mod._select_lock or engine_mod._run_lock:
+        raise HTTPException(409, "决策或选股流程正在运行,请稍后")
+    if not db.query(Model).filter(Model.enabled.is_(True), Model.type == "llm").first():
+        raise HTTPException(400, "无启用的 LLM 模型")
+    background.add_task(selector_mod.run_selector, "manual")
+    return {"ok": True, "message": "自动选股已启动"}
 
 
 @router.delete("/watchlist/{code}")
@@ -316,11 +331,14 @@ def run_detail(run_id: int, db: Session = Depends(get_db)):
     for out in outputs:
         slot = by_model.setdefault(out.model_pk, {
             "model_pk": out.model_pk, "model": models.get(out.model_pk, "?"),
-            "market_report": None, "reflection": None, "stocks": {}})
+            "market_report": None, "reflection": None, "selector_report": None,
+            "stocks": {}})
         if out.code == "MARKET":
             slot["market_report"] = out.output
         elif out.code == "REFLECT":
             slot["reflection"] = out.output
+        elif out.code == "SELECT":
+            slot["selector_report"] = out.output
         else:
             stock = slot["stocks"].setdefault(out.code, {"code": out.code,
                                                          "agents": [], "decision": None})
@@ -332,7 +350,8 @@ def run_detail(run_id: int, db: Session = Depends(get_db)):
     for dec in decisions:
         slot = by_model.setdefault(dec.model_pk, {
             "model_pk": dec.model_pk, "model": models.get(dec.model_pk, "?"),
-            "market_report": None, "reflection": None, "stocks": {}})
+            "market_report": None, "reflection": None, "selector_report": None,
+            "stocks": {}})
         stock = slot["stocks"].setdefault(dec.code, {"code": dec.code,
                                                      "agents": [], "decision": None})
         stock["name"] = dec.name

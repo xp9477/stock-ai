@@ -3,10 +3,14 @@
     <el-page-header @back="$router.push('/runs')" :content="`决策详情 #${$route.params.id}`" class="mb" />
     <el-alert v-if="detail.error" type="error" :title="detail.error" class="mb" />
 
-    <el-tabs v-model="activeModel" type="border-card" v-if="(detail.models || []).length">
+    <el-tabs v-model="activeModel" :type="isMobile ? '' : 'border-card'" v-if="(detail.models || []).length">
       <el-tab-pane v-for="slot in detail.models" :key="slot.model_pk"
         :label="slot.model" :name="String(slot.model_pk)">
-        <el-collapse v-if="slot.market_report || slot.reflection" class="mb">
+        <el-collapse v-if="slot.market_report || slot.reflection || slot.selector_report" class="mb">
+          <el-collapse-item v-if="slot.selector_report" name="selector">
+            <template #title><b>🎯 AI 选股报告</b></template>
+            <div class="markdown" v-html="render(slot.selector_report)" />
+          </el-collapse-item>
           <el-collapse-item v-if="slot.market_report" name="market">
             <template #title><b>🌐 大盘环境报告</b></template>
             <div class="markdown" v-html="render(slot.market_report)" />
@@ -63,7 +67,9 @@ import { useRoute } from 'vue-router'
 import { marked } from 'marked'
 import { ElMessage } from 'element-plus'
 import api from '../api/index.js'
+import { useIsMobile } from '../composables/useIsMobile.js'
 
+const { isMobile } = useIsMobile()
 const route = useRoute()
 const detail = ref({})
 const loading = ref(true)
@@ -96,11 +102,13 @@ onMounted(async () => {
 
 <style scoped>
 .mb { margin-bottom: 16px; }
-.stock-header { display: flex; align-items: center; gap: 12px; }
+.stock-header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .stock-title { font-size: 16px; font-weight: 700; }
 .confidence { color: #909399; font-size: 13px; }
 .time { margin-left: 12px; color: #c0c4cc; font-size: 12px; }
-.markdown { line-height: 1.7; }
+.markdown { line-height: 1.7; overflow-x: auto; }
+.markdown :deep(table) { display: block; overflow-x: auto; max-width: 100%; border-collapse: collapse; }
+.markdown :deep(th), .markdown :deep(td) { border: 1px solid #e4e7ed; padding: 4px 8px; }
 .input-summary { background: #f5f7fa; padding: 12px; border-radius: 4px; font-size: 12px;
-  white-space: pre-wrap; max-height: 300px; overflow-y: auto; color: #606266; }
+  white-space: pre-wrap; overflow-x: auto; max-height: 300px; overflow-y: auto; color: #606266; }
 </style>

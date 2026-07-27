@@ -5,7 +5,7 @@ from datetime import datetime, time as dtime
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from .agents import engine, monitor
+from .agents import engine, monitor, selector
 from .config import settings
 from .data import market
 
@@ -22,6 +22,13 @@ def _decision_job():
         logger.info("今日非交易日,跳过每日决策")
         return
     engine.run_pipeline(trigger="schedule")
+
+
+def _selector_job():
+    if not market.is_trade_date():
+        logger.info("今日非交易日,跳过自动选股")
+        return
+    selector.run_selector(trigger="schedule")
 
 
 def _monitor_job():
@@ -50,14 +57,23 @@ def start():
                        CronTrigger(day_of_week="mon-fri", hour=int(hour), minute=int(minute)),
                        id="daily_decision", max_instances=1, coalesce=True)
 
+    if settings.stock_select_enabled:
+        sel_hour, sel_minute = settings.stock_select_time.strip().split(":")
+        _scheduler.add_job(_selector_job,
+                           CronTrigger(day_of_week="mon-fri",
+                                       hour=int(sel_hour), minute=int(sel_minute)),
+                           id="stock_select", max_instances=1, coalesce=True)
+
     _scheduler.add_job(_monitor_job,
                        CronTrigger(day_of_week="mon-fri", hour="9-14",
                                    minute=f"*/{settings.monitor_interval_minutes}"),
                        id="monitor", max_instances=1, coalesce=True)
 
     _scheduler.start()
-    logger.info("调度器已启动: 每日决策 %s, 盘中监控每 %d 分钟",
-                settings.daily_decision_time, settings.monitor_interval_minutes)
+    logger.info("调度器已启动: 每日决策 %s, 自动选股 %s, 盘中监控每 %d 分钟",
+                settings.daily_decision_time,
+                settings.stock_select_time if settings.stock_select_enabled else "关闭",
+                settings.monitor_interval_minutes)
 
 
 def shutdown():

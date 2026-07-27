@@ -30,6 +30,9 @@ class Watchlist(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     code: Mapped[str] = mapped_column(String(10), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(50))
+    source: Mapped[str] = mapped_column(String(10), default="manual")  # manual / auto
+    miss_count: Mapped[int] = mapped_column(Integer, default=0)  # 连续未被 AI 看好次数
+    select_reason: Mapped[str] = mapped_column(Text, default="")  # AI 选入理由
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 

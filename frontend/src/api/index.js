@@ -22,6 +22,7 @@ export default {
   getWatchlist: () => client.get('/watchlist'),
   addWatchlist: (code) => client.post('/watchlist', { code }),
   removeWatchlist: (code) => client.delete(`/watchlist/${code}`),
+  autoSelect: () => client.post('/watchlist/auto-select'),
   triggerRun: () => client.post('/runs/trigger'),
   getRuns: () => client.get('/runs'),
   getRunDetail: (id) => client.get(`/runs/${id}`),
