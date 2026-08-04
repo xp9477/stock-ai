@@ -151,3 +151,55 @@ class MonitorEvent(Base):
     action: Mapped[str] = mapped_column(String(15))  # review_hold / review_sell / alert
     detail: Mapped[str] = mapped_column(Text, default="")  # 复审推理全文
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class TradeLedger(Base):
+    """决策账本：信号 → 成交 → 平仓后回填，用于 100 笔样本与置信度校准。"""
+
+    __tablename__ = "trade_ledger"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    strategy_key: Mapped[str] = mapped_column(String(40), index=True)  # llm:1 / ensemble:3 / rule:s2
+    model_pk: Mapped[int | None] = mapped_column(ForeignKey("models.id"), nullable=True, index=True)
+    code: Mapped[str] = mapped_column(String(10), index=True)
+    name: Mapped[str] = mapped_column(String(50), default="")
+    side: Mapped[str] = mapped_column(String(4))  # open / close
+    qty: Mapped[int] = mapped_column(Integer, default=0)
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    signal_source: Mapped[str] = mapped_column(String(30), default="")  # trader / factor / deep_loss
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    factsheet_hash: Mapped[str] = mapped_column(String(64), default="")
+    order_id: Mapped[int | None] = mapped_column(ForeignKey("orders.id"), nullable=True)
+    # 平仓回填
+    is_closed: Mapped[bool] = mapped_column(Boolean, default=False)
+    pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    pnl_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    hold_days: Mapped[int] = mapped_column(Integer, default=0)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class PoolVersion(Base):
+    """共享股池版本快照，变更打版本号，避免赛中偷换宇宙。"""
+
+    __tablename__ = "pool_versions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    version: Mapped[str] = mapped_column(String(30), unique=True)  # e.g. pool_v1
+    codes_json: Mapped[str] = mapped_column(Text, default="[]")
+    note: Mapped[str] = mapped_column(String(200), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class SettingOverride(Base):
+    """用户覆盖的运行时配置（默认值在 settings_registry）。"""
+
+    __tablename__ = "setting_overrides"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+

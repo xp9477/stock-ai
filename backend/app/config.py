@@ -14,17 +14,35 @@ class Settings(BaseSettings):
     daily_decision_time: str = "14:35"
     monitor_interval_minutes: int = 15
 
-    # 自动选股
+    # 自动选股 / 共享股池（赛马宇宙上限 30）
     stock_select_enabled: bool = True
     stock_select_time: str = "14:05"
-    pool_max: int = 8
+    pool_max: int = 30
 
-    # 盘中复审阈值
+    # 盘中：浅线仅告警，深亏强制自动砍（分层 3）
     take_profit_review_pct: float = 0.15
     stop_loss_review_pct: float = -0.08
     deep_loss_pct: float = -0.15
+    deep_loss_auto_execute: bool = True
+    shallow_line_alert_only: bool = True
 
     db_path: str = "stock_ai.db"
+
+    # 行情/财务主源：同花顺扶摇（唯一；不够再用 Tushare，不做免费源降级）
+    fuyao_api_key: str = ""
+    # 可选备份，默认不用
+    tushare_token: str = ""
+
+    # S2 因子组合：周频再平衡，综合分前 N 等权
+    factor_rebalance: str = "W-MON"  # pandas 周频锚到周一
+    factor_top_n: int = 10
+    factor_lookback_short: int = 5
+    factor_lookback_mid: int = 20
+    factor_vol_window: int = 20
+
+    # 赛马验收门槛
+    race_min_trade_days: int = 60
+    race_min_closed_trades: int = 100
 
     # 硬性风控参数
     max_position_pct: float = 0.30      # 单票市值不超过总资产 30%

@@ -116,6 +116,13 @@ FAKE_CANDIDATES = [
 
 
 def run_selector_with(db, chat_return, pool_max=8):
+    from app.settings_registry import REGISTRY
+
+    def _get(key, _db=None):
+        if key == "selector.pool_max":
+            return pool_max
+        return REGISTRY[key].default
+
     session_factory = lambda: db  # noqa: E731
     with patch("app.database.SessionLocal", session_factory), \
          patch("app.agents.selector.market.screen_candidates",
@@ -123,7 +130,7 @@ def run_selector_with(db, chat_return, pool_max=8):
          patch("app.agents.selector.market.market_overview_text",
                return_value="大盘中性"), \
          patch("app.agents.selector.llm.chat", side_effect=chat_return), \
-         patch.object(selector.settings, "pool_max", pool_max):
+         patch("app.agents.selector.get_setting", side_effect=_get):
         real_close = db.close
         db.close = lambda: None  # 防止 job 关闭共享测试 session
         try:

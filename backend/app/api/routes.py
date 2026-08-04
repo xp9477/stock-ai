@@ -125,6 +125,8 @@ def leaderboard(db: Session = Depends(get_db)):
         positions = db.query(Position).filter(Position.model_pk == model.id).count()
         rows.append({
             "id": model.id, "name": model.name, "type": model.type,
+            "model_id": model.model_id,
+            "lane": "rule" if model.type == "rule" else "ai",
             "total_equity": eq["total_equity"],
             "pnl": round(eq["total_equity"] - eq["initial_cash"], 2),
             "pnl_pct": round((eq["total_equity"] / eq["initial_cash"] - 1) * 100, 2)
@@ -239,8 +241,10 @@ def get_portfolio(model_pk: int, db: Session = Depends(get_db)):
 @router.post("/account/reset")
 def reset_account(db: Session = Depends(get_db)):
     """重置所有账户与全部记录。"""
+    from ..models import TradeLedger
+
     for table in (Position, Order, EquitySnapshot, Decision, AgentOutput,
-                  Reflection, MonitorEvent, Run):
+                  Reflection, MonitorEvent, TradeLedger, Run):
         db.query(table).delete()
     for account in db.query(Account).all():
         account.cash = settings.initial_cash
@@ -409,10 +413,276 @@ def list_monitor_events(db: Session = Depends(get_db)):
 @router.get("/status")
 def status():
     from .. import scheduler
+    from ..runtime_settings import get_setting
 
     return {
         "running": engine._run_lock,
         "schedule_enabled": scheduler.is_enabled(),
         "schedule_times": scheduler.schedule_times(),
         "next_run": scheduler.next_run_time(),
+        "pool_max": get_setting("selector.pool_max"),
+        "factor_top_n": get_setting("factor.top_n"),
+        "race_min_trade_days": get_setting("race.min_trade_days"),
+        "race_min_closed_trades": get_setting("race.min_closed_trades"),
+        "fuyao_configured": bool(str(get_setting("secrets.fuyao_api_key")).strip()),
+        "llm_configured": bool(str(get_setting("secrets.llm_api_key")).strip()),
+        "data_primary": "fuyao",
+        "news_source": "rss",
     }
+
+
+# ---------- 运行时设置 ----------
+
+class SettingsUpdate(BaseModel):
+    values: dict  # key -> value
+
+
+class SettingsReset(BaseModel):
+    keys: list[str] | None = None
+    group: str | None = None
+
+
+@router.get("/settings")
+def get_settings_api(group: str | None = None, db: Session = Depends(get_db)):
+    """列出配置注册表 + 当前有效值（按流水线分组）。"""
+    from ..runtime_settings import list_settings
+    from ..settings_registry import GROUPS
+
+    items = list_settings(group=group, db=db)
+    groups = GROUPS if group is None else [g for g in GROUPS if g["id"] == group]
+    return {"groups": groups, "items": items}
+
+
+@router.put("/settings")
+def put_settings_api(body: SettingsUpdate, db: Session = Depends(get_db)):
+    """批量更新配置覆盖。"""
+    from .. import scheduler
+    from ..runtime_settings import set_settings
+
+    if not body.values:
+        raise HTTPException(400, "values 不能为空")
+    try:
+        result = set_settings(body.values, db)
+    except KeyError as err:
+        raise HTTPException(400, str(err)) from err
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    if result.get("reload_scheduler"):
+        try:
+            scheduler.reload_jobs()
+        except Exception as err:  # noqa: BLE001
+            return {**result, "scheduler_reload_error": str(err)}
+    return {"ok": True, **result}
+
+
+@router.post("/settings/reset")
+def reset_settings_api(body: SettingsReset = SettingsReset(),
+                       db: Session = Depends(get_db)):
+    """恢复默认（删除覆盖）。可按 keys 或 group。"""
+    from .. import scheduler
+    from ..runtime_settings import reset_settings
+
+    if not body.keys and not body.group:
+        # 全量重置需显式 group=all 防止误触 — 这里允许 keys=[] 时重置全部
+        pass
+    try:
+        result = reset_settings(keys=body.keys, group=body.group, db=db)
+    except KeyError as err:
+        raise HTTPException(400, str(err)) from err
+    if result.get("reload_scheduler"):
+        try:
+            scheduler.reload_jobs()
+        except Exception as err:  # noqa: BLE001
+            return {**result, "scheduler_reload_error": str(err)}
+    return {"ok": True, **result}
+
+
+# ---------- 规则组前瞻调仓 ----------
+
+@router.post("/rules/rebalance")
+def rules_rebalance(db: Session = Depends(get_db)):
+    """手动触发全部规则策略调仓（S2 周频 + 池内等权）。"""
+    from ..runtime_settings import get_setting
+    from ..strategies.rule_runner import rebalance_all_rules
+
+    if not str(get_setting("secrets.fuyao_api_key")).strip():
+        raise HTTPException(400, "未配置扶摇 API Key（设置 → 密钥）")
+    if not db.query(Watchlist).first():
+        raise HTTPException(400, "股池为空")
+    # 确保规则账户存在
+    from ..seed import ensure_rule_strategies
+    ensure_rule_strategies(db)
+    db.commit()
+    return rebalance_all_rules(db)
+
+
+@router.post("/rules/rebalance/{model_id}")
+def rules_rebalance_one(model_id: str, db: Session = Depends(get_db)):
+    from ..runtime_settings import get_setting
+    from ..strategies.rule_runner import rebalance_strategy
+
+    if not str(get_setting("secrets.fuyao_api_key")).strip():
+        raise HTTPException(400, "未配置扶摇 API Key（设置 → 密钥）")
+    try:
+        return rebalance_strategy(db, model_id)
+    except ValueError as err:
+        raise HTTPException(404, str(err)) from err
+    except Exception as err:  # noqa: BLE001
+        raise HTTPException(502, str(err)) from err
+
+
+@router.get("/rules/status")
+def rules_status(db: Session = Depends(get_db)):
+    from ..strategies.rule_runner import RULE_MODEL_IDS, is_rebalance_day
+
+    rows = []
+    for mid in RULE_MODEL_IDS:
+        model = db.query(Model).filter(Model.type == "rule", Model.model_id == mid).first()
+        if model is None:
+            rows.append({"model_id": mid, "exists": False})
+            continue
+        eq = portfolio.total_equity(db, model.id)
+        pos_n = db.query(Position).filter(Position.model_pk == model.id).count()
+        rows.append({
+            "model_id": mid,
+            "exists": True,
+            "id": model.id,
+            "name": model.name,
+            "enabled": model.enabled,
+            "total_equity": eq["total_equity"],
+            "cash": eq["cash"],
+            "position_count": pos_n,
+            "pnl_pct": round((eq["total_equity"] / eq["initial_cash"] - 1) * 100, 2)
+            if eq["initial_cash"] else 0,
+        })
+    return {
+        "is_rebalance_day": is_rebalance_day(),
+        "schedule": "周一 14:50（交易日）",
+        "top_n": _rt_get("factor.top_n"),
+        "strategies": rows,
+    }
+
+
+# ---------- 因子 / 回测 / 事实底稿 / 账本 ----------
+
+
+@router.get("/factors/snapshot")
+def factors_snapshot(db: Session = Depends(get_db)):
+    """共享股池最新 S2 因子截面 + 综合分排名。"""
+    from ..factors.panel import latest_factor_snapshot
+    from ..factors.score import select_top_n
+
+    codes = [w.code for w in db.query(Watchlist).all()]
+    if not codes:
+        return {"items": [], "top_n": [], "message": "股池为空"}
+    snap = latest_factor_snapshot(codes)
+    if snap.empty:
+        return {"items": [], "top_n": [], "message": "因子计算失败或数据不足"}
+    items = []
+    for _, row in snap.iterrows():
+        items.append({
+            "code": row["code"],
+            "date": str(row.get("date", ""))[:10],
+            "mom_short": _f(row.get("mom_short")),
+            "mom_mid": _f(row.get("mom_mid")),
+            "low_vol": _f(row.get("low_vol")),
+            "ep": _f(row.get("ep")),
+            "bp": _f(row.get("bp")),
+            "quality_roe": _f(row.get("quality_roe")),
+            "rev_1m": _f(row.get("rev_1m")),
+            "low_turn": _f(row.get("low_turn")),
+            "growth_roe": _f(row.get("growth_roe")),
+            "size_proxy": _f(row.get("size_proxy")),
+            "score": _f(row.get("score")),
+            "n_factors": int(row.get("n_factors") or 0),
+        })
+    items.sort(key=lambda x: (x["score"] is None, -(x["score"] or 0)))
+    from ..runtime_settings import get_setting
+    top_n = int(get_setting("factor.top_n"))
+    top = select_top_n(snap, n=top_n)
+    return {"items": items, "top_n": top, "top_n_size": top_n}
+
+
+@router.get("/factsheet/{code}")
+def get_factsheet(code: str, db: Session = Depends(get_db)):
+    from ..data.factsheet import build_factsheet, factsheet_text
+
+    item = db.query(Watchlist).filter(Watchlist.code == code).first()
+    name = item.name if item else ""
+    peers = [w.code for w in db.query(Watchlist).all()]
+    sheet = build_factsheet(code, name, peer_codes=peers)
+    return {"sheet": sheet, "text": factsheet_text(sheet)}
+
+
+class BacktestBody(BaseModel):
+    years: int = 3
+    top_n: int | None = None
+    codes: list[str] | None = None
+
+
+@router.post("/backtest/run")
+def run_backtest(body: BacktestBody, db: Session = Depends(get_db)):
+    """对股池（或指定 codes）跑：池内等权锚 + S2 周频前 N。"""
+    from datetime import date, timedelta
+
+    from ..backtest.engine import run_equal_weight_buyhold, run_factor_weekly
+    from ..factors.panel import build_factor_panel
+
+    codes = body.codes or [w.code for w in db.query(Watchlist).all()]
+    if len(codes) < 2:
+        raise HTTPException(400, "至少需要 2 只股票才能回测")
+    start = date.today() - timedelta(days=365 * max(1, min(body.years, 8)) + 60)
+    panel = build_factor_panel(codes, start=start, end=date.today())
+    if panel.empty:
+        raise HTTPException(502, "无法构建因子面板（检查 FUYAO_API_KEY 与股池代码）")
+    # 需要 close 列
+    if "close" not in panel.columns and "收盘" in panel.columns:
+        panel = panel.rename(columns={"收盘": "close"})
+    eq_bt = run_equal_weight_buyhold(panel)
+    from ..runtime_settings import get_setting as _gs
+    fac_bt = run_factor_weekly(panel, top_n=body.top_n or int(_gs("factor.top_n")))
+    return {
+        "codes": codes,
+        "start": start.isoformat(),
+        "equal_weight": eq_bt.to_dict(),
+        "factor_weekly": fac_bt.to_dict(),
+    }
+
+
+@router.get("/ledger/stats")
+def ledger_stats(db: Session = Depends(get_db)):
+    from ..ledger import closed_trade_count
+    from ..models import TradeLedger
+
+    total_closed = closed_trade_count(db)
+    by_strategy: dict[str, int] = {}
+    rows = (db.query(TradeLedger.strategy_key)
+            .filter(TradeLedger.side == "close", TradeLedger.is_closed.is_(True)).all())
+    for (sk,) in rows:
+        by_strategy[sk] = by_strategy.get(sk, 0) + 1
+    min_closed = int(_rt_get("race.min_closed_trades"))
+    return {
+        "closed_trades": total_closed,
+        "by_strategy": by_strategy,
+        "min_closed_trades": min_closed,
+        "min_trade_days": int(_rt_get("race.min_trade_days")),
+        "sample_ok": total_closed >= min_closed,
+    }
+
+
+def _rt_get(key: str):
+    from ..runtime_settings import get_setting
+    return get_setting(key)
+
+
+def _f(value):
+    try:
+        if value is None:
+            return None
+        v = float(value)
+        if v != v:  # NaN
+            return None
+        return round(v, 6)
+    except (TypeError, ValueError):
+        return None
+

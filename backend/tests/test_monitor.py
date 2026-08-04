@@ -1,8 +1,8 @@
-"""盘中监控触发规则与复审执行测试。"""
-from datetime import datetime, timedelta
+"""盘中监控：分层3（浅线告警 / 深亏强制砍）。"""
 from unittest.mock import patch
 
 from app.agents import monitor
+from app.config import settings
 from app.models import MonitorEvent, Position
 from app.trading import broker
 
@@ -21,56 +21,44 @@ def test_no_trigger_in_normal_range(db, model_a):
     assert monitor.should_review(db, model_a.id, "000001", 0.10) is None
 
 
-def test_stop_loss_trigger_once_per_day(db, model_a):
+def test_shallow_stop_loss_alerts_once_per_day(db, model_a):
+    assert settings.shallow_line_alert_only is True
     assert monitor.should_review(db, model_a.id, "000001", -0.09) == "stop_loss"
     db.add(MonitorEvent(model_pk=model_a.id, code="000001", pnl_pct=-0.09,
-                        trigger="stop_loss", action="review_hold"))
+                        trigger="stop_loss", action="alert"))
     db.commit()
     assert monitor.should_review(db, model_a.id, "000001", -0.10) is None
 
 
-def test_take_profit_trigger_once_per_day(db, model_a):
+def test_shallow_take_profit_alerts_once_per_day(db, model_a):
     assert monitor.should_review(db, model_a.id, "000001", 0.16) == "take_profit"
     db.add(MonitorEvent(model_pk=model_a.id, code="000001", pnl_pct=0.16,
-                        trigger="take_profit", action="review_hold"))
+                        trigger="take_profit", action="alert"))
     db.commit()
     assert monitor.should_review(db, model_a.id, "000001", 0.20) is None
 
 
-def test_deep_loss_bypasses_daily_limit_with_hour_gap(db, model_a):
-    event = MonitorEvent(model_pk=model_a.id, code="000001", pnl_pct=-0.16,
-                         trigger="deep_loss", action="review_hold")
-    db.add(event)
-    db.commit()
-    # 1 小时内不重复触发
-    assert monitor.should_review(db, model_a.id, "000001", -0.18) is None
-    event.created_at = datetime.now() - timedelta(hours=2)
-    db.commit()
+def test_deep_loss_once_per_day_after_force_sell(db, model_a):
     assert monitor.should_review(db, model_a.id, "000001", -0.18) == "deep_loss"
+    db.add(MonitorEvent(model_pk=model_a.id, code="000001", pnl_pct=-0.18,
+                        trigger="deep_loss", action="force_sell"))
+    db.commit()
+    assert monitor.should_review(db, model_a.id, "000001", -0.20) is None
 
 
-@patch("app.agents.monitor.engine.recent_reflections", return_value="(无)")
-@patch("app.agents.monitor.indicators_text", side_effect=Exception("skip"))
-@patch("app.agents.monitor.market.get_daily_kline", side_effect=Exception("skip"))
-@patch("app.agents.monitor.llm.chat",
-       return_value='推理\n{"action": "sell", "target_position_pct": 0, "confidence": 0.9, "reason": "止损"}')
-def test_review_sell_executes(_chat, _k, _t, _r, db, model_a):
+def test_shallow_alert_does_not_sell(db, model_a):
     broker.get_account(db, model_a.id)
     pos = make_position(db, model_a.id)
     event = monitor.review_position(db, pos, price=9.0, pct_change=-2.0,
                                     pnl_pct=-0.10, trigger="stop_loss")
-    assert event.action == "review_sell"
-    assert broker.get_position(db, model_a.id, "000001") is None
-
-
-@patch("app.agents.monitor.engine.recent_reflections", return_value="(无)")
-@patch("app.agents.monitor.indicators_text", side_effect=Exception("skip"))
-@patch("app.agents.monitor.market.get_daily_kline", side_effect=Exception("skip"))
-@patch("app.agents.monitor.llm.chat", return_value="没有 JSON 的回复")
-def test_review_bad_json_holds(_chat, _k, _t, _r, db, model_a):
-    broker.get_account(db, model_a.id)
-    pos = make_position(db, model_a.id)
-    event = monitor.review_position(db, pos, price=9.0, pct_change=-2.0,
-                                    pnl_pct=-0.10, trigger="stop_loss")
-    assert event.action == "review_hold"
+    assert event.action == "alert"
     assert broker.get_position(db, model_a.id, "000001") is not None
+
+
+def test_deep_loss_force_sells(db, model_a):
+    broker.get_account(db, model_a.id)
+    pos = make_position(db, model_a.id)
+    event = monitor.review_position(db, pos, price=8.0, pct_change=-5.0,
+                                    pnl_pct=-0.20, trigger="deep_loss")
+    assert event.action == "force_sell"
+    assert broker.get_position(db, model_a.id, "000001") is None

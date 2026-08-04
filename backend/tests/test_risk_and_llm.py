@@ -1,7 +1,7 @@
 from unittest.mock import patch
 
 from app.agents import llm
-from app.config import settings
+from app.runtime_settings import get_setting
 from app.trading import broker, portfolio
 
 
@@ -35,7 +35,7 @@ def test_risk_limit_caps_single_position(db, model_a):
     broker.get_account(db, model_a.id)
     action, target, note = portfolio.apply_risk_limits(db, model_a.id, "600519", "buy", 0.5)
     assert action == "buy"
-    assert target <= settings.max_position_pct + 1e-9
+    assert target <= float(get_setting("risk.max_position_pct")) + 1e-9
     assert "单票仓位上限" in note
 
 

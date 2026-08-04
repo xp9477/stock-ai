@@ -1,12 +1,12 @@
 import axios from 'axios'
 
-const client = axios.create({ baseURL: '/api', timeout: 30000 })
+const client = axios.create({ baseURL: '/api', timeout: 120000 })
 
 client.interceptors.response.use(
   (resp) => resp.data,
   (err) => {
     const msg = err.response?.data?.detail || err.message
-    return Promise.reject(new Error(msg))
+    return Promise.reject(new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)))
   },
 )
 
@@ -26,7 +26,19 @@ export default {
   triggerRun: () => client.post('/runs/trigger'),
   getRuns: () => client.get('/runs'),
   getRunDetail: (id) => client.get(`/runs/${id}`),
-  getOrders: () => client.get('/orders'),
+  getOrders: (modelPk) => client.get('/orders', { params: modelPk != null ? { model_pk: modelPk } : {} }),
   getMonitorEvents: () => client.get('/monitor-events'),
   resetAccount: () => client.post('/account/reset'),
+  // 规则 / 因子 / 账本
+  rulesStatus: () => client.get('/rules/status'),
+  rulesRebalance: () => client.post('/rules/rebalance'),
+  rulesRebalanceOne: (modelId) => client.post(`/rules/rebalance/${modelId}`),
+  factorsSnapshot: () => client.get('/factors/snapshot'),
+  ledgerStats: () => client.get('/ledger/stats'),
+  runBacktest: (data) => client.post('/backtest/run', data || { years: 3 }),
+  getFactsheet: (code) => client.get(`/factsheet/${code}`),
+  // 运行时设置
+  getSettings: (group) => client.get('/settings', { params: group ? { group } : {} }),
+  putSettings: (values) => client.put('/settings', { values }),
+  resetSettings: (body) => client.post('/settings/reset', body || {}),
 }

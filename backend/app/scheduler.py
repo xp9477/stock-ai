@@ -1,4 +1,4 @@
-"""APScheduler:每交易日一次全量决策 + 盘中定时持仓监控。"""
+"""APScheduler:每日决策 + 盘中监控 + 规则组周频调仓。"""
 import logging
 from datetime import datetime, time as dtime
 
@@ -45,35 +45,103 @@ def _monitor_job():
         logger.exception("盘中监控失败")
 
 
+def _rule_rebalance_job():
+    """周一（交易日）规则组调仓。"""
+    if not market.is_trade_date():
+        logger.info("今日非交易日,跳过规则调仓")
+        return
+    from .database import SessionLocal
+    from .strategies.rule_runner import rebalance_all_rules
+
+    db = SessionLocal()
+    try:
+        result = rebalance_all_rules(db)
+        logger.info("规则组调仓完成: %s", result)
+    except Exception:  # noqa: BLE001
+        logger.exception("规则组调仓失败")
+    finally:
+        db.close()
+
+
+def _sched_params() -> dict:
+    """从运行时配置读取调度参数（设置页可改）。"""
+    try:
+        from .runtime_settings import get_setting
+        return {
+            "decision_time": str(get_setting("schedule.daily_decision_time")),
+            "select_enabled": bool(get_setting("schedule.stock_select_enabled")),
+            "select_time": str(get_setting("schedule.stock_select_time")),
+            "monitor_minutes": int(get_setting("schedule.monitor_interval_minutes")),
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "decision_time": settings.daily_decision_time,
+            "select_enabled": settings.stock_select_enabled,
+            "select_time": settings.stock_select_time,
+            "monitor_minutes": settings.monitor_interval_minutes,
+        }
+
+
+def _register_jobs(sched: BackgroundScheduler) -> None:
+    p = _sched_params()
+    hour, minute = p["decision_time"].strip().split(":")
+    sched.add_job(_decision_job,
+                  CronTrigger(day_of_week="mon-fri", hour=int(hour), minute=int(minute)),
+                  id="daily_decision", max_instances=1, coalesce=True, replace_existing=True)
+
+    if p["select_enabled"]:
+        sel_hour, sel_minute = p["select_time"].strip().split(":")
+        sched.add_job(_selector_job,
+                      CronTrigger(day_of_week="mon-fri",
+                                  hour=int(sel_hour), minute=int(sel_minute)),
+                      id="stock_select", max_instances=1, coalesce=True, replace_existing=True)
+    else:
+        try:
+            sched.remove_job("stock_select")
+        except Exception:  # noqa: BLE001
+            pass
+
+    sched.add_job(_monitor_job,
+                  CronTrigger(day_of_week="mon-fri", hour="9-14",
+                              minute=f"*/{p['monitor_minutes']}"),
+                  id="monitor", max_instances=1, coalesce=True, replace_existing=True)
+
+    # 规则组：每周一 14:50（决策后）
+    sched.add_job(_rule_rebalance_job,
+                  CronTrigger(day_of_week="mon", hour=14, minute=50),
+                  id="rule_rebalance", max_instances=1, coalesce=True, replace_existing=True)
+
+
 def start():
     global _scheduler
     if not settings.schedule_enabled:
         logger.info("定时调度已关闭 (SCHEDULE_ENABLED=false)")
         return
     _scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
-
-    hour, minute = settings.daily_decision_time.strip().split(":")
-    _scheduler.add_job(_decision_job,
-                       CronTrigger(day_of_week="mon-fri", hour=int(hour), minute=int(minute)),
-                       id="daily_decision", max_instances=1, coalesce=True)
-
-    if settings.stock_select_enabled:
-        sel_hour, sel_minute = settings.stock_select_time.strip().split(":")
-        _scheduler.add_job(_selector_job,
-                           CronTrigger(day_of_week="mon-fri",
-                                       hour=int(sel_hour), minute=int(sel_minute)),
-                           id="stock_select", max_instances=1, coalesce=True)
-
-    _scheduler.add_job(_monitor_job,
-                       CronTrigger(day_of_week="mon-fri", hour="9-14",
-                                   minute=f"*/{settings.monitor_interval_minutes}"),
-                       id="monitor", max_instances=1, coalesce=True)
-
+    _register_jobs(_scheduler)
     _scheduler.start()
-    logger.info("调度器已启动: 每日决策 %s, 自动选股 %s, 盘中监控每 %d 分钟",
-                settings.daily_decision_time,
-                settings.stock_select_time if settings.stock_select_enabled else "关闭",
-                settings.monitor_interval_minutes)
+    p = _sched_params()
+    logger.info(
+        "调度器已启动: 每日决策 %s, 自动选股 %s, 盘中监控每 %d 分钟, 规则调仓 周一 14:50",
+        p["decision_time"],
+        p["select_time"] if p["select_enabled"] else "关闭",
+        p["monitor_minutes"],
+    )
+
+
+def reload_jobs() -> None:
+    """设置页改调度参数后热重载 job（不重启进程）。"""
+    if _scheduler is None or not _scheduler.running:
+        logger.info("调度器未运行,跳过 reload_jobs")
+        return
+    _register_jobs(_scheduler)
+    p = _sched_params()
+    logger.info(
+        "调度器已重载: 每日决策 %s, 自动选股 %s, 监控每 %d 分钟",
+        p["decision_time"],
+        p["select_time"] if p["select_enabled"] else "关闭",
+        p["monitor_minutes"],
+    )
 
 
 def shutdown():
@@ -86,7 +154,8 @@ def is_enabled() -> bool:
 
 
 def schedule_times() -> str:
-    return f"每日 {settings.daily_decision_time} 决策 / 每 {settings.monitor_interval_minutes} 分钟监控"
+    p = _sched_params()
+    return f"每日 {p['decision_time']} 决策 / 每 {p['monitor_minutes']} 分钟监控"
 
 
 def next_run_time() -> str | None:

@@ -6,29 +6,41 @@ import time
 
 from openai import OpenAI
 
-from ..config import settings
+from ..runtime_settings import get_setting
 
 logger = logging.getLogger(__name__)
 
 _client: OpenAI | None = None
+_client_fp: str | None = None  # base_url + key 指纹，变更则重建
+
+
+def reset_client() -> None:
+    global _client, _client_fp
+    _client = None
+    _client_fp = None
 
 
 def get_client() -> OpenAI:
-    global _client
-    if _client is None:
-        _client = OpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key)
+    global _client, _client_fp
+    base = str(get_setting("secrets.llm_base_url")).strip()
+    key = str(get_setting("secrets.llm_api_key")).strip()
+    fp = f"{base}|{key}"
+    if _client is None or _client_fp != fp:
+        _client = OpenAI(base_url=base, api_key=key or "EMPTY")
+        _client_fp = fp
     return _client
 
 
 def chat(system: str, user: str, model: str, retries: int = 2) -> str:
     """调用指定模型,失败重试 retries 次,最终失败抛出异常。"""
     last_err: Exception | None = None
+    temp = float(get_setting("secrets.llm_temperature"))
     for attempt in range(retries + 1):
         try:
             # 指令并入 user 消息:部分中转端点会丢弃/覆盖 system 消息
             resp = get_client().chat.completions.create(
                 model=model,
-                temperature=settings.llm_temperature,
+                temperature=temp,
                 messages=[
                     {"role": "user",
                      "content": f"【你的角色与任务】\n{system}\n\n【输入材料】\n{user}"},

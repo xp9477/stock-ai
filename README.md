@@ -72,22 +72,45 @@ npm run dev            # http://localhost:5173
 3. 点击右上角「立即运行一轮」,或等待每日定时决策(默认交易日 14:35)
 4. 「决策记录」按模型查看各 Agent 报告、辩论、大盘环境与反思;「仪表盘」看排行榜与多曲线对比
 
+## 赛马底座（已落地）
+
+北极星：**可验证 edge**（夏普/回撤/超额），不是胜率。规则因子组 vs AI 同场；AI 吃同一 X1 事实底稿（含 S2 因子）。
+
+| 模块 | 说明 |
+|---|---|
+| S2 因子 | 短动量 / 中动量 / 低波动 / EP / BP / 质量(ROE)，截面 z 分等权合成，周频前 10 等权 |
+| 回测 | `POST /api/backtest/run`：池内等权锚 + 因子周频；指标含夏普、最大回撤、样本门槛标记 |
+| 事实底稿 | `GET /api/factsheet/{code}`；决策流水线注入全部 AI 臂 |
+| 账本 | `trade_ledger` + `GET /api/ledger/stats`（100 笔平仓门槛） |
+| 规则组前瞻 | `S2周频前10` + `池内等权` 独立模拟账户；`POST /api/rules/rebalance`；周一 14:50 自动调仓 |
+| 盘中分层 | 深亏强制砍；浅止损/止盈仅告警 |
+
+数据分层：
+
+- **主源**：同花顺[扶摇](https://fuyao.aicubes.cn/)（`FUYAO_API_KEY`）— 日 K / 估值 / 财务指标 / 后续 ETF  
+- **新闻**：Vibe 路线公开 RSS（零 Key，本地抓取）  
+- **不做**免费源降级/交叉校验；不够用再上 Tushare
+
 ## 配置(backend/.env)
 
 | 变量 | 说明 | 默认 |
 |---|---|---|
 | `LLM_BASE_URL` | OpenAI 兼容接口地址(所有模型共用) | `https://api.deepseek.com` |
 | `LLM_API_KEY` | API Key | - |
+| `FUYAO_API_KEY` | 同花顺扶摇 API Key（主数据源） | - |
 | `INITIAL_CASH` | 每个模型账户初始虚拟资金 | `1000000` |
 | `SCHEDULE_ENABLED` | 开启定时调度 | `true` |
 | `STOCK_SELECT_ENABLED` | 开启每日自动选股 | `true` |
 | `STOCK_SELECT_TIME` | 自动选股时刻 | `14:05` |
-| `POOL_MAX` | 股池上限(含手动股) | `8` |
+| `POOL_MAX` | 共享股池上限 | `30` |
+| `FACTOR_TOP_N` | 因子组合持仓只数 | `10` |
 | `DAILY_DECISION_TIME` | 每日全量决策时刻 | `14:35` |
 | `MONITOR_INTERVAL_MINUTES` | 盘中监控间隔(分钟) | `15` |
-| `TAKE_PROFIT_REVIEW_PCT` | 止盈复审阈值 | `0.15` |
-| `STOP_LOSS_REVIEW_PCT` | 止损复审阈值 | `-0.08` |
-| `DEEP_LOSS_PCT` | 深亏阈值(提升复审频率) | `-0.15` |
+| `TAKE_PROFIT_REVIEW_PCT` | 止盈警戒线（仅告警） | `0.15` |
+| `STOP_LOSS_REVIEW_PCT` | 止损警戒线（仅告警） | `-0.08` |
+| `DEEP_LOSS_PCT` | 深亏强制砍仓阈值 | `-0.15` |
+| `RACE_MIN_TRADE_DAYS` | 样本门槛：交易日 | `60` |
+| `RACE_MIN_CLOSED_TRADES` | 样本门槛：平仓笔数 | `100` |
 | `DB_PATH` | SQLite 路径(Docker 内为 `/data/stock_ai.db`) | `stock_ai.db` |
 
 模型名单不在 `.env` 配置,在前端「模型管理」页维护(默认种子: Grok 4.5 / Opus 5 / Fable 5 + 三模合议)。

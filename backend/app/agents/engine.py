@@ -6,13 +6,13 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from ..config import settings
 from ..data import market
 from ..data.indicators import indicators_text
 from ..models import (AgentOutput, Decision, Model, Order, Position,
                       Reflection, Run, Watchlist)
+from ..runtime_settings import get_setting
 from ..trading import broker, portfolio
-from . import llm, prompts
+from . import llm
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +44,8 @@ def _position_context(db: Session, model_pk: int, code: str) -> str:
             f"持仓成本 {pos.avg_cost:.2f} 元, 现价 {price:.2f} 元, 浮动盈亏 {pnl_pct:.1%}",
             f"该股仓位占总资产 {pos.total_qty * price / eq['total_equity']:.1%}" if eq['total_equity'] else "",
         ]
-        if pnl_pct <= settings.stop_loss_alert_pct:
-            lines.append("⚠️ 警告: 该持仓浮亏已超过 10%,必须评估是否止损!")
+        if pnl_pct <= float(get_setting("risk.stop_loss_alert_pct")):
+            lines.append("⚠️ 警告: 该持仓浮亏已超过止损提示线,必须评估是否止损!")
     else:
         lines.append("当前未持有该股票")
     return "\n".join(filter(None, lines))
@@ -61,8 +61,11 @@ def recent_reflections(db: Session, model_pk: int, limit: int = 5) -> str:
 
 # ---------- 共享数据准备(每轮一次,与模型无关) ----------
 
-def prepare_stock_inputs(code: str, name: str) -> dict:
-    """采集个股数据文本,同一轮内所有模型共享。"""
+def prepare_stock_inputs(code: str, name: str, peer_codes: list[str] | None = None) -> dict:
+    """采集个股数据 + X1 事实底稿,同一轮内所有模型共享。"""
+    from ..data.factsheet import build_factsheet, factsheet_text
+    from ..ledger import factsheet_hash
+
     try:
         kline = market.get_daily_kline(code)
         tech_input = f"股票: {name}({code})\n\n{indicators_text(kline)}"
@@ -89,7 +92,33 @@ def prepare_stock_inputs(code: str, name: str) -> dict:
     except Exception as err:  # noqa: BLE001
         news_input = f"股票: {name}({code})\n\n(新闻数据获取失败: {err})"
 
-    return {"tech": tech_input, "fund": fund_input, "news": news_input}
+    # X1：S2 因子 + 统一底稿（所有 AI 臂必读，禁止编造 missing）
+    sheet = {}
+    sheet_text = ""
+    try:
+        sheet = build_factsheet(code, name, peer_codes=peer_codes or [])
+        sheet_text = factsheet_text(sheet)
+        factors = sheet.get("factors") or {}
+        if factors:
+            fund_input += (
+                f"\n\n【S2因子截面】score={factors.get('score')} rank={factors.get('rank')}"
+                f"/{factors.get('universe_size')}\n"
+                f"mom_short={factors.get('mom_short')} mom_mid={factors.get('mom_mid')} "
+                f"low_vol={factors.get('low_vol')} ep={factors.get('ep')} "
+                f"bp={factors.get('bp')} quality_roe={factors.get('quality_roe')}"
+            )
+    except Exception as err:  # noqa: BLE001
+        logger.warning("factsheet %s: %s", code, err)
+        sheet_text = f"(事实底稿构建失败: {err})"
+
+    return {
+        "tech": tech_input,
+        "fund": fund_input,
+        "news": news_input,
+        "factsheet": sheet,
+        "factsheet_text": sheet_text,
+        "factsheet_hash": factsheet_hash(sheet) if sheet else "",
+    }
 
 
 # ---------- 单模型流水线 ----------
@@ -99,7 +128,7 @@ def market_report(db: Session, run_id: int, model: Model) -> str:
         overview = market.market_overview_text()
     except Exception as err:  # noqa: BLE001
         overview = f"(大盘数据获取失败: {err})"
-    report = llm.chat(prompts.MARKET, overview, model.model_id)
+    report = llm.chat(str(get_setting("prompt.market")), overview, model.model_id)
     _save_output(db, run_id, model.id, MARKET_CODE, "market", overview, report)
     return report
 
@@ -108,14 +137,15 @@ def analyze_stock(db: Session, run_id: int, model: Model, code: str, name: str,
                   inputs: dict, market_ctx: str, reflections: str) -> Decision:
     """对单只股票执行完整流水线(指定模型),返回落库后的最终决策。"""
     model_id = model.model_id
+    p = lambda k: str(get_setting(f"prompt.{k}"))  # noqa: E731
 
-    tech_report = llm.chat(prompts.TECHNICAL, inputs["tech"], model_id)
+    tech_report = llm.chat(p("technical"), inputs["tech"], model_id)
     _save_output(db, run_id, model.id, code, "technical", inputs["tech"], tech_report)
 
-    fund_report = llm.chat(prompts.FUNDAMENTAL, inputs["fund"], model_id)
+    fund_report = llm.chat(p("fundamental"), inputs["fund"], model_id)
     _save_output(db, run_id, model.id, code, "fundamental", inputs["fund"], fund_report)
 
-    news_report = llm.chat(prompts.NEWS, inputs["news"], model_id)
+    news_report = llm.chat(p("news"), inputs["news"], model_id)
     _save_output(db, run_id, model.id, code, "news", inputs["news"], news_report)
 
     reports = (
@@ -127,22 +157,24 @@ def analyze_stock(db: Session, run_id: int, model: Model, code: str, name: str,
     debate_log = ""
     for round_no in (1, 2):
         bull_input = f"{reports}\n\n【辩论记录】\n{debate_log or '(辩论开始,你先发言)'}"
-        bull_view = llm.chat(prompts.BULL, bull_input, model_id)
+        bull_view = llm.chat(p("bull"), bull_input, model_id)
         _save_output(db, run_id, model.id, code, f"bull_{round_no}", f"第{round_no}轮", bull_view)
         debate_log += f"\n多头(第{round_no}轮): {bull_view}\n"
 
         bear_input = f"{reports}\n\n【辩论记录】\n{debate_log}"
-        bear_view = llm.chat(prompts.BEAR, bear_input, model_id)
+        bear_view = llm.chat(p("bear"), bear_input, model_id)
         _save_output(db, run_id, model.id, code, f"bear_{round_no}", f"第{round_no}轮", bear_view)
         debate_log += f"\n空头(第{round_no}轮): {bear_view}\n"
 
     position_ctx = _position_context(db, model.id, code)
+    factsheet_block = inputs.get("factsheet_text") or ""
     trader_input = (
-        f"股票: {name}({code})\n\n【大盘环境】\n{market_ctx}\n\n{reports}\n\n"
+        f"股票: {name}({code})\n\n【大盘环境】\n{market_ctx}\n\n"
+        f"{factsheet_block}\n\n{reports}\n\n"
         f"【多空辩论】\n{debate_log}\n\n【账户状态】\n{position_ctx}\n\n"
         f"【历史经验教训】\n{reflections}"
     )
-    trader_output = llm.chat(prompts.TRADER, trader_input, model_id)
+    trader_output = llm.chat(p("trader"), trader_input, model_id)
     _save_output(db, run_id, model.id, code, "trader", position_ctx, trader_output)
     trader_decision = llm.decide_with_fallback(trader_output, model_id)
     if trader_decision is None:
@@ -153,7 +185,7 @@ def analyze_stock(db: Session, run_id: int, model: Model, code: str, name: str,
         f"股票: {name}({code})\n\n【大盘环境】\n{market_ctx}\n\n【分析师报告】\n{reports}\n\n"
         f"【交易员决策】\n{trader_output}\n\n【账户状态】\n{position_ctx}"
     )
-    risk_output = llm.chat(prompts.RISK, risk_input, model_id)
+    risk_output = llm.chat(p("risk"), risk_input, model_id)
     _save_output(db, run_id, model.id, code, "risk", "审核交易员决策", risk_output)
     final = llm.decide_with_fallback(risk_output, model_id)
     if final is None:
@@ -211,7 +243,7 @@ def reflect(db: Session, run_id: int, model: Model):
             f"{order.name} {order.qty}股 @{order.price},理由: {reason[:80]};结果: {outcome}")
     review_input = "近期交易记录:\n" + "\n".join(lines)
     try:
-        output = llm.chat(prompts.REFLECT, review_input, model.model_id)
+        output = llm.chat(str(get_setting("prompt.reflect")), review_input, model.model_id)
     except Exception as err:  # noqa: BLE001
         logger.warning("模型 %s 反思失败: %s", model.name, err)
         return
@@ -293,8 +325,11 @@ def run_pipeline(trigger: str = "manual") -> int | None:
         for pos in db.query(Position).all():
             targets.setdefault(pos.code, pos.name)
 
-        stock_inputs = {code: prepare_stock_inputs(code, name)
-                        for code, name in targets.items()}
+        peer_codes = list(targets.keys())
+        stock_inputs = {
+            code: prepare_stock_inputs(code, name, peer_codes=peer_codes)
+            for code, name in targets.items()
+        }
 
         llm_models = (db.query(Model)
                       .filter(Model.enabled.is_(True), Model.type == "llm").all())

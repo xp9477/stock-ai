@@ -176,26 +176,135 @@ def validate_code(code: str) -> dict | None:
 
 
 # ---------- 自动选股 ----------
+# 初筛阈值默认见 settings_registry；运行时用 get_setting 读取（可被设置页覆盖）
+# 行情主源：扶摇（沪深300+中证500 成分）；新浪全市场仅作兜底（常 Broken pipe / 超时）
 
-# 初筛阈值常量
+import logging
+
+logger = logging.getLogger(__name__)
+
+# 兼容旧测试/引用的模块级常量（等于注册表默认，不随 DB 覆盖变化）
 SCREEN_MIN_PRICE = 3.0
 SCREEN_MAX_PRICE = 100.0
-SCREEN_MIN_TURNOVER = 2e8       # 成交额 ≥ 2 亿
-SCREEN_MIN_PCT = -3.0           # 当日涨跌幅下限(避免接飞刀)
-SCREEN_MAX_PCT = 7.0            # 当日涨跌幅上限(避免追涨停)
+SCREEN_MIN_TURNOVER = 2e8
+SCREEN_MIN_PCT = -3.0
+SCREEN_MAX_PCT = 7.0
 SCREEN_TOP_N = 30
+
+# 扶摇 snapshot 单次 thscodes 不宜过长
+_FUYAO_BATCH = 80
+
+
+def _symbol_prefix(code: str) -> str:
+    code = str(code).zfill(6)
+    return f"sh{code}" if code.startswith(("60", "68", "9")) else f"sz{code}"
+
+
+@ttl_cache(3600)
+def get_screen_universe() -> list[tuple[str, str]]:
+    """选股宇宙：(code, name)。优先 沪深300 + 中证500 成分。"""
+    pairs: dict[str, str] = {}
+    for symbol in ("000300", "000905"):  # 沪深300 / 中证500
+        try:
+            df = ak.index_stock_cons(symbol=symbol)
+        except Exception as err:  # noqa: BLE001
+            logger.warning("指数成分 %s 拉取失败: %s", symbol, err)
+            continue
+        if df is None or df.empty:
+            continue
+        code_col = "品种代码" if "品种代码" in df.columns else (
+            "成分券代码" if "成分券代码" in df.columns else df.columns[0]
+        )
+        name_col = "品种名称" if "品种名称" in df.columns else (
+            "成分券名称" if "成分券名称" in df.columns else None
+        )
+        for _, row in df.iterrows():
+            code = str(row[code_col]).zfill(6)[-6:]
+            if not code.isdigit():
+                continue
+            name = str(row[name_col]) if name_col else code
+            pairs[code] = name
+    if not pairs:
+        raise RuntimeError("无法获取选股宇宙（沪深300/中证500 成分）")
+    return sorted(pairs.items(), key=lambda x: x[0])
+
+
+def _snapshot_via_fuyao() -> pd.DataFrame:
+    """扶摇批量行情 → 与 screen_candidates 兼容的 DataFrame 列。"""
+    from . import fuyao_client as fuyao
+
+    if not fuyao.available():
+        raise RuntimeError("扶摇未配置")
+
+    universe = get_screen_universe()
+    name_map = dict(universe)
+    codes = [c for c, _ in universe]
+    rows = []
+    for i in range(0, len(codes), _FUYAO_BATCH):
+        chunk = codes[i:i + _FUYAO_BATCH]
+        try:
+            items = fuyao.prices_snapshot(chunk)
+        except Exception as err:  # noqa: BLE001
+            logger.warning("扶摇 snapshot 批次失败 %s…: %s", chunk[:3], err)
+            continue
+        for it in items or []:
+            code = str(it.get("ticker") or fuyao.from_thscode(it.get("thscode", ""))).zfill(6)[-6:]
+            price = it.get("last_price")
+            pct = it.get("price_change_ratio_pct")
+            turnover = it.get("turnover")
+            if price is None:
+                continue
+            rows.append({
+                "代码": _symbol_prefix(code),
+                "名称": name_map.get(code, code),
+                "最新价": float(price),
+                "涨跌幅": float(pct) if pct is not None else 0.0,
+                "成交额": float(turnover) if turnover is not None else 0.0,
+            })
+    if not rows:
+        raise RuntimeError("扶摇行情快照为空")
+    return pd.DataFrame(rows)
 
 
 @ttl_cache(600)
 def get_market_snapshot() -> pd.DataFrame:
-    """全市场实时快照(新浪),约 5000+ 只,耗时 ~20s,缓存 10 分钟。"""
-    return ak.stock_zh_a_spot()
+    """选股用截面快照。优先扶摇(指数成分)，失败再试新浪全市场。"""
+    errors: list[str] = []
+    try:
+        df = _snapshot_via_fuyao()
+        logger.info("选股快照来源=扶摇, 行数=%d", len(df))
+        return df
+    except Exception as err:  # noqa: BLE001
+        errors.append(f"扶摇: {err}")
+        logger.warning("扶摇选股快照失败,尝试新浪: %s", err)
+
+    try:
+        df = ak.stock_zh_a_spot()
+        logger.info("选股快照来源=新浪, 行数=%d", len(df))
+        return df
+    except Exception as err:  # noqa: BLE001
+        errors.append(f"新浪: {err}")
+        msg = "；".join(errors)
+        # 常见：Broken pipe / ConnectTimeout — 给前端可读说明
+        raise RuntimeError(
+            f"选股行情快照失败（{msg}）。"
+            "请确认 FUYAO_API_KEY 可用；新浪全市场接口常被掐断。"
+        ) from err
 
 
 def screen_candidates(exclude_codes: set[str] | None = None,
                       snapshot: pd.DataFrame | None = None) -> list[dict]:
     """规则初筛候选股:普通沪深 A 股、非 ST、价格/流动性/涨跌幅过滤,
-    按成交额降序取前 SCREEN_TOP_N。"""
+    按成交额降序取前 top_n（可配置）。"""
+    from ..runtime_settings import get_setting
+
+    min_price = float(get_setting("selector.screen.min_price"))
+    max_price = float(get_setting("selector.screen.max_price"))
+    min_turnover = float(get_setting("selector.screen.min_turnover_yi")) * 1e8
+    min_pct = float(get_setting("selector.screen.min_pct"))
+    max_pct = float(get_setting("selector.screen.max_pct"))
+    top_n = int(get_setting("selector.screen.top_n"))
+
     exclude_codes = exclude_codes or set()
     df = snapshot if snapshot is not None else get_market_snapshot()
     out = []
@@ -217,13 +326,13 @@ def screen_candidates(exclude_codes: set[str] | None = None,
             turnover = float(row["成交额"])
         except (TypeError, ValueError):
             continue
-        if not (SCREEN_MIN_PRICE <= price <= SCREEN_MAX_PRICE):
+        if not (min_price <= price <= max_price):
             continue
-        if turnover < SCREEN_MIN_TURNOVER:
+        if turnover < min_turnover:
             continue
-        if not (SCREEN_MIN_PCT <= pct <= SCREEN_MAX_PCT):
+        if not (min_pct <= pct <= max_pct):
             continue
         out.append({"code": code, "name": name, "price": price,
                     "pct_change": pct, "turnover": turnover})
     out.sort(key=lambda x: x["turnover"], reverse=True)
-    return out[:SCREEN_TOP_N]
+    return out[:top_n]

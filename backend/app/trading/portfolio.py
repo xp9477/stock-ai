@@ -3,9 +3,9 @@ import logging
 
 from sqlalchemy.orm import Session
 
-from ..config import settings
 from ..data import market
 from ..models import EquitySnapshot, Position
+from ..runtime_settings import get_setting
 from . import broker
 
 logger = logging.getLogger(__name__)
@@ -42,9 +42,12 @@ def apply_risk_limits(db: Session, model_pk: int, code: str, action: str,
     """代码层硬性风控,返回 (action, adjusted_target_pct, note)。"""
     notes = []
     if action == "buy":
-        if target_pct > settings.max_position_pct:
-            notes.append(f"单票仓位上限 {settings.max_position_pct:.0%},目标 {target_pct:.0%} 已压缩")
-            target_pct = settings.max_position_pct
+        max_pos = float(get_setting("risk.max_position_pct"))
+        max_total = float(get_setting("risk.max_total_position_pct"))
+        max_buy_cash = float(get_setting("risk.max_buy_cash_pct"))
+        if target_pct > max_pos:
+            notes.append(f"单票仓位上限 {max_pos:.0%},目标 {target_pct:.0%} 已压缩")
+            target_pct = max_pos
 
         eq = total_equity(db, model_pk)
         current_market_pct = eq["market_value"] / eq["total_equity"] if eq["total_equity"] > 0 else 0
@@ -52,15 +55,15 @@ def apply_risk_limits(db: Session, model_pk: int, code: str, action: str,
         current_pct = position_value(pos) / eq["total_equity"] if pos and eq["total_equity"] > 0 else 0
         add_pct = max(target_pct - current_pct, 0)
 
-        room = settings.max_total_position_pct - current_market_pct
+        room = max_total - current_market_pct
         if add_pct > room:
-            notes.append(f"总仓位上限 {settings.max_total_position_pct:.0%},加仓额度已压缩")
+            notes.append(f"总仓位上限 {max_total:.0%},加仓额度已压缩")
             add_pct = max(room, 0)
 
-        max_cash = eq["cash"] * settings.max_buy_cash_pct
+        max_cash = eq["cash"] * max_buy_cash
         add_amount = add_pct * eq["total_equity"]
         if add_amount > max_cash:
-            notes.append(f"单次买入不超过可用资金 {settings.max_buy_cash_pct:.0%}")
+            notes.append(f"单次买入不超过可用资金 {max_buy_cash:.0%}")
             add_amount = max_cash
         if add_amount < 100:
             return "hold", current_pct, ";".join(notes) or "无加仓空间,转为持有"

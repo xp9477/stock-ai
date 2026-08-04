@@ -6,14 +6,12 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from ..config import settings
 from ..data import market
 from ..models import AgentOutput, Model, Position, Run, Watchlist
-from . import llm, prompts
+from ..runtime_settings import get_setting
+from . import llm
 
 logger = logging.getLogger(__name__)
-
-MISS_LIMIT = 3  # 连续未被看好次数达到即淘汰(无持仓时)
 
 _select_lock = False
 
@@ -78,7 +76,7 @@ def _apply_lifecycle(db: Session, auto_items: list[Watchlist],
         item.miss_count += 1
         held = db.query(Position).filter(Position.code == item.code,
                                          Position.total_qty > 0).first()
-        if item.miss_count >= MISS_LIMIT and held is None:
+        if item.miss_count >= get_setting("selector.miss_limit") and held is None:
             removed.append(item.code)
             db.delete(item)
     db.commit()
@@ -114,10 +112,11 @@ def run_selector(trigger: str = "schedule") -> int | None:
         pool = db.query(Watchlist).all()
         auto_items = [w for w in pool if w.source == "auto"]
         pool_codes = {w.code for w in pool}
-        slots = max(settings.pool_max - len(pool), 0)
+        slots = max(int(get_setting("selector.pool_max")) - len(pool), 0)
 
         candidates = market.screen_candidates(exclude_codes=pool_codes)
         market_ctx = market.market_overview_text()
+        selector_prompt = str(get_setting("prompt.selector"))
 
         user_input = (
             f"【大盘环境】\n{market_ctx}\n\n"
@@ -127,11 +126,11 @@ def run_selector(trigger: str = "schedule") -> int | None:
             + ("(股池已满,本日只需评估 keep,picks 请输出空数组)" if slots == 0 else "")
         )
 
-        output = llm.chat(prompts.SELECTOR, user_input, model.model_id, retries=1)
+        output = llm.chat(selector_prompt, user_input, model.model_id, retries=1)
         parsed = parse_selector_json(output)
         if parsed is None:
             # 重试一次
-            output2 = llm.chat(prompts.SELECTOR, user_input, model.model_id, retries=0)
+            output2 = llm.chat(selector_prompt, user_input, model.model_id, retries=0)
             parsed = parse_selector_json(output2)
             output = output + "\n\n[重试输出]\n" + output2
         db.add(AgentOutput(run_id=run_id, model_pk=model.id, code="SELECT",
@@ -164,7 +163,16 @@ def run_selector(trigger: str = "schedule") -> int | None:
     except Exception as err:  # noqa: BLE001
         logger.exception("自动选股失败")
         run.status = "failed"
-        run.error = str(err)
+        # Broken pipe / 超时等网络错误 → 可读文案
+        raw = str(err)
+        if "Broken pipe" in raw or "Errno 32" in raw:
+            run.error = (
+                "选股行情连接中断 (Broken pipe)。"
+                "已优先改用扶摇指数成分快照；请重试 AI 选股。"
+                f" 原始错误: {raw}"
+            )
+        else:
+            run.error = raw
     finally:
         run.finished_at = datetime.now()
         db.commit()

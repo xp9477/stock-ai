@@ -1,5 +1,11 @@
 <template>
-  <div>
+  <div class="page stack">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">成交</h1>
+        <p class="page-sub">模拟撮合订单与盘中事件</p>
+      </div>
+    </div>
     <el-card>
       <template #header>交易记录</template>
 
@@ -134,7 +140,12 @@ const loading = ref(false)
 
 const triggerType = (t) => ({ stop_loss: 'warning', take_profit: 'success', deep_loss: 'danger' }[t] || 'info')
 const triggerText = (t) => ({ stop_loss: '止损警戒', take_profit: '止盈警戒', deep_loss: '深度亏损' }[t] || t)
-const actionText = (a) => ({ review_sell: '复审卖出', review_hold: '继续持有', alert: '仅告警' }[a] || a)
+const actionText = (a) => ({
+  review_sell: '复审卖出',
+  review_hold: '继续持有',
+  alert: '仅告警',
+  force_sell: '强制砍仓',
+}[a] || a)
 const rowClass = ({ row }) => (row.trigger === 'deep_loss' ? 'deep-loss-row' : '')
 
 onMounted(async () => {
@@ -152,24 +163,33 @@ onMounted(async () => {
 
 <style scoped>
 .mt { margin-top: 12px; }
-.detail { white-space: pre-wrap; font-size: 12px; max-height: 320px; overflow-y: auto; margin: 0; }
-:deep(.deep-loss-row) { background: #fef0f0 !important; }
-.deep-loss-card { border-color: #f56c6c; background: #fef0f0; }
+.detail {
+  white-space: pre-wrap; font-size: 12px; max-height: 320px; overflow-y: auto;
+  margin: 0; color: var(--text-muted); font-family: var(--mono);
+}
+:deep(.deep-loss-row) { background: rgba(255, 90, 95, 0.08) !important; }
+.deep-loss-card {
+  border-color: rgba(255, 90, 95, 0.35);
+  background: rgba(255, 90, 95, 0.06);
+}
 
-/* 移动端订单:紧凑行 */
-.o-row { display: flex; align-items: center; gap: 8px; padding: 9px 2px; border-bottom: 1px solid #f2f3f5; }
+.o-row {
+  display: flex; align-items: center; gap: 8px; padding: 10px 4px;
+  border-bottom: 1px solid var(--border);
+}
 .o-row:last-child { border-bottom: none; }
 .o-left { flex: 1; min-width: 0; }
 .o-name { font-size: 14px; font-weight: 600; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-.o-meta { font-size: 11px; color: #909399; margin-top: 2px; }
+.o-meta { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
 .o-right { text-align: right; flex: none; }
-.o-amount { font-size: 14px; font-weight: 700; }
-.o-detail { font-size: 11px; color: #909399; }
-.reject { font-size: 12px; color: #e6a23c; margin-top: 2px; }
-.pnl { font-weight: 700; font-size: 14px; }
+.o-amount { font-size: 14px; font-weight: 700; font-family: var(--mono); }
+.o-detail { font-size: 11px; color: var(--text-dim); font-family: var(--mono); }
+.reject { font-size: 12px; color: var(--warn); margin-top: 2px; }
+.pnl { font-weight: 700; font-size: 14px; font-family: var(--mono); }
 .ev-action { margin-left: auto; }
 .detail-collapse { margin-top: 4px; }
-.detail-collapse :deep(.el-collapse-item__header) { height: 30px; font-size: 12px; color: #409eff; background: transparent; }
+.detail-collapse :deep(.el-collapse-item__header) {
+  height: 30px; font-size: 12px; color: var(--accent); background: transparent;
+}
 .detail-collapse :deep(.el-collapse-item__wrap) { background: transparent; }
-.deep-loss-card .detail-collapse :deep(.el-collapse-item__header) { background: transparent; }
 </style>

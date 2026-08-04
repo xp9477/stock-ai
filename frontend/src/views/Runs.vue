@@ -1,6 +1,13 @@
 <template>
+  <div class="page stack">
+    <div class="page-head">
+      <div>
+        <h1 class="page-title">决策</h1>
+        <p class="page-sub">AI 流水线与选股记录</p>
+      </div>
+    </div>
   <el-card>
-    <template #header>决策记录</template>
+    <template #header>运行列表</template>
 
     <template v-if="isMobile">
       <div v-for="row in runs" :key="row.id" class="m-card clickable-card" @click="goDetail(row)">
@@ -48,9 +55,10 @@
           </template>
         </el-table-column>
       </el-table>
-      <el-empty v-if="!loading && !runs.length" description="暂无决策记录,点击右上角「立即运行一轮」" />
+      <el-empty v-if="!loading && !runs.length" description="暂无决策记录，点右上角「AI 决策」" />
     </template>
   </el-card>
+  </div>
 </template>
 
 <script setup>
