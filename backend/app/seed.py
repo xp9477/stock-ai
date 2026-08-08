@@ -21,8 +21,9 @@ RULE_STRATEGIES = [
 
 def ensure_account(db: Session, model_pk: int):
     if not db.query(Account).filter(Account.model_pk == model_pk).first():
-        db.add(Account(model_pk=model_pk, cash=settings.initial_cash,
-                       initial_cash=settings.initial_cash))
+        from .runtime_settings import get_setting
+        cash = float(get_setting("account.initial_cash"))
+        db.add(Account(model_pk=model_pk, cash=cash, initial_cash=cash))
         db.flush()
 
 

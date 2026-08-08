@@ -49,3 +49,28 @@ def test_news_for_stock_matches(monkeypatch):
     miss = news_for_stock("000001", "平安银行", limit=5)
     # 无命中时退回 general
     assert miss and miss[0]["match"] == "general"
+
+
+def test_market_get_news_uses_rss(monkeypatch):
+    """决策流水线与 factsheet 应同源 RSS，而非东财。"""
+    from app.data import market, news_rss
+
+    def fake_for_stock(code, name="", limit=10):
+        return [{"title": f"rss-{code}", "content": name, "time": "t",
+                 "url": "u", "source": "test", "match": "stock"}]
+
+    monkeypatch.setattr(news_rss, "news_for_stock", fake_for_stock)
+    # 清 TTL 缓存
+    if hasattr(market.get_news, "cache_clear"):
+        market.get_news.cache_clear()
+    items = market.get_news("600519", name="贵州茅台")
+    assert items and items[0]["title"] == "rss-600519"
+
+
+def test_fetch_respects_rss_disabled(monkeypatch):
+    from app.data import news_rss
+
+    monkeypatch.setattr("app.data.datasources.is_enabled", lambda sid: False if sid == "rss" else True)
+    if hasattr(news_rss.fetch_all_headlines, "cache_clear"):
+        news_rss.fetch_all_headlines.cache_clear()
+    assert news_rss.fetch_all_headlines() == []

@@ -4,8 +4,8 @@ from datetime import date, datetime
 
 from sqlalchemy.orm import Session
 
-from ..config import settings
 from ..models import Account, Order, Position
+from ..runtime_settings import get_setting
 
 LIMIT_PCT = 9.8  # 涨跌停近似阈值(%)
 
@@ -17,11 +17,15 @@ class FillResult:
     reason: str = ""
 
 
+def _initial_cash() -> float:
+    return float(get_setting("account.initial_cash"))
+
+
 def get_account(db: Session, model_pk: int) -> Account:
     account = db.query(Account).filter(Account.model_pk == model_pk).first()
     if account is None:
-        account = Account(model_pk=model_pk, cash=settings.initial_cash,
-                          initial_cash=settings.initial_cash)
+        cash = _initial_cash()
+        account = Account(model_pk=model_pk, cash=cash, initial_cash=cash)
         db.add(account)
         db.commit()
     return account
@@ -33,15 +37,19 @@ def get_position(db: Session, model_pk: int, code: str) -> Position | None:
 
 
 def calc_buy_fee(amount: float) -> float:
-    commission = max(amount * settings.commission_rate, settings.commission_min)
-    transfer = amount * settings.transfer_fee_rate
+    rate = float(get_setting("trading.commission_rate"))
+    floor = float(get_setting("trading.commission_min"))
+    transfer = amount * float(get_setting("trading.transfer_fee_rate"))
+    commission = max(amount * rate, floor)
     return round(commission + transfer, 2)
 
 
 def calc_sell_fee(amount: float) -> float:
-    commission = max(amount * settings.commission_rate, settings.commission_min)
-    stamp = amount * settings.stamp_tax_rate
-    transfer = amount * settings.transfer_fee_rate
+    rate = float(get_setting("trading.commission_rate"))
+    floor = float(get_setting("trading.commission_min"))
+    stamp = amount * float(get_setting("trading.stamp_tax_rate"))
+    transfer = amount * float(get_setting("trading.transfer_fee_rate"))
+    commission = max(amount * rate, floor)
     return round(commission + stamp + transfer, 2)
 
 

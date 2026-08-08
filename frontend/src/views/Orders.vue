@@ -3,11 +3,34 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">成交</h1>
-        <p class="page-sub">模拟撮合订单与盘中事件</p>
+        <p class="page-sub">模拟撮合订单与盘中事件 · 可按账户筛选</p>
+      </div>
+      <div class="head-actions">
+        <el-select
+          v-model="filterModel"
+          size="small"
+          clearable
+          placeholder="全部账户"
+          style="width: 180px"
+          @change="loadOrders"
+        >
+          <el-option
+            v-for="m in models"
+            :key="m.id"
+            :label="m.name"
+            :value="m.id"
+          />
+        </el-select>
+        <el-button size="small" :loading="loading" @click="reload">刷新</el-button>
       </div>
     </div>
     <el-card>
-      <template #header>交易记录</template>
+      <template #header>
+        <div class="card-h">
+          <span>交易记录</span>
+          <span class="dim mono" style="font-size:12px">最近 {{ orders.length }} 条</span>
+        </div>
+      </template>
 
       <template v-if="isMobile">
         <div v-for="row in orders" :key="row.id" class="o-row">
@@ -19,7 +42,7 @@
               </el-tag>
               <el-tag v-if="row.status !== 'filled'" type="info" size="small">拒绝</el-tag>
             </div>
-            <div class="o-meta">{{ row.created_at.slice(5, 16) }} · {{ row.model }}</div>
+            <div class="o-meta">{{ (row.created_at || '').slice(5, 16) }} · {{ row.model }}</div>
             <div v-if="row.reject_reason" class="reject">{{ row.reject_reason }}</div>
           </div>
           <div class="o-right" v-if="row.status === 'filled'">
@@ -33,7 +56,7 @@
       <template v-else>
         <el-table :data="orders" stripe v-loading="loading">
           <el-table-column prop="created_at" label="时间" width="165" />
-          <el-table-column prop="model" label="模型" width="110" />
+          <el-table-column prop="model" label="账户" width="120" />
           <el-table-column prop="code" label="代码" width="85" />
           <el-table-column prop="name" label="名称" width="100" />
           <el-table-column label="方向" width="70">
@@ -71,7 +94,9 @@
             <el-tag :type="triggerType(row.trigger)" size="small" :effect="row.trigger === 'deep_loss' ? 'dark' : 'light'">
               {{ triggerText(row.trigger) }}
             </el-tag>
-            <span :class="row.pnl_pct >= 0 ? 'up' : 'down'" class="pnl">{{ row.pnl_pct.toFixed(2) }}%</span>
+            <span :class="(row.pnl_pct ?? 0) >= 0 ? 'up' : 'down'" class="pnl">
+              {{ row.pnl_pct != null ? row.pnl_pct.toFixed(2) + '%' : '—' }}
+            </span>
             <el-tag :type="row.action === 'review_sell' ? 'success' : 'info'" size="small" class="ev-action">
               {{ actionText(row.action) }}
             </el-tag>
@@ -100,7 +125,9 @@
           </el-table-column>
           <el-table-column label="盈亏" width="90">
             <template #default="{ row }">
-              <span :class="row.pnl_pct >= 0 ? 'up' : 'down'">{{ row.pnl_pct.toFixed(2) }}%</span>
+              <span :class="(row.pnl_pct ?? 0) >= 0 ? 'up' : 'down'">
+                {{ row.pnl_pct != null ? row.pnl_pct.toFixed(2) + '%' : '—' }}
+              </span>
             </template>
           </el-table-column>
           <el-table-column label="复审结果" width="110">
@@ -136,6 +163,8 @@ import { useIsMobile } from '../composables/useIsMobile.js'
 const { isMobile } = useIsMobile()
 const orders = ref([])
 const events = ref([])
+const models = ref([])
+const filterModel = ref(null)
 const loading = ref(false)
 
 const triggerType = (t) => ({ stop_loss: 'warning', take_profit: 'success', deep_loss: 'danger' }[t] || 'info')
@@ -148,20 +177,34 @@ const actionText = (a) => ({
 }[a] || a)
 const rowClass = ({ row }) => (row.trigger === 'deep_loss' ? 'deep-loss-row' : '')
 
-onMounted(async () => {
+async function loadOrders() {
+  orders.value = await api.getOrders(filterModel.value ?? undefined)
+}
+
+async function reload() {
   loading.value = true
   try {
-    orders.value = await api.getOrders()
-    events.value = await api.getMonitorEvents()
+    const [ord, ev, ms] = await Promise.all([
+      api.getOrders(filterModel.value ?? undefined),
+      api.getMonitorEvents(),
+      api.getModels().catch(() => []),
+    ])
+    orders.value = ord
+    events.value = Array.isArray(ev) ? ev : []
+    models.value = ms
   } catch (err) {
     ElMessage.error(err.message)
   } finally {
     loading.value = false
   }
-})
+}
+
+onMounted(reload)
 </script>
 
 <style scoped>
+.head-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.card-h { display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; }
 .mt { margin-top: 12px; }
 .detail {
   white-space: pre-wrap; font-size: 12px; max-height: 320px; overflow-y: auto;

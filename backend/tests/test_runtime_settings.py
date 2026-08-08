@@ -7,7 +7,7 @@ from app.models import SettingOverride
 
 def test_registry_has_core_groups():
     ids = {g["id"] for g in GROUPS}
-    assert {"secrets", "selector", "prompt", "risk", "schedule"}.issubset(ids)
+    assert {"secrets", "selector", "prompt", "risk", "schedule", "datasources"}.issubset(ids)
     assert "selector.pool_max" in REGISTRY
     assert "prompt.selector" in REGISTRY
     assert "risk.deep_loss_pct" in REGISTRY

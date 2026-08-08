@@ -1,11 +1,12 @@
 """盘中持仓监控（分层 3）:
 
-- 深亏: 硬规则强制自动砍仓（不经 LLM）
+- 深亏: 硬规则强制自动砍仓（不经 LLM）——仅交易时段 + 报价经校验
 - 浅止损/止盈线: 仅告警；若关闭 alert_only 则走 LLM 复审
+- 规则账户不参与盘中监控
 """
 import json
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from sqlalchemy.orm import Session
 
@@ -156,19 +157,28 @@ def review_position(db: Session, pos: Position, price: float, pct_change: float,
 
     if decision and decision["action"] == "sell":
         avg_cost = pos.avg_cost
-        result = broker.sell(db, pos.model_pk, None, pos.code, pos.name,
-                             price, pct_change, pos.available_qty)
-        action = "review_sell" if result.ok else "review_hold"
-        if not result.ok:
-            detail += f"\n[卖出未成交: {result.reason}]"
-        elif result.order:
-            model = db.get(Model, pos.model_pk)
-            record_close_from_sell(
-                db, strategy_key=strategy_key_for_model(pos.model_pk, model.type if model else "llm"),
-                model_pk=pos.model_pk, code=pos.code, name=pos.name,
-                qty=result.order.qty, price=price, signal_source="review",
-                order_id=result.order.id, avg_cost=avg_cost,
-            )
+        # 复审卖出也校验报价
+        if market.sanitize_quote(
+            {"price": price, "code": pos.code},
+            code=pos.code, avg_cost=avg_cost,
+        ) is None:
+            action = "review_hold"
+            detail += "\n[报价异常，拒绝卖出]"
+        else:
+            result = broker.sell(db, pos.model_pk, None, pos.code, pos.name,
+                                 price, pct_change, pos.available_qty)
+            action = "review_sell" if result.ok else "review_hold"
+            if not result.ok:
+                detail += f"\n[卖出未成交: {result.reason}]"
+            elif result.order:
+                model = db.get(Model, pos.model_pk)
+                record_close_from_sell(
+                    db, strategy_key=strategy_key_for_model(
+                        pos.model_pk, model.type if model else "llm"),
+                    model_pk=pos.model_pk, code=pos.code, name=pos.name,
+                    qty=result.order.qty, price=price, signal_source="review",
+                    order_id=result.order.id, avg_cost=avg_cost,
+                )
 
     event = MonitorEvent(model_pk=pos.model_pk, code=pos.code, name=pos.name,
                          pnl_pct=round(pnl_pct, 4), trigger=trigger,
@@ -179,9 +189,14 @@ def review_position(db: Session, pos: Position, price: float, pct_change: float,
 
 
 def run_monitor() -> int:
-    """扫描所有账户持仓,触发复审/强制砍仓。返回触发的事件数。"""
-    if engine._run_lock:
+    """扫描 AI 账户持仓,触发复审/强制砍仓。返回触发的事件数。"""
+    if engine.is_running():
         logger.info("决策流程运行中,跳过本次监控")
+        return 0
+
+    # 硬门禁：非交易日 / 非连续竞价时段绝不强平（防盘后脏报价）
+    if not market.is_trading_session():
+        logger.info("非交易时段,跳过盘中监控")
         return 0
 
     from ..database import SessionLocal
@@ -194,7 +209,13 @@ def run_monitor() -> int:
             model = db.get(Model, pos.model_pk)
             if model is None or not model.enabled:
                 continue
-            quote = market.get_quote(pos.code)
+            # 规则臂按周频调仓，不参与盘中 LLM 复审/深亏砍仓
+            if model.type == "rule":
+                continue
+            # 交易级行情：扶摇优先 + 腾讯交叉 + 成本/日K校验，失败会写 ERROR 审计日志
+            quote = market.get_trade_quote(
+                pos.code, avg_cost=pos.avg_cost or None, require_cross_check=True,
+            )
             if quote is None or not pos.avg_cost:
                 continue
             price, pct_change = quote["price"], quote["pct_change"]
@@ -202,8 +223,38 @@ def run_monitor() -> int:
             trigger = should_review(db, pos.model_pk, pos.code, pnl_pct)
             if trigger is None:
                 continue
-            logger.info("监控触发 %s: 模型#%s %s 盈亏 %.1f%%", trigger,
-                        pos.model_pk, pos.code, pnl_pct * 100)
+            # 深亏必须再次用日 K 印证（双保险）
+            if trigger == "deep_loss":
+                close = market.last_close_price(pos.code)
+                if close and close > 0:
+                    kline_pnl = (close - pos.avg_cost) / pos.avg_cost
+                    deep = float(get_setting("risk.deep_loss_pct"))
+                    if kline_pnl > deep:
+                        logger.warning(
+                            "深亏实时价与日K不一致,跳过强平 %s realtime=%.2f%% kline=%.2f%% "
+                            "price=%.4f close=%.4f source=%s",
+                            pos.code, pnl_pct * 100, kline_pnl * 100,
+                            price, close, quote.get("source"),
+                        )
+                        event = MonitorEvent(
+                            model_pk=pos.model_pk, code=pos.code, name=pos.name,
+                            pnl_pct=round(pnl_pct, 4), trigger="deep_loss",
+                            action="alert",
+                            detail=(
+                                f"实时浮亏 {pnl_pct:+.1%} 但日K收盘浮亏 {kline_pnl:+.1%} "
+                                f"未达阈值，疑似脏报价，仅告警不砍仓 "
+                                f"(price={price:.4f} source={quote.get('source')})"
+                            ),
+                        )
+                        db.add(event)
+                        db.commit()
+                        count += 1
+                        continue
+            logger.info(
+                "监控触发 %s: 模型#%s %s 盈亏 %.1f%% price=%.4f source=%s",
+                trigger, pos.model_pk, pos.code, pnl_pct * 100,
+                price, quote.get("source"),
+            )
             review_position(db, pos, price, pct_change, pnl_pct, trigger)
             count += 1
     finally:

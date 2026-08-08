@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 _select_lock = False
 
 
+def is_selecting() -> bool:
+    return bool(_select_lock)
+
+
 def parse_selector_json(text: str) -> dict | None:
     """从 LLM 输出中提取 {picks: [...], keep: [...]},失败返回 None。"""
     decoder = json.JSONDecoder()
@@ -88,7 +92,7 @@ def run_selector(trigger: str = "schedule") -> int | None:
     global _select_lock
     from . import engine as engine_mod
 
-    if _select_lock or engine_mod._run_lock:
+    if _select_lock or engine_mod.is_running():
         logger.warning("决策或选股流程运行中,跳过本次选股")
         return None
     _select_lock = True
@@ -160,6 +164,16 @@ def run_selector(trigger: str = "schedule") -> int | None:
         removed = _apply_lifecycle(db, auto_items, favored)
         logger.info("选股完成: 新增 %s, 移除 %s", added or "无", removed or "无")
         run.status = "done"
+        run.result_json = json.dumps({
+            "kind": "selector",
+            "model": model.name,
+            "added": added,
+            "removed": removed,
+            "kept": list(parsed.get("keep") or [])[:30],
+            "slots_before": slots,
+            "candidate_n": len(candidates),
+            "pool_size": db.query(Watchlist).count(),
+        }, ensure_ascii=False)
     except Exception as err:  # noqa: BLE001
         logger.exception("自动选股失败")
         run.status = "failed"

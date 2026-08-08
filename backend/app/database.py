@@ -31,6 +31,7 @@ def _migrate():
         ("watchlist", "source", "VARCHAR(10) DEFAULT 'manual'"),
         ("watchlist", "miss_count", "INTEGER DEFAULT 0"),
         ("watchlist", "select_reason", "TEXT DEFAULT ''"),
+        ("runs", "result_json", "TEXT DEFAULT ''"),
     ]
     with engine.connect() as conn:
         for table, column, ddl in migrations:

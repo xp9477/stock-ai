@@ -42,27 +42,54 @@
         </div>
         <div class="top-actions">
           <span
-            v-if="status.running"
+            v-if="status.running || status.selecting"
             class="live-dot"
             role="status"
             aria-live="polite"
-          >决策中</span>
+            :title="progressText"
+          >{{ progressShort }}</span>
+          <el-button
+            v-if="status.running && status.current_run_id"
+            size="small"
+            text
+            type="primary"
+            @click="goCurrentRun"
+          >查看过程</el-button>
+          <el-button
+            v-if="status.running"
+            size="small"
+            type="danger"
+            plain
+            :loading="cancelling"
+            @click="cancelRun"
+          >停止</el-button>
           <el-button
             size="small"
             type="warning"
             plain
             :loading="rebalancing"
+            :disabled="status.running || status.selecting"
             @click="rebalance"
           >规则调仓</el-button>
           <el-button
             size="small"
             type="primary"
             :loading="triggering"
-            :disabled="status.running"
+            :disabled="status.running || status.selecting"
             @click="trigger"
           >{{ isMobile ? 'AI 决策' : '立即 AI 决策' }}</el-button>
         </div>
       </header>
+
+      <div v-if="setupHints.length" class="setup-bar" role="status">
+        <span class="setup-label">待办</span>
+        <router-link
+          v-for="h in setupHints"
+          :key="h.to"
+          class="setup-chip"
+          :to="h.to"
+        >{{ h.text }}</router-link>
+      </div>
 
       <main class="content">
         <router-view />
@@ -95,15 +122,16 @@
 </template>
 
 <script setup>
-import { onMounted, onUnmounted, ref } from 'vue'
-import { useRoute } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import api from './api/index.js'
 import { useIsMobile } from './composables/useIsMobile.js'
 
 const NAV = [
   { path: '/', label: '战报', icon: '◈' },
   { path: '/strategies', label: '策略', icon: '◎' },
+  { path: '/research', label: '研究', icon: '✎' },
   { path: '/watchlist', label: '股池', icon: '▣' },
   { path: '/runs', label: '决策', icon: '☰' },
   { path: '/orders', label: '成交', icon: '⇄' },
@@ -112,12 +140,56 @@ const NAV = [
 ]
 
 const route = useRoute()
+const router = useRouter()
 const { isMobile } = useIsMobile()
 const drawer = ref(false)
 const status = ref({})
 const triggering = ref(false)
 const rebalancing = ref(false)
+const cancelling = ref(false)
 let timer = null
+
+const progressText = computed(() => {
+  if (status.value?.selecting) return 'AI 选股进行中'
+  const p = status.value?.progress
+  if (!p) return '决策中'
+  return p.message || '决策中'
+})
+
+const progressShort = computed(() => {
+  if (status.value?.selecting) return '选股中…'
+  if (!status.value?.running) return ''
+  if (status.value?.cancel_requested) return '停止中…'
+  const p = status.value?.progress
+  if (!p) return '决策中'
+  if (p.model_total && p.stock_total && p.phase === 'stock') {
+    return `决策 ${p.model_index}/${p.model_total} · ${p.stock_index}/${p.stock_total}`
+  }
+  if (p.agent) return `决策 · ${p.agent}`
+  return '决策中'
+})
+
+/** 关键就绪检查：密钥 / 股池 / 选手 / 规则尚未调仓 */
+const setupHints = computed(() => {
+  const s = status.value || {}
+  const hints = []
+  if (s.llm_configured === false) {
+    hints.push({ to: '/settings?tab=secrets', text: '配置 LLM 密钥' })
+  }
+  if (s.fuyao_configured === false) {
+    hints.push({ to: '/settings?tab=secrets', text: '配置扶摇 Key' })
+  }
+  if ((s.pool_size ?? 0) === 0) {
+    hints.push({ to: '/watchlist', text: '添加股池' })
+  }
+  if ((s.llm_enabled_count ?? 0) === 0 && s.llm_configured !== false) {
+    hints.push({ to: '/models', text: '启用 AI 账户' })
+  }
+  if ((s.rule_enabled_count ?? 0) > 0 && s.rule_has_positions === false && s.fuyao_configured) {
+    hints.push({ to: '/strategies', text: '规则尚未调仓' })
+  }
+  return hints.slice(0, 4)
+})
 
 function isActive(path) {
   if (path === '/') return route.path === '/'
@@ -130,12 +202,52 @@ async function refreshStatus() {
   } catch { /* silent */ }
 }
 
+function goCurrentRun() {
+  const id = status.value?.current_run_id
+  if (id) router.push(`/runs/${id}`)
+}
+
+async function cancelRun() {
+  cancelling.value = true
+  try {
+    const res = await api.cancelRun()
+    ElMessage.warning(res.message || '已请求停止')
+    await refreshStatus()
+  } catch (err) {
+    ElMessage.error(err.message)
+  } finally {
+    cancelling.value = false
+  }
+}
+
 async function trigger() {
+  const s = status.value || {}
+  if ((s.pool_size ?? 0) === 0) {
+    ElMessage.warning('股池为空，请先到「股池」添加标的或 AI 选股')
+    router.push('/watchlist')
+    return
+  }
+  if (!s.llm_configured) {
+    ElMessage.warning('未配置 LLM API Key')
+    router.push('/settings?tab=secrets')
+    return
+  }
+  if ((s.llm_enabled_count ?? 0) === 0) {
+    ElMessage.warning('无启用的 LLM 模型')
+    router.push('/models')
+    return
+  }
   triggering.value = true
   try {
     await api.triggerRun()
-    ElMessage.success('AI 决策已启动，稍后在「决策」查看')
+    ElMessage.success('AI 决策已启动，可点「查看过程」跟随流水线')
     await refreshStatus()
+    setTimeout(async () => {
+      await refreshStatus()
+      if (status.value?.current_run_id) {
+        router.push(`/runs/${status.value.current_run_id}`)
+      }
+    }, 600)
   } catch (err) {
     ElMessage.error(err.message)
   } finally {
@@ -144,11 +256,27 @@ async function trigger() {
 }
 
 async function rebalance() {
+  try {
+    await ElMessageBox.confirm(
+      '将对全部启用的规则策略（S2 / 池内等权 / 研究晋升臂）立即按当前股池调仓。非周一也可手动执行，会真实买卖模拟盘。',
+      '确认规则调仓',
+      { type: 'warning', confirmButtonText: '开始调仓', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
   rebalancing.value = true
   try {
     const res = await api.rulesRebalance()
-    const ok = (res.results || []).filter((r) => r.ok).length
-    ElMessage.success(`规则调仓完成（${ok} 个策略）`)
+    const results = res.results || []
+    const ok = results.filter((r) => r.ok).length
+    const fail = results.filter((r) => r.ok === false)
+    if (fail.length) {
+      const msg = fail.map((r) => `${r.model_id}: ${r.error || '失败'}`).join('；')
+      ElMessage.warning(`调仓完成 ${ok}/${results.length}。失败：${msg}`)
+    } else {
+      ElMessage.success(`规则调仓完成（${ok} 个策略）`)
+    }
   } catch (err) {
     ElMessage.error(err.message)
   } finally {
@@ -158,7 +286,13 @@ async function rebalance() {
 
 onMounted(() => {
   refreshStatus()
-  timer = setInterval(refreshStatus, 12000)
+  // 运行中加快轮询，便于进度条
+  timer = setInterval(() => {
+    refreshStatus()
+  }, status.value?.running ? 2500 : 8000)
+  // 固定 2.5s 轮询：状态变化时仍够用
+  clearInterval(timer)
+  timer = setInterval(refreshStatus, 2500)
 })
 onUnmounted(() => clearInterval(timer))
 </script>
@@ -247,8 +381,28 @@ onUnmounted(() => clearInterval(timer))
 }
 .content { padding: 18px 20px 40px; flex: 1; }
 
+.setup-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 8px 18px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(251, 191, 36, 0.06);
+  font-size: 12px;
+}
+.setup-label {
+  color: var(--warn, #fbbf24); font-weight: 700; letter-spacing: 0.04em;
+  text-transform: uppercase; font-size: 10px;
+}
+.setup-chip {
+  padding: 3px 10px; border-radius: 999px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  color: var(--text-muted); background: rgba(0,0,0,0.15);
+  transition: color 0.15s, border-color 0.15s;
+}
+.setup-chip:hover { color: var(--accent); border-color: var(--accent); }
+
 .shell.mobile .topbar { padding: 0 10px; }
 .shell.mobile .content { padding: 12px 10px 32px; }
+.shell.mobile .setup-bar { padding: 8px 10px; }
 .drawer-brand { border-bottom: 1px solid var(--border); margin-bottom: 8px; }
 
 @media (max-width: 768px) {

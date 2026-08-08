@@ -21,6 +21,13 @@ _pro_token: str | None = None
 
 
 def available() -> bool:
+    """Token 已配置且数据源开关启用。"""
+    try:
+        from . import datasources as ds
+        if not ds.is_enabled("tushare"):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     return bool(str(get_setting("secrets.tushare_token")).strip())
 
 
@@ -32,6 +39,8 @@ def reset_client() -> None:
 
 def _get_pro():
     global _pro, _pro_token
+    if not available():
+        return None
     token = str(get_setting("secrets.tushare_token")).strip()
     if not token:
         logger.warning("TUSHARE_TOKEN 未配置，因子基本面将不可用")

@@ -36,6 +36,16 @@ def _env_fallback(key: str) -> Any | None:
         "secrets.llm_temperature": settings.llm_temperature,
         "secrets.fuyao_api_key": settings.fuyao_api_key,
         "secrets.tushare_token": settings.tushare_token,
+        "account.initial_cash": settings.initial_cash,
+        "trading.commission_rate": settings.commission_rate,
+        "trading.commission_min": settings.commission_min,
+        "trading.stamp_tax_rate": settings.stamp_tax_rate,
+        "trading.transfer_fee_rate": settings.transfer_fee_rate,
+        "schedule.enabled": settings.schedule_enabled,
+        "schedule.daily_decision_time": settings.daily_decision_time,
+        "schedule.stock_select_enabled": settings.stock_select_enabled,
+        "schedule.stock_select_time": settings.stock_select_time,
+        "schedule.monitor_interval_minutes": settings.monitor_interval_minutes,
     }
     if key not in mapping:
         return None
@@ -99,6 +109,19 @@ def _coerce(defn: SettingDef, raw: Any) -> Any:
         raise ValueError(f"{defn.key}: 文本不能为空")
     if _is_secret(defn):
         return s.strip()
+    s = s.strip() if defn.type == "str" else s
+    # 数据源失败策略白名单
+    if defn.key.endswith(".fail_policy"):
+        allowed = {"fallback", "hard", "skip"}
+        low = s.lower()
+        if low not in allowed:
+            raise ValueError(f"{defn.key}: 须为 fallback / hard / skip，收到 {raw!r}")
+        return low
+    if defn.key == "logs.min_level":
+        low = s.upper()
+        if low not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+            raise ValueError(f"{defn.key}: 须为 DEBUG/INFO/WARNING/ERROR")
+        return low
     return s
 
 
@@ -206,6 +229,7 @@ def list_settings(group: str | None = None, db: Session | None = None) -> list[d
             "max_value": defn.max_value,
             "secret": _is_secret(defn),
             "overridden": defn.key in overrides,
+            "danger": getattr(defn, "danger", "normal") or "normal",
         }
         if _is_secret(defn):
             configured = bool(str(raw or "").strip())
@@ -288,7 +312,31 @@ def set_settings(updates: dict[str, Any], db: Session) -> dict:
     db.commit()
     invalidate_cache()
     _on_secrets_changed(updated)
+    if any(k.startswith("datasources.") for k in updated):
+        _clear_data_caches()
+    if any(k.startswith("secrets.tushare") for k in updated):
+        try:
+            from .data import tushare_client
+            tushare_client.reset_client()
+        except Exception:  # noqa: BLE001
+            pass
     return {"updated": updated, "skipped": skipped, "reload_scheduler": reload}
+
+
+def _clear_data_caches() -> None:
+    """数据源设置变更后清 TTL，避免旧开关结果残留。"""
+    try:
+        from .data import market, news_rss
+        for fn in (
+            market._tx_quote_raw, market.get_daily_kline, market.get_news,
+            market.get_index_daily, market.get_hs300_history, market._trade_dates,
+            market.get_market_snapshot, market.get_screen_universe,
+            news_rss.fetch_all_headlines,
+        ):
+            if hasattr(fn, "cache_clear"):
+                fn.cache_clear()
+    except Exception:  # noqa: BLE001
+        logger.debug("clear data caches failed", exc_info=True)
 
 
 def reset_settings(keys: list[str] | None = None, group: str | None = None,
@@ -317,6 +365,8 @@ def reset_settings(keys: list[str] | None = None, group: str | None = None,
         db.commit()
         invalidate_cache()
         _on_secrets_changed(removed)
+        if any(k.startswith("datasources.") for k in removed):
+            _clear_data_caches()
         return {"removed": removed, "reload_scheduler": reload}
     finally:
         if own:

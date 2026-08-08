@@ -58,8 +58,13 @@ def _ms_to_date(ms: int | float) -> str:
 def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     if not available():
         raise RuntimeError("FUYAO_API_KEY 未配置")
+    from . import datasources as ds
+
+    if not ds.is_enabled("fuyao"):
+        raise RuntimeError("扶摇数据源已禁用（设置 → 数据源）")
+    to = ds.timeout_sec("fuyao", 30)
     url = f"{BASE_URL}{path}"
-    resp = requests.get(url, headers=_headers(), params=params or {}, timeout=30)
+    resp = requests.get(url, headers=_headers(), params=params or {}, timeout=to)
     resp.raise_for_status()
     body = resp.json()
     code = body.get("code")

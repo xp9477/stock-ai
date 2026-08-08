@@ -247,6 +247,9 @@ def rebalance_strategy(db: Session, model_id: str) -> dict[str, Any]:
     elif model_id == POOL_EQUAL:
         targets = _target_codes_equal(codes)
         signal = "pool_equal"
+    elif model_id.startswith("res_"):
+        targets = _target_codes_research(db, model, codes)
+        signal = model_id
     else:
         raise ValueError(f"未知规则策略: {model_id}")
 
@@ -266,10 +269,54 @@ def rebalance_strategy(db: Session, model_id: str) -> dict[str, Any]:
     return result
 
 
+def _target_codes_research(db: Session, model: Model, codes: list[str]) -> list[str]:
+    """研究晋升规格：按因子子集综合分取 top_n；equal_weight 则全池。"""
+    import json
+
+    from ..factors.definitions import FACTOR_NAMES
+    from ..factors.panel import latest_factor_snapshot
+    from ..factors.score import composite_scores, select_top_n
+    from ..runtime_settings import get_setting
+
+    try:
+        meta = json.loads(model.members or "{}")
+    except json.JSONDecodeError:
+        meta = {}
+    spec = meta.get("spec") if isinstance(meta, dict) else None
+    if not isinstance(spec, dict):
+        return _target_codes_s2(db, codes)
+
+    mode = spec.get("mode") or "factor_cross_section"
+    if mode == "equal_weight":
+        return _target_codes_equal(codes)
+
+    factors = [f for f in (spec.get("factors") or []) if f in FACTOR_NAMES]
+    if not factors:
+        factors = list(FACTOR_NAMES[:6])
+    try:
+        top_n = int(spec.get("top_n") or get_setting("factor.top_n"))
+    except (TypeError, ValueError):
+        top_n = int(get_setting("factor.top_n"))
+    snap = latest_factor_snapshot(codes)
+    if snap is None or snap.empty:
+        return []
+    scored = composite_scores(snap, tuple(factors))
+    return select_top_n(scored, n=top_n)
+
+
 def rebalance_all_rules(db: Session) -> dict[str, Any]:
-    """全部启用规则策略调仓（周频任务入口）。"""
+    """全部启用规则策略调仓（周频任务入口 + 研究晋升臂）。"""
     results = []
-    for mid in RULE_MODEL_IDS:
+    mids: list[str] = list(RULE_MODEL_IDS)
+    for m in (
+        db.query(Model)
+        .filter(Model.type == "rule", Model.enabled.is_(True), Model.model_id.like("res_%"))
+        .all()
+    ):
+        if m.model_id not in mids:
+            mids.append(m.model_id)
+
+    for mid in mids:
         model = (
             db.query(Model)
             .filter(Model.type == "rule", Model.model_id == mid, Model.enabled.is_(True))

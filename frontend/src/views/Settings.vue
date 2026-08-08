@@ -170,6 +170,8 @@
                   <span v-if="item.overridden" class="tag">已覆盖</span>
                   <span v-if="isDirty(item.key)" class="tag warn">未保存</span>
                   <span v-if="item.requires_scheduler_reload" class="tag ok">改后重载调度</span>
+                  <span v-if="item.danger === 'confirm'" class="tag warn">改前确认</span>
+                  <span v-if="item.danger === 'frozen'" class="tag bad">仅新户/重置</span>
                 </div>
               </div>
 
@@ -267,6 +269,82 @@
             </div>
           </div>
 
+          <!-- 数据源健康面板 -->
+          <div v-if="activeGroup === 'datasources'" class="ds-health panel-inset">
+            <div class="ds-health-head">
+              <div>
+                <div class="ds-health-title">数据源健康</div>
+                <p class="block-help">角色固定：扶摇主源 · 新浪兜底 · 腾讯实时 · Tushare 备 · RSS 新闻。下方可探测连通性。</p>
+              </div>
+              <el-button size="small" type="primary" plain :loading="probing" @click="probeAll">
+                立即探测
+              </el-button>
+            </div>
+            <div v-if="probeResults.length" class="ds-grid">
+              <article v-for="r in probeResults" :key="r.id" class="ds-card" :class="r.ok ? 'ok' : 'bad'">
+                <div class="ds-card-top">
+                  <b>{{ r.label || r.id }}</b>
+                  <span class="tag" :class="r.ok ? 'ok' : 'bad'">{{ r.ok ? '正常' : '异常' }}</span>
+                </div>
+                <div class="ds-role dim">{{ r.role }}</div>
+                <div class="ds-detail mono">{{ r.detail || '—' }}</div>
+                <div class="ds-meta mono dim">
+                  {{ r.enabled === false ? '已禁用 · ' : '' }}
+                  超时 {{ r.timeout_sec ?? '—' }}s · 失败 {{ r.fail_policy || '—' }}
+                  <template v-if="r.latency_ms != null"> · {{ r.latency_ms }}ms</template>
+                </div>
+              </article>
+            </div>
+            <p v-else class="empty">尚未探测。保存启停/超时后点「立即探测」。</p>
+
+            <div v-if="rssFeeds.length" class="rss-list">
+              <div class="ds-health-title" style="margin:14px 0 8px">RSS 源列表（只读）</div>
+              <ul class="rss-ul">
+                <li v-for="f in rssFeeds" :key="f.id">
+                  <span class="tag" :class="f.region === 'cn' ? 'ok' : ''">{{ f.region === 'cn' ? '国内' : '国际' }}</span>
+                  <b>{{ f.name }}</b>
+                  <span class="mono dim rss-url">{{ f.url }}</span>
+                </li>
+              </ul>
+            </div>
+            <p class="foot-note">
+              失败策略：<code>fallback</code> 降级下一源 · <code>hard</code> 立即失败 · <code>skip</code> 跳过。
+              启停/超时已接入行情·指数·选股·新闻路径。源 URL 在
+              <code>backend/app/data/news_rss.py</code>。
+            </p>
+          </div>
+
+          <!-- 全局日志面板 -->
+          <div v-if="activeGroup === 'logs'" class="ds-health panel-inset">
+            <div class="ds-health-head">
+              <div>
+                <div class="ds-health-title">全局日志</div>
+                <p class="block-help">运行中过程见决策页；此处为系统级日志（密钥已脱敏）。</p>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap">
+                <el-select v-model="logLevel" size="small" clearable placeholder="级别" style="width:110px" @change="loadLogs">
+                  <el-option label="全部" value="" />
+                  <el-option label="INFO" value="INFO" />
+                  <el-option label="WARNING" value="WARNING" />
+                  <el-option label="ERROR" value="ERROR" />
+                  <el-option label="DEBUG" value="DEBUG" />
+                </el-select>
+                <el-button size="small" :loading="logLoading" @click="loadLogs">刷新</el-button>
+                <el-button size="small" plain type="danger" @click="doPurgeLogs">清理过期</el-button>
+              </div>
+            </div>
+            <div v-if="logItems.length" class="log-box mono">
+              <div v-for="(row, i) in logItems" :key="row.id || i" class="log-line">
+                <span class="dim">{{ row.created_at }}</span>
+                <span :class="logLevelClass(row.level)">{{ row.level }}</span>
+                <span class="dim">{{ row.logger_name }}</span>
+                <span v-if="row.run_id" class="tag">run#{{ row.run_id }}</span>
+                <span>{{ row.message }}</span>
+              </div>
+            </div>
+            <p v-else class="empty">暂无日志。跑一轮决策或探测后会出现。</p>
+          </div>
+
           <p v-if="activeGroup === 'secrets'" class="foot-note">
             优先级：设置页覆盖 &gt; <code>.env</code> &gt; 空。接口不回传明文；留空保存表示不改。
           </p>
@@ -275,6 +353,9 @@
           </p>
           <p v-else-if="activeGroup === 'factor'" class="foot-note">
             S3：动量 / 反转 / 低波 / 低换手 / 估值 / ROE / ROE 改善；可选规模与板块中性。
+          </p>
+          <p v-else-if="activeGroup === 'debug'" class="foot-note">
+            P0 骨架：决策详情页有「调试」开关可展开 Agent 输入摘要；原始 token/HTTP 级日志在后续版本。
           </p>
         </div>
       </section>
@@ -286,7 +367,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api/index.js'
 
 const route = useRoute()
@@ -301,6 +382,12 @@ const models = ref([])
 const activeGroup = ref('secrets')
 const draft = reactive({})
 const baseline = reactive({})
+const probing = ref(false)
+const probeResults = ref([])
+const rssFeeds = ref([])
+const logItems = ref([])
+const logLoading = ref(false)
+const logLevel = ref('')
 
 const STATIC_MODELS_GROUP = {
   id: 'models',
@@ -310,24 +397,41 @@ const STATIC_MODELS_GROUP = {
 
 const itemMap = computed(() => Object.fromEntries(items.value.map((i) => [i.key, i])))
 
+/** 客户端保底分组顺序：后端未热更时也能看到「数据源」等入口 */
+const FALLBACK_GROUPS = [
+  { id: 'secrets', label: '密钥', description: 'LLM / 数据源 API' },
+  { id: 'datasources', label: '数据源', description: '扶摇/新浪/腾讯/Tushare/RSS' },
+  { id: 'account', label: '账户', description: '初始资金' },
+  { id: 'trading', label: '撮合', description: '佣金印花税' },
+  { id: 'selector', label: '选股', description: '' },
+  { id: 'prompt', label: 'Prompt', description: '' },
+  { id: 'risk', label: '风控', description: '' },
+  { id: 'factor', label: '因子', description: '' },
+  { id: 'models', label: '参赛账户', description: '' },
+  { id: 'schedule', label: '调度', description: '' },
+  { id: 'race', label: '赛马', description: '' },
+  { id: 'logs', label: '日志', description: '全局日志' },
+  { id: 'debug', label: '调试', description: '' },
+]
+
 const navGroups = computed(() => {
-  const fromApi = groups.value.length
-    ? groups.value.map((g) =>
-        g.id === 'models' ? { ...g, ...STATIC_MODELS_GROUP } : g,
-      )
-    : [
-        { id: 'secrets', label: '密钥', description: '' },
-        { id: 'selector', label: '选股', description: '' },
-        { id: 'prompt', label: 'Prompt', description: '' },
-        { id: 'risk', label: '风控', description: '' },
-        { id: 'factor', label: '因子', description: '' },
-        { id: 'schedule', label: '调度', description: '' },
-        { id: 'race', label: '赛马', description: '' },
-      ]
-  if (!fromApi.find((g) => g.id === 'models')) {
-    return [...fromApi, STATIC_MODELS_GROUP]
+  const byId = Object.fromEntries(
+    (groups.value || []).map((g) => [g.id, g]),
+  )
+  // 按保底顺序合并：API 有则用 API 元数据，缺的用 FALLBACK 补上
+  const merged = []
+  const seen = new Set()
+  for (const fb of FALLBACK_GROUPS) {
+    const g = byId[fb.id] || fb
+    merged.push(g.id === 'models' ? { ...g, ...STATIC_MODELS_GROUP } : { ...fb, ...g })
+    seen.add(g.id)
   }
-  return fromApi
+  for (const g of groups.value || []) {
+    if (!seen.has(g.id)) {
+      merged.push(g.id === 'models' ? { ...g, ...STATIC_MODELS_GROUP } : g)
+    }
+  }
+  return merged
 })
 
 const currentGroupMeta = computed(() => {
@@ -434,6 +538,68 @@ function selectGroup(id) {
   activeGroup.value = id
   router.replace({ query: { ...route.query, tab: id } })
   if (id === 'models') loadModels()
+  if (id === 'datasources') loadDatasourceStatus()
+  if (id === 'logs') loadLogs()
+}
+
+function logLevelClass(lv) {
+  if (lv === 'ERROR' || lv === 'CRITICAL') return 'down'
+  if (lv === 'WARNING') return 'warn-text'
+  return ''
+}
+
+async function loadLogs() {
+  logLoading.value = true
+  try {
+    const data = await api.getLogs({
+      limit: 200,
+      level: logLevel.value || undefined,
+    })
+    logItems.value = data.items || []
+  } catch (err) {
+    ElMessage.error(err.message)
+  } finally {
+    logLoading.value = false
+  }
+}
+
+async function doPurgeLogs() {
+  try {
+    const res = await api.purgeLogs()
+    ElMessage.success(`已清理 ${res.removed ?? 0} 条过期日志`)
+    await loadLogs()
+  } catch (err) {
+    ElMessage.error(err.message)
+  }
+}
+
+async function loadDatasourceStatus() {
+  try {
+    const data = await api.getDatasources()
+    rssFeeds.value = data.rss_feeds || []
+    probeResults.value = (data.sources || []).map((s) => ({
+      ...s,
+      ok: s.enabled !== false && (s.key_configured !== false || !s.needs_key),
+      detail: s.needs_key
+        ? (s.key_configured ? 'Key 已配置（未探测）' : 'Key 未配置')
+        : (s.enabled === false ? '已禁用' : '已启用（未探测）'),
+    }))
+  } catch (err) {
+    ElMessage.error(err.message)
+  }
+}
+
+async function probeAll() {
+  probing.value = true
+  try {
+    const data = await api.probeDatasources()
+    probeResults.value = data.results || []
+    ElMessage.success('探测完成')
+  } catch (err) {
+    ElMessage.error(err.message)
+  } finally {
+    probing.value = false
+  }
 }
 
 function applySettings(data) {
@@ -478,8 +644,10 @@ async function loadAll() {
 
 async function save() {
   const values = {}
+  const dirtyItems = []
   for (const it of items.value) {
     if (!isDirty(it.key) || !it.editable) continue
+    dirtyItems.push(it)
     if (it.secret || it.type === 'secret') {
       const s = String(draft[it.key] || '').trim()
       if (!s) continue
@@ -491,6 +659,19 @@ async function save() {
   if (!Object.keys(values).length) {
     ElMessage.info('没有需要保存的修改')
     return
+  }
+  const needConfirm = dirtyItems.filter((i) => i.danger === 'confirm' || i.danger === 'frozen')
+  if (needConfirm.length) {
+    const names = needConfirm.map((i) => i.label).join('、')
+    try {
+      await ElMessageBox.confirm(
+        `以下配置会影响赛马可比性或仅对新账户生效：\n${names}\n\n确认保存？`,
+        '危险配置确认',
+        { type: 'warning', confirmButtonText: '仍要保存', cancelButtonText: '取消' },
+      )
+    } catch {
+      return
+    }
   }
   saving.value = true
   try {
@@ -538,12 +719,18 @@ function onBeforeUnload(e) {
   }
 }
 
+function loadGroupSideData(tab) {
+  if (tab === 'models') loadModels()
+  if (tab === 'datasources') loadDatasourceStatus()
+  if (tab === 'logs') loadLogs()
+}
+
 watch(
   () => route.query.tab,
   (tab) => {
     if (typeof tab === 'string' && tab && tab !== activeGroup.value) {
       activeGroup.value = tab
-      if (tab === 'models') loadModels()
+      loadGroupSideData(tab)
     }
   },
 )
@@ -552,6 +739,7 @@ onMounted(async () => {
   const tab = typeof route.query.tab === 'string' ? route.query.tab : 'secrets'
   activeGroup.value = tab
   await loadAll()
+  loadGroupSideData(tab)
   window.addEventListener('beforeunload', onBeforeUnload)
 })
 
@@ -1035,6 +1223,61 @@ onUnmounted(() => {
   color: var(--text-muted);
   font-size: 13px;
 }
+
+.ds-health {
+  margin-bottom: 20px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel-2);
+}
+.ds-health-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.ds-health-title { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+.ds-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.ds-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: var(--panel);
+}
+.ds-card.ok { border-color: rgba(103, 194, 58, 0.35); }
+.ds-card.bad { border-color: rgba(245, 108, 108, 0.35); }
+.ds-card-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.ds-role { font-size: 11px; margin-bottom: 6px; line-height: 1.4; }
+.ds-detail { font-size: 12px; margin-bottom: 4px; word-break: break-all; }
+.ds-meta { font-size: 11px; }
+.rss-ul { list-style: none; margin: 0; padding: 0; }
+.rss-ul li {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
+  padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.rss-url { font-size: 11px; word-break: break-all; }
+.log-box {
+  max-height: 420px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 8px 10px; background: var(--panel);
+  font-size: 11px; line-height: 1.55;
+}
+.log-line { display: flex; flex-wrap: wrap; gap: 8px; padding: 3px 0; border-bottom: 1px solid var(--border); }
+.warn-text { color: #e6a23c; font-weight: 600; }
+.tag.bad { background: rgba(245,108,108,0.15); color: #f56c6c; }
 
 .foot-note {
   margin: 0;

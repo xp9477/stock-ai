@@ -30,7 +30,7 @@
           </div>
           <div v-if="row.type === 'llm'" class="meta mono" translate="no">{{ row.model_id }}</div>
           <div v-else-if="row.type === 'ensemble'" class="meta">
-            成员：{{ (row.members || []).map(nameOf).join(' · ') }}
+            成员：{{ memberNames(row) }}
           </div>
           <div v-else class="meta mono">策略 {{ row.model_id }}</div>
           <div class="m-row">
@@ -40,19 +40,22 @@
                 {{ formatPnl(row.pnl_pct) }}
               </span>
             </span>
-            <el-popconfirm
-              v-if="row.type !== 'rule'"
-              title="删除该账户全部数据？"
-              confirm-button-text="删除"
-              cancel-button-text="取消"
-              @confirm="remove(row.id)"
-            >
-              <template #reference>
-                <el-button size="small" type="danger" plain :aria-label="`删除 ${row.name}`">
-                  删除
-                </el-button>
-              </template>
-            </el-popconfirm>
+            <div class="m-actions">
+              <el-button size="small" type="primary" plain @click="openPositions(row)">持仓</el-button>
+              <el-popconfirm
+                v-if="row.type !== 'rule'"
+                title="删除该账户全部数据？"
+                confirm-button-text="删除"
+                cancel-button-text="取消"
+                @confirm="remove(row.id)"
+              >
+                <template #reference>
+                  <el-button size="small" type="danger" plain :aria-label="`删除 ${row.name}`">
+                    删除
+                  </el-button>
+                </template>
+              </el-popconfirm>
+            </div>
           </div>
         </div>
       </div>
@@ -72,7 +75,7 @@
           <template #default="{ row }">
             <span v-if="row.type === 'llm'" class="mono" translate="no">{{ row.model_id }}</span>
             <span v-else-if="row.type === 'rule'" class="mono" translate="no">{{ row.model_id }}</span>
-            <span v-else>{{ (row.members || []).map(nameOf).join(' · ') || '—' }}</span>
+            <span v-else>{{ memberNames(row) || '—' }}</span>
           </template>
         </el-table-column>
         <el-table-column label="收益率" width="110">
@@ -91,8 +94,9 @@
             />
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="100">
+        <el-table-column label="操作" width="160">
           <template #default="{ row }">
+            <el-button size="small" type="primary" plain @click="openPositions(row)">持仓</el-button>
             <el-popconfirm
               v-if="row.type !== 'rule'"
               title="删除该账户全部数据？"
@@ -106,11 +110,53 @@
                 </el-button>
               </template>
             </el-popconfirm>
-            <span v-else class="dim">—</span>
           </template>
         </el-table-column>
       </el-table>
     </section>
+
+    <el-drawer
+      v-model="posDrawer"
+      :title="posModel ? `持仓 · ${posModel.name}` : '持仓'"
+      :size="isMobile ? '92%' : '480px'"
+      destroy-on-close
+    >
+      <div v-if="posLoading" class="empty">加载中…</div>
+      <template v-else-if="posData.total_equity != null">
+        <div class="pos-summary">
+          <div>
+            <div class="m-label">总资产</div>
+            <div class="mono m-value">{{ fmtMoney(posData.total_equity) }}</div>
+          </div>
+          <div>
+            <div class="m-label">现金</div>
+            <div class="mono m-value">{{ fmtMoney(posData.cash) }}</div>
+          </div>
+          <div>
+            <div class="m-label">收益率</div>
+            <div class="mono m-value" :class="posData.total_pnl_pct >= 0 ? 'up' : 'down'">
+              {{ formatPnl(posData.total_pnl_pct) }}
+            </div>
+          </div>
+        </div>
+        <div v-if="(posData.positions || []).length" class="pos-list">
+          <div v-for="p in posData.positions" :key="p.code" class="pos-item">
+            <div class="pos-item-h">
+              <b>{{ p.name }}</b>
+              <span class="mono dim">{{ p.code }}</span>
+              <span class="mono" :class="p.pnl >= 0 ? 'up' : 'down'">{{ p.pnl_pct?.toFixed(2) }}%</span>
+            </div>
+            <div class="pos-item-grid mono">
+              <span>持仓 {{ p.total_qty }} / 可卖 {{ p.available_qty }}</span>
+              <span>成本 {{ p.avg_cost }} · 现价 {{ p.price }}</span>
+              <span>市值 {{ fmtMoney(p.market_value) }}</span>
+            </div>
+            <p v-if="p.buy_reason" class="pos-reason">{{ p.buy_reason }}</p>
+          </div>
+        </div>
+        <el-empty v-else description="该账户当前空仓" :image-size="56" />
+      </template>
+    </el-drawer>
 
     <p class="hint foot">
       规则账户由系统维护，不可删除。LLM 共用
@@ -204,9 +250,37 @@ const llmDialog = ref(false)
 const ensembleDialog = ref(false)
 const llmForm = ref({ name: '', model_id: '' })
 const ensembleForm = ref({ name: '', members: [] })
+const posDrawer = ref(false)
+const posModel = ref(null)
+const posData = ref({})
+const posLoading = ref(false)
 
 const llmModels = computed(() => models.value.filter((m) => m.type === 'llm'))
 const nameOf = (pk) => models.value.find((m) => m.id === pk)?.name || pk
+function memberNames(row) {
+  const ms = row?.members
+  if (!Array.isArray(ms) || !ms.length) return ''
+  return ms.map(nameOf).join(' · ')
+}
+
+function fmtMoney(v) {
+  if (v == null || Number.isNaN(Number(v))) return '—'
+  return Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+}
+
+async function openPositions(row) {
+  posModel.value = row
+  posDrawer.value = true
+  posLoading.value = true
+  posData.value = {}
+  try {
+    posData.value = await api.getPortfolio(row.id)
+  } catch (err) {
+    ElMessage.error(err.message)
+  } finally {
+    posLoading.value = false
+  }
+}
 
 function laneClass(row) {
   if (row.type === 'rule') return 'rule'
@@ -253,7 +327,7 @@ async function createLlm() {
   saving.value = true
   try {
     await api.createModel({ ...llmForm.value, type: 'llm' })
-    ElMessage.success('已添加 LLM')
+    ElMessage.success('已添加 LLM。启用后点右上角「AI 决策」即可参赛')
     llmDialog.value = false
     await load()
   } catch (err) {
@@ -275,7 +349,7 @@ async function createEnsemble() {
       type: 'ensemble',
       members: ensembleForm.value.members,
     })
-    ElMessage.success('已创建合议')
+    ElMessage.success('已创建合议。下轮 AI 决策会在成员跑完后自动合成')
     ensembleDialog.value = false
     await load()
   } catch (err) {
@@ -322,7 +396,42 @@ onMounted(load)
   justify-content: space-between;
   align-items: center;
   font-size: 13px;
+  gap: 8px;
 }
+.m-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.pos-summary {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2, transparent);
+}
+.pos-list { display: flex; flex-direction: column; gap: 10px; }
+.pos-item {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.pos-item-h {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.pos-item-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.pos-reason { margin: 6px 0 0; font-size: 11px; color: var(--text-dim); line-height: 1.4; }
+.m-label { font-size: 11px; color: var(--text-dim); }
+.m-value { font-size: 15px; font-weight: 600; }
 .hint { font-size: 12px; color: var(--text-dim); margin: 0; }
 .foot { margin-top: 4px; max-width: 56ch; line-height: 1.5; }
 .foot a { color: var(--accent); }

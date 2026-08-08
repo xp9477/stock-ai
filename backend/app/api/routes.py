@@ -37,9 +37,15 @@ def list_models(db: Session = Depends(get_db)):
     result = []
     for model in db.query(Model).order_by(Model.id).all():
         eq = portfolio.total_equity(db, model.id)
+        try:
+            members_raw = json.loads(model.members or "[]")
+        except json.JSONDecodeError:
+            members_raw = []
+        # 合议成员必须是 list[int]；研究晋升规则臂把 meta 存在 members，前端只展示 model_id
+        members = members_raw if isinstance(members_raw, list) else []
         result.append({
             "id": model.id, "name": model.name, "model_id": model.model_id,
-            "type": model.type, "members": json.loads(model.members or "[]"),
+            "type": model.type, "members": members,
             "enabled": model.enabled,
             "total_equity": eq["total_equity"],
             "pnl_pct": round((eq["total_equity"] / eq["initial_cash"] - 1) * 100, 2)
@@ -95,13 +101,23 @@ def delete_model(model_pk: int, db: Session = Depends(get_db)):
     model = db.get(Model, model_pk)
     if model is None:
         raise HTTPException(404, "模型不存在")
+    if model.type == "rule":
+        raise HTTPException(
+            400,
+            "规则账户不可直接删除。内置规则请停用；研究晋升臂请到「研究」页退役。",
+        )
     # 被合议组合引用的 LLM 模型不可删
     if model.type == "llm":
         for ens in db.query(Model).filter(Model.type == "ensemble").all():
-            if model_pk in json.loads(ens.members or "[]"):
+            try:
+                members = json.loads(ens.members or "[]")
+            except json.JSONDecodeError:
+                members = []
+            if isinstance(members, list) and model_pk in members:
                 raise HTTPException(400, f"被合议组合「{ens.name}」引用,请先移除")
+    from ..models import TradeLedger
     for table in (Account, Position, Order, Decision, AgentOutput,
-                  EquitySnapshot, Reflection, MonitorEvent):
+                  EquitySnapshot, Reflection, MonitorEvent, TradeLedger):
         db.query(table).filter(table.model_pk == model_pk).delete()
     db.delete(model)
     db.commit()
@@ -168,13 +184,21 @@ def add_watchlist(body: WatchlistAdd, db: Session = Depends(get_db)):
     code = body.code.strip()
     if db.query(Watchlist).filter(Watchlist.code == code).first():
         raise HTTPException(400, "该股票已在股池中")
+    from ..runtime_settings import get_setting
+    pool_max = int(get_setting("selector.pool_max"))
+    current_n = db.query(Watchlist).count()
+    if current_n >= pool_max:
+        raise HTTPException(
+            400,
+            f"股池已满（{current_n}/{pool_max}）。请先移除部分标的，或在设置中提高股池上限。",
+        )
     try:
         quote = market.validate_code(code)
     except Exception as err:  # noqa: BLE001
         raise HTTPException(502, f"行情数据获取失败: {err}") from err
     if quote is None:
         raise HTTPException(400, "无效代码(仅支持沪深主板/创业板/科创板普通 A 股,不含 ST)")
-    item = Watchlist(code=code, name=quote["name"])
+    item = Watchlist(code=code, name=quote["name"], source="manual")
     db.add(item)
     db.commit()
     return {"id": item.id, "code": code, "name": quote["name"]}
@@ -185,7 +209,7 @@ def trigger_auto_select(background: BackgroundTasks, db: Session = Depends(get_d
     from ..agents import selector as selector_mod
     from ..agents import engine as engine_mod
 
-    if selector_mod._select_lock or engine_mod._run_lock:
+    if selector_mod._select_lock or engine_mod.is_running():
         raise HTTPException(409, "决策或选股流程正在运行,请稍后")
     if not db.query(Model).filter(Model.enabled.is_(True), Model.type == "llm").first():
         raise HTTPException(400, "无启用的 LLM 模型")
@@ -246,11 +270,21 @@ def reset_account(db: Session = Depends(get_db)):
     for table in (Position, Order, EquitySnapshot, Decision, AgentOutput,
                   Reflection, MonitorEvent, TradeLedger, Run):
         db.query(table).delete()
+    from ..runtime_settings import get_setting
+    cash = float(get_setting("account.initial_cash"))
     for account in db.query(Account).all():
-        account.cash = settings.initial_cash
-        account.initial_cash = settings.initial_cash
+        account.cash = cash
+        account.initial_cash = cash
     db.commit()
     return {"ok": True}
+
+
+@router.post("/account/repair-bad-quotes")
+def repair_bad_quotes(dry_run: bool = False, db: Session = Depends(get_db)):
+    """回滚因脏报价（如全市场价=7）触发的误强平，恢复持仓与现金。"""
+    from ..trading.repair import repair_bad_quote_force_sells
+
+    return repair_bad_quote_force_sells(db, dry_run=dry_run)
 
 
 @router.get("/equity-curve")
@@ -296,12 +330,94 @@ def equity_curve(db: Session = Depends(get_db)):
 
 @router.post("/runs/trigger")
 def trigger_run(background: BackgroundTasks, db: Session = Depends(get_db)):
-    if engine._run_lock:
+    if engine.is_running():
         raise HTTPException(409, "已有决策流程在运行中")
     if not db.query(Watchlist).first() and not db.query(Position).first():
         raise HTTPException(400, "股池为空,请先添加自选股")
+    if not db.query(Model).filter(Model.enabled.is_(True), Model.type == "llm").first():
+        raise HTTPException(400, "无启用的 LLM 模型，请到「参赛账户」启用或添加")
+    from ..runtime_settings import get_setting
+    if not str(get_setting("secrets.llm_api_key")).strip():
+        raise HTTPException(400, "未配置 LLM API Key（设置 → 密钥）")
     background.add_task(engine.run_pipeline, "manual")
     return {"ok": True, "message": "全量决策流程已在后台启动"}
+
+
+@router.post("/runs/cancel")
+def cancel_run():
+    """协作式取消当前决策：当前 Agent 结束后停止，已落库保留，撮合前再检查。"""
+    result = engine.request_cancel()
+    if not result.get("ok"):
+        raise HTTPException(409, result.get("message") or "无法取消")
+    return result
+
+
+def _parse_run_result(run: Run) -> dict | None:
+    raw = getattr(run, "result_json", None) or ""
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _run_list_summary(db: Session, run: Run, models: dict[int, str]) -> list[dict]:
+    """列表摘要：优先买卖；选股用 result；失败不塞满 hold。"""
+    result = _parse_run_result(run)
+    if run.trigger == "selector":
+        if result and result.get("kind") == "selector":
+            items = []
+            for code in result.get("added") or []:
+                items.append({
+                    "model": result.get("model") or "选股",
+                    "code": code, "name": code, "action": "buy",
+                    "target_position_pct": 0,
+                    "label": "入池",
+                })
+            for code in result.get("removed") or []:
+                items.append({
+                    "model": result.get("model") or "选股",
+                    "code": code, "name": code, "action": "sell",
+                    "target_position_pct": 0,
+                    "label": "移出",
+                })
+            if not items and run.status == "done":
+                items.append({
+                    "model": result.get("model") or "选股",
+                    "code": "", "name": "股池无变动", "action": "hold",
+                    "target_position_pct": 0,
+                })
+            return items[:40]
+        # 历史选股无 result_json：有报告则给占位
+        if run.status == "done":
+            ao = (db.query(AgentOutput)
+                  .filter(AgentOutput.run_id == run.id, AgentOutput.code == "SELECT")
+                  .first())
+            if ao:
+                return [{
+                    "model": models.get(ao.model_pk, "选股"),
+                    "code": "", "name": "选股报告已生成（点进详情）",
+                    "action": "hold", "target_position_pct": 0,
+                }]
+        return []
+
+    decisions = db.query(Decision).filter(Decision.run_id == run.id).all()
+    trades = [d for d in decisions if d.action in ("buy", "sell")]
+    # 列表只带买卖，避免 30×N 条 hold 把页面撑爆
+    rows = [{
+        "model": models.get(d.model_pk, "?"), "code": d.code, "name": d.name,
+        "action": d.action, "target_position_pct": d.target_position_pct,
+    } for d in trades[:40]]
+    if not rows and decisions:
+        # 无买卖时给一条占位，前端显示「本轮无买卖」
+        hold_n = sum(1 for d in decisions if d.action == "hold")
+        rows.append({
+            "model": "", "code": "", "name": f"无买卖 · {hold_n} 条观望",
+            "action": "hold", "target_position_pct": 0,
+        })
+    return rows
 
 
 @router.get("/runs")
@@ -310,14 +426,13 @@ def list_runs(db: Session = Depends(get_db)):
     models = {m.id: m.name for m in db.query(Model).all()}
     result = []
     for run in runs:
-        decisions = db.query(Decision).filter(Decision.run_id == run.id).all()
         result.append({
             "id": run.id, "trigger": run.trigger, "status": run.status,
             "error": run.error,
+            "result": _parse_run_result(run),
             "started_at": run.started_at.strftime("%Y-%m-%d %H:%M:%S"),
             "finished_at": run.finished_at.strftime("%Y-%m-%d %H:%M:%S") if run.finished_at else None,
-            "summary": [{"model": models.get(d.model_pk, "?"), "code": d.code,
-                         "name": d.name, "action": d.action} for d in decisions],
+            "summary": _run_list_summary(db, run, models),
         })
     return result
 
@@ -370,6 +485,7 @@ def run_detail(run_id: int, db: Session = Depends(get_db)):
     result_models.sort(key=lambda s: s["model_pk"])
     return {
         "id": run.id, "trigger": run.trigger, "status": run.status, "error": run.error,
+        "result": _parse_run_result(run),
         "started_at": run.started_at.strftime("%Y-%m-%d %H:%M:%S"),
         "finished_at": run.finished_at.strftime("%Y-%m-%d %H:%M:%S") if run.finished_at else None,
         "models": result_models,
@@ -411,24 +527,98 @@ def list_monitor_events(db: Session = Depends(get_db)):
 # ---------- 状态 ----------
 
 @router.get("/status")
-def status():
+def status(db: Session = Depends(get_db)):
     from .. import scheduler
+    from ..agents import selector as selector_mod
     from ..runtime_settings import get_setting
 
+    progress = engine.get_progress()
+    pool_size = db.query(Watchlist).count()
+    llm_n = db.query(Model).filter(Model.enabled.is_(True), Model.type == "llm").count()
+    ens_n = db.query(Model).filter(Model.enabled.is_(True), Model.type == "ensemble").count()
+    rule_n = db.query(Model).filter(Model.enabled.is_(True), Model.type == "rule").count()
+    rule_pos = (
+        db.query(Position)
+        .join(Model, Model.id == Position.model_pk)
+        .filter(Model.type == "rule", Position.total_qty > 0)
+        .count()
+    )
     return {
-        "running": engine._run_lock,
+        "running": engine.is_running(),
+        "selecting": selector_mod.is_selecting(),
+        "cancel_requested": engine.cancel_requested(),
+        "current_run_id": progress.get("run_id") if engine.is_running() else None,
+        "progress": progress if engine.is_running() else None,
         "schedule_enabled": scheduler.is_enabled(),
         "schedule_times": scheduler.schedule_times(),
         "next_run": scheduler.next_run_time(),
         "pool_max": get_setting("selector.pool_max"),
+        "pool_size": pool_size,
         "factor_top_n": get_setting("factor.top_n"),
         "race_min_trade_days": get_setting("race.min_trade_days"),
         "race_min_closed_trades": get_setting("race.min_closed_trades"),
         "fuyao_configured": bool(str(get_setting("secrets.fuyao_api_key")).strip()),
         "llm_configured": bool(str(get_setting("secrets.llm_api_key")).strip()),
+        "llm_enabled_count": llm_n,
+        "ensemble_enabled_count": ens_n,
+        "rule_enabled_count": rule_n,
+        "rule_has_positions": rule_pos > 0,
         "data_primary": "fuyao",
         "news_source": "rss",
+        "debug_show_io_default": bool(get_setting("debug.show_agent_io_default")),
     }
+
+
+@router.get("/datasources")
+def datasources_list():
+    """数据源角色与配置态（不含网络探测）。"""
+    from ..data.datasources import list_sources_status
+    from ..data.news_rss import RSS_FEEDS
+
+    return {
+        "sources": list_sources_status(),
+        "rss_feeds": [
+            {"id": f["id"], "name": f["name"], "url": f["url"],
+             "region": f.get("region", "")}
+            for f in RSS_FEEDS
+        ],
+    }
+
+
+@router.post("/datasources/probe")
+def datasources_probe(source_id: str | None = None):
+    """立即探测数据源健康（可选 source_id=fuyao|sina|tencent|tushare|rss）。"""
+    from ..data.datasources import SOURCE_META, probe_all
+
+    if source_id and source_id not in {m["id"] for m in SOURCE_META}:
+        raise HTTPException(400, f"未知数据源: {source_id}")
+    return {"results": probe_all(source_id)}
+
+
+@router.get("/logs")
+def get_logs(
+    limit: int = 200,
+    level: str | None = None,
+    run_id: int | None = None,
+    q: str | None = None,
+):
+    """全局系统日志（新→旧）。"""
+    from ..system_log import list_logs, purge_old
+    from ..runtime_settings import get_setting
+
+    purge_old()
+    return {
+        "items": list_logs(limit=limit, level=level, run_id=run_id, q=q),
+        "retention_days": int(get_setting("logs.retention_days")),
+        "min_level": str(get_setting("logs.min_level")),
+    }
+
+
+@router.post("/logs/purge")
+def purge_logs():
+    from ..system_log import purge_old
+    n = purge_old()
+    return {"ok": True, "removed": n}
 
 
 # ---------- 运行时设置 ----------
@@ -563,6 +753,215 @@ def rules_status(db: Session = Depends(get_db)):
     }
 
 
+@router.get("/strategies/board")
+def strategies_board(db: Session = Depends(get_db)):
+    """P2 策略对照台：夏普主序、样本授冠、锚/生命周期标签。"""
+    from ..seed import ensure_rule_strategies
+    from ..strategies.board import build_strategy_board
+
+    ensure_rule_strategies(db)
+    db.commit()
+    return build_strategy_board(db)
+
+
+# ---------- 研究闭环 P3 ----------
+
+class HypothesisCreate(BaseModel):
+    theory_text: str
+    title: str = ""
+
+
+class SpecUpdate(BaseModel):
+    spec: dict
+    confirm: bool = False
+
+
+class DiscardBody(BaseModel):
+    reason: str = ""
+
+
+class ResearchBacktestBody(BaseModel):
+    years: int = 3
+
+
+@router.get("/research/hypotheses")
+def research_list(status: str | None = None, db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    return {"items": research.list_hypotheses(db, status=status)}
+
+
+@router.post("/research/hypotheses")
+def research_create(body: HypothesisCreate, db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    try:
+        return research.create_hypothesis(db, body.theory_text, title=body.title or "")
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+
+
+@router.get("/research/hypotheses/{hid}")
+def research_get(hid: int, db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    try:
+        h = research.get_hypothesis(db, hid)
+        return research._to_dict(h)
+    except ValueError as err:
+        raise HTTPException(404, str(err)) from err
+
+
+@router.post("/research/hypotheses/{hid}/translate")
+def research_translate(hid: int, db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    try:
+        return research.translate(db, hid)
+    except ValueError as err:
+        raise HTTPException(404, str(err)) from err
+    except Exception as err:  # noqa: BLE001
+        raise HTTPException(502, str(err)) from err
+
+
+@router.put("/research/hypotheses/{hid}/spec")
+def research_update_spec(hid: int, body: SpecUpdate, db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    try:
+        return research.update_spec(db, hid, body.spec, confirm=body.confirm)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+
+
+@router.post("/research/hypotheses/{hid}/backtest")
+def research_backtest(hid: int, body: ResearchBacktestBody = ResearchBacktestBody(),
+                      db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    try:
+        return research.run_backtest(db, hid, years=body.years)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    except RuntimeError as err:
+        raise HTTPException(502, str(err)) from err
+    except Exception as err:  # noqa: BLE001
+        logger = __import__("logging").getLogger(__name__)
+        logger.exception("research backtest")
+        raise HTTPException(502, str(err)) from err
+
+
+@router.post("/research/hypotheses/{hid}/promote")
+def research_promote(hid: int, db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    try:
+        return research.promote(db, hid)
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+
+
+@router.post("/research/hypotheses/{hid}/discard")
+def research_discard(hid: int, body: DiscardBody = DiscardBody(),
+                     db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    try:
+        return research.discard(db, hid, reason=body.reason or "")
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+
+
+@router.post("/research/hypotheses/{hid}/retire")
+def research_retire(hid: int, body: DiscardBody = DiscardBody(),
+                    db: Session = Depends(get_db)):
+    from ..research import service as research
+
+    try:
+        return research.retire(db, hid, reason=body.reason or "")
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+
+
+@router.get("/research/library")
+def research_library():
+    from ..research.library import get_library
+    return get_library()
+
+
+class GridRunBody(BaseModel):
+    years: int = 3
+    factor_set_ids: list[str] | None = None
+    top_n_list: list[int] | None = None
+    rebalances: list[str] | None = None
+    stop_losses: list[float | None] | None = None
+    include_equal_weight: bool = True
+    max_combos: int | None = None
+
+
+class GridImportBody(BaseModel):
+    specs: list[dict]
+    theory_prefix: str = "网格导入"
+
+
+class ProposeBody(BaseModel):
+    count: int = 5
+    mode: str = "library"  # library | improve
+
+
+@router.post("/research/grid/run")
+def research_grid_run(body: GridRunBody = GridRunBody(), db: Session = Depends(get_db)):
+    """规则库网格批量回测（手动触发，单次共享面板）。"""
+    from ..research.grid import run_grid
+    from ..runtime_settings import get_setting
+
+    max_c = body.max_combos
+    if max_c is None:
+        try:
+            max_c = int(get_setting("research.grid_max_combos"))
+        except Exception:  # noqa: BLE001
+            max_c = 48
+    try:
+        return run_grid(
+            db,
+            years=body.years,
+            factor_set_ids=body.factor_set_ids,
+            top_n_list=body.top_n_list,
+            rebalances=body.rebalances,
+            stop_losses=body.stop_losses,
+            include_equal_weight=body.include_equal_weight,
+            max_combos=max_c,
+        )
+    except ValueError as err:
+        raise HTTPException(400, str(err)) from err
+    except RuntimeError as err:
+        raise HTTPException(502, str(err)) from err
+    except Exception as err:  # noqa: BLE001
+        raise HTTPException(502, str(err)) from err
+
+
+@router.post("/research/grid/import")
+def research_grid_import(body: GridImportBody, db: Session = Depends(get_db)):
+    from ..research.grid import import_specs_as_hypotheses
+
+    if not body.specs:
+        raise HTTPException(400, "specs 不能为空")
+    items = import_specs_as_hypotheses(
+        db, body.specs, theory_prefix=body.theory_prefix or "网格导入",
+    )
+    return {"ok": True, "imported": len(items), "items": items}
+
+
+@router.post("/research/propose")
+def research_propose(body: ProposeBody = ProposeBody(), db: Session = Depends(get_db)):
+    """AI/规则库提议假说（B）：生成草稿，须人确认后回测。"""
+    from ..research.propose import propose_candidates
+
+    mode = body.mode if body.mode in ("library", "improve") else "library"
+    items = propose_candidates(db, count=body.count, mode=mode)
+    return {"ok": True, "mode": mode, "items": items}
+
+
 # ---------- 因子 / 回测 / 事实底稿 / 账本 ----------
 
 
@@ -661,12 +1060,20 @@ def ledger_stats(db: Session = Depends(get_db)):
     for (sk,) in rows:
         by_strategy[sk] = by_strategy.get(sk, 0) + 1
     min_closed = int(_rt_get("race.min_closed_trades"))
+    min_days = int(_rt_get("race.min_trade_days"))
+    # 用权益快照的不同日历日近似「交易日」样本
+    day_rows = db.query(EquitySnapshot.created_at).all()
+    trade_days = len({
+        (r[0].strftime("%Y-%m-%d") if r[0] else "")
+        for r in day_rows if r[0]
+    })
     return {
         "closed_trades": total_closed,
+        "trade_days": trade_days,
         "by_strategy": by_strategy,
         "min_closed_trades": min_closed,
-        "min_trade_days": int(_rt_get("race.min_trade_days")),
-        "sample_ok": total_closed >= min_closed,
+        "min_trade_days": min_days,
+        "sample_ok": total_closed >= min_closed and trade_days >= min_days,
     }
 
 

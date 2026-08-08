@@ -32,7 +32,10 @@ def _selector_job():
 
 
 def _monitor_job():
+    # 双重门禁：日历 + 连续竞价时段（run_monitor 内部仍会再检查）
     if not market.is_trade_date():
+        return
+    if not market.is_trading_session():
         return
     now = datetime.now().time()
     if not any(start <= now <= end for start, end in MONITOR_WINDOWS):
@@ -101,10 +104,14 @@ def _register_jobs(sched: BackgroundScheduler) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    sched.add_job(_monitor_job,
-                  CronTrigger(day_of_week="mon-fri", hour="9-14",
-                              minute=f"*/{p['monitor_minutes']}"),
-                  id="monitor", max_instances=1, coalesce=True, replace_existing=True)
+    # misfire_grace_time 短：进程重启时不要补跑盘后「漏掉」的监控（曾导致脏价强平）
+    sched.add_job(
+        _monitor_job,
+        CronTrigger(day_of_week="mon-fri", hour="9-14",
+                    minute=f"*/{p['monitor_minutes']}"),
+        id="monitor", max_instances=1, coalesce=True, replace_existing=True,
+        misfire_grace_time=60,
+    )
 
     # 规则组：每周一 14:50（决策后）
     sched.add_job(_rule_rebalance_job,
@@ -114,8 +121,13 @@ def _register_jobs(sched: BackgroundScheduler) -> None:
 
 def start():
     global _scheduler
-    if not settings.schedule_enabled:
-        logger.info("定时调度已关闭 (SCHEDULE_ENABLED=false)")
+    try:
+        from .runtime_settings import get_setting
+        enabled = bool(get_setting("schedule.enabled"))
+    except Exception:  # noqa: BLE001
+        enabled = settings.schedule_enabled
+    if not enabled:
+        logger.info("定时调度已关闭 (schedule.enabled / SCHEDULE_ENABLED=false)")
         return
     _scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
     _register_jobs(_scheduler)
@@ -155,7 +167,12 @@ def is_enabled() -> bool:
 
 def schedule_times() -> str:
     p = _sched_params()
-    return f"每日 {p['decision_time']} 决策 / 每 {p['monitor_minutes']} 分钟监控"
+    parts = [f"决策 {p['decision_time']}"]
+    if p["select_enabled"]:
+        parts.append(f"选股 {p['select_time']}")
+    parts.append(f"监控每{p['monitor_minutes']}分")
+    parts.append("规则周一14:50")
+    return " · ".join(parts)
 
 
 def next_run_time() -> str | None:

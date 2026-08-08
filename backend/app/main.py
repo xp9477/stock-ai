@@ -18,6 +18,12 @@ logging.basicConfig(level=logging.INFO,
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     init_db()
+    try:
+        from .system_log import install_handler, purge_old
+        install_handler()
+        purge_old()
+    except Exception:  # noqa: BLE001
+        logging.getLogger(__name__).exception("系统日志初始化失败")
     scheduler.start()
     yield
     scheduler.shutdown()

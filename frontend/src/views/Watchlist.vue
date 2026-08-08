@@ -3,7 +3,13 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">股池</h1>
-        <p class="page-sub">共享交易宇宙 · 上限 {{ poolHint }} · AI 与规则只交易池内标的</p>
+        <p class="page-sub">
+          共享交易宇宙 ·
+          <span class="mono" :class="items.length >= poolHint ? 'warn-text' : ''">
+            {{ items.length }}/{{ poolHint }}
+          </span>
+          · AI 与规则只交易池内标的
+        </p>
       </div>
     </div>
 
@@ -14,18 +20,32 @@
           placeholder="6 位代码，如 600519"
           maxlength="6"
           class="code-input"
+          :disabled="items.length >= poolHint"
           @keyup.enter="add"
         />
-        <el-button type="primary" :loading="adding" @click="add">添加</el-button>
+        <el-button
+          type="primary"
+          :loading="adding"
+          :disabled="items.length >= poolHint"
+          @click="add"
+        >添加</el-button>
         <el-button type="warning" :loading="selecting" @click="autoSelect">AI 选股</el-button>
       </div>
-      <p class="hint">AI 选股约 1–2 分钟；手动添加的票不会被自动淘汰。</p>
+      <p class="hint">
+        AI 选股约 1–2 分钟；手动添加的票不会被自动淘汰。
+        <span v-if="items.length >= poolHint" class="warn-text">
+          股池已满，请先移除后再添加，或到「设置 → 选股」提高上限。
+        </span>
+      </p>
     </section>
 
     <section class="panel">
       <div class="panel-h">
-        <div class="panel-title">当前 {{ items.length }} 只</div>
-        <el-button size="small" text type="primary" @click="load">刷新</el-button>
+        <div class="panel-title">
+          当前 {{ items.length }} 只
+          <span v-if="lastRefresh" class="refresh-hint mono">· {{ lastRefresh }} 自动刷新</span>
+        </div>
+        <el-button size="small" text type="primary" :loading="loading" @click="load">刷新</el-button>
       </div>
 
       <div v-if="isMobile">
@@ -98,21 +118,36 @@ const loading = ref(false)
 const adding = ref(false)
 const selecting = ref(false)
 const poolHint = ref(30)
+const lastRefresh = ref('')
 let timer = null
+let selectTimer = null
 
-async function load() {
+function stampRefresh() {
+  const d = new Date()
+  lastRefresh.value = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
+}
+
+async function load(silent = false) {
+  if (!silent) loading.value = true
   try {
     items.value = await api.getWatchlist()
     const st = await api.getStatus()
     if (st.pool_max) poolHint.value = st.pool_max
+    stampRefresh()
   } catch (err) {
-    ElMessage.error(err.message)
+    if (!silent) ElMessage.error(err.message)
+  } finally {
+    if (!silent) loading.value = false
   }
 }
 
 async function add() {
   if (!/^\d{6}$/.test(newCode.value)) {
     ElMessage.warning('请输入 6 位数字代码')
+    return
+  }
+  if (items.value.length >= poolHint.value) {
+    ElMessage.warning(`股池已满（${items.value.length}/${poolHint.value}）`)
     return
   }
   adding.value = true
@@ -132,12 +167,36 @@ async function autoSelect() {
   selecting.value = true
   try {
     await api.autoSelect()
-    ElMessage.success('AI 选股已启动，约 1–2 分钟后刷新')
-    timer = setInterval(load, 12000)
-    setTimeout(() => { clearInterval(timer); timer = null }, 180000)
+    ElMessage.success('AI 选股已启动，完成后自动刷新列表')
+    if (selectTimer) clearInterval(selectTimer)
+    let ticks = 0
+    let wasSelecting = true
+    selectTimer = setInterval(async () => {
+      ticks += 1
+      try {
+        const st = await api.getStatus()
+        if (st.selecting) {
+          wasSelecting = true
+          await load(true)
+        } else if (wasSelecting) {
+          // 选股刚结束
+          clearInterval(selectTimer)
+          selectTimer = null
+          selecting.value = false
+          await load()
+          ElMessage.success('AI 选股已完成，列表已更新')
+        }
+      } catch { /* silent poll */ }
+      if (ticks >= 40) {
+        // ~3 分钟兜底
+        clearInterval(selectTimer)
+        selectTimer = null
+        selecting.value = false
+        load()
+      }
+    }, 4500)
   } catch (err) {
     ElMessage.error(err.message)
-  } finally {
     selecting.value = false
   }
 }
@@ -151,18 +210,57 @@ async function remove(code) {
   }
 }
 
-onMounted(() => {
-  loading.value = true
-  load().finally(() => { loading.value = false })
+onMounted(async () => {
+  await load()
+  // 若进入页面时选股已在跑，接上轮询
+  try {
+    const st = await api.getStatus()
+    if (st.selecting) {
+      selecting.value = true
+      autoSelectFollow()
+    }
+  } catch { /* ignore */ }
+  timer = setInterval(() => load(true), 60_000)
 })
-onUnmounted(() => clearInterval(timer))
+
+function autoSelectFollow() {
+  if (selectTimer) clearInterval(selectTimer)
+  let ticks = 0
+  selectTimer = setInterval(async () => {
+    ticks += 1
+    try {
+      const st = await api.getStatus()
+      if (!st.selecting) {
+        clearInterval(selectTimer)
+        selectTimer = null
+        selecting.value = false
+        await load()
+        ElMessage.success('AI 选股已完成')
+      } else {
+        await load(true)
+      }
+    } catch { /* ignore */ }
+    if (ticks >= 40) {
+      clearInterval(selectTimer)
+      selectTimer = null
+      selecting.value = false
+    }
+  }, 4500)
+}
+
+onUnmounted(() => {
+  clearInterval(timer)
+  if (selectTimer) clearInterval(selectTimer)
+})
 </script>
 
 <style scoped>
 .add-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .code-input { width: 200px; max-width: 100%; }
 .hint { margin: 10px 0 0; font-size: 12px; color: var(--text-dim); }
+.warn-text { color: var(--warn, #fbbf24); }
 .reason { margin-top: 8px; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+.refresh-hint { font-size: 11px; font-weight: 400; color: var(--text-dim); margin-left: 6px; }
 @media (max-width: 600px) {
   .code-input { width: 100%; }
   .add-row .el-button { flex: 1; }

@@ -11,6 +11,8 @@ from typing import Any, Literal
 from .agents import prompts
 
 SettingType = Literal["int", "float", "bool", "str", "text", "percent", "time", "secret"]
+# normal=随时改; confirm=保存前强确认; frozen=仅影响新开账户/重置后（改参不改已有赛季）
+DangerLevel = Literal["normal", "confirm", "frozen"]
 
 
 @dataclass(frozen=True)
@@ -29,11 +31,15 @@ class SettingDef:
     requires_scheduler_reload: bool = False
     # 敏感字段：API 只返回脱敏，空写=不修改
     secret: bool = False
+    danger: DangerLevel = "normal"
 
 
 # 分组元信息（UI Tab 顺序）
 GROUPS: list[dict[str, str]] = [
     {"id": "secrets", "label": "密钥", "description": "LLM / 数据源 API（脱敏；DB 覆盖优先于 .env）"},
+    {"id": "datasources", "label": "数据源", "description": "扶摇/新浪/腾讯/Tushare/RSS：启停、超时、失败策略与健康状态"},
+    {"id": "account", "label": "账户", "description": "初始资金等（冻结项仅影响新开/重置账户）"},
+    {"id": "trading", "label": "撮合", "description": "佣金/印花税/过户费（改后影响后续可比性）"},
     {"id": "selector", "label": "选股", "description": "规则初筛阈值、股池与淘汰"},
     {"id": "prompt", "label": "Prompt", "description": "各 Agent 系统提示词"},
     {"id": "risk", "label": "风控", "description": "止盈止损、仓位硬顶"},
@@ -41,6 +47,8 @@ GROUPS: list[dict[str, str]] = [
     {"id": "models", "label": "参赛账户", "description": "摘要只读 · 管理请到参赛账户页"},
     {"id": "schedule", "label": "调度", "description": "定时决策 / 选股 / 监控"},
     {"id": "race", "label": "赛马", "description": "样本门槛（可验证 edge）"},
+    {"id": "logs", "label": "日志", "description": "全局日志保留与级别"},
+    {"id": "debug", "label": "调试", "description": "决策流水线调试开关"},
 ]
 
 _DEFS: list[SettingDef] = [
@@ -78,6 +86,100 @@ _DEFS: list[SettingDef] = [
         label="Tushare Token",
         description="可选备份数据源，默认不用",
         secret=True,
+    ),
+
+    # ---------- 数据源（固定角色；启停/超时/失败策略）----------
+    # fail_policy: fallback=尝试下一源; hard=立即失败; skip=跳过该能力
+    SettingDef(
+        key="datasources.fuyao.enabled",
+        group="datasources", type="bool", default=True,
+        label="扶摇 · 启用",
+        description="主行情/财务源（沪深300+中证500 成分选股快照）",
+    ),
+    SettingDef(
+        key="datasources.fuyao.timeout_sec",
+        group="datasources", type="int", default=30,
+        label="扶摇 · 超时", unit="秒",
+        description="单次 HTTP 请求超时",
+        min_value=3, max_value=120,
+    ),
+    SettingDef(
+        key="datasources.fuyao.fail_policy",
+        group="datasources", type="str", default="fallback",
+        label="扶摇 · 失败策略",
+        description="fallback=降级新浪等兜底; hard=硬失败; skip=跳过",
+    ),
+    SettingDef(
+        key="datasources.sina.enabled",
+        group="datasources", type="bool", default=True,
+        label="新浪 · 启用",
+        description="选股全市场快照兜底 + 指数日线/交易日历（AKShare，无 Key）",
+    ),
+    SettingDef(
+        key="datasources.sina.timeout_sec",
+        group="datasources", type="int", default=25,
+        label="新浪 · 超时", unit="秒",
+        description="全市场接口易慢/被掐，建议 15–30 秒",
+        min_value=5, max_value=120,
+    ),
+    SettingDef(
+        key="datasources.sina.fail_policy",
+        group="datasources", type="str", default="hard",
+        label="新浪 · 失败策略",
+        description="作为选股兜底时：hard=双源皆失败则报错; skip=返回空候选",
+    ),
+    SettingDef(
+        key="datasources.tencent.enabled",
+        group="datasources", type="bool", default=True,
+        label="腾讯 · 启用",
+        description="实时行情与日 K（qt.gtimg.cn）",
+    ),
+    SettingDef(
+        key="datasources.tencent.timeout_sec",
+        group="datasources", type="int", default=10,
+        label="腾讯 · 超时", unit="秒",
+        min_value=2, max_value=60,
+    ),
+    SettingDef(
+        key="datasources.tencent.fail_policy",
+        group="datasources", type="str", default="hard",
+        label="腾讯 · 失败策略",
+        description="实时行情失败时 hard=抛错/空报价; skip=静默空",
+    ),
+    SettingDef(
+        key="datasources.tushare.enabled",
+        group="datasources", type="bool", default=False,
+        label="Tushare · 启用",
+        description="可选备份数据源（需 Token；当前主路径默认不用）",
+    ),
+    SettingDef(
+        key="datasources.tushare.timeout_sec",
+        group="datasources", type="int", default=30,
+        label="Tushare · 超时", unit="秒",
+        min_value=5, max_value=120,
+    ),
+    SettingDef(
+        key="datasources.tushare.fail_policy",
+        group="datasources", type="str", default="skip",
+        label="Tushare · 失败策略",
+    ),
+    SettingDef(
+        key="datasources.rss.enabled",
+        group="datasources", type="bool", default=True,
+        label="新闻 RSS · 启用",
+        description="公开 RSS 资讯（源列表在代码 backend/app/data/news_rss.py 的 RSS_FEEDS；此处管启停/超时）。决策流水线与 factsheet 共用。",
+    ),
+    SettingDef(
+        key="datasources.rss.timeout_sec",
+        group="datasources", type="int", default=12,
+        label="新闻 RSS · 超时", unit="秒",
+        min_value=3, max_value=60,
+    ),
+    SettingDef(
+        key="datasources.rss.fail_policy",
+        group="datasources", type="str", default="skip",
+        label="新闻 RSS · 失败策略",
+        description="skip=无新闻继续决策; hard=新闻失败则该票分析失败。源 URL 暂不可在 UI 编辑。",
     ),
 
     # ---------- 选股 ----------
@@ -332,7 +434,54 @@ _DEFS: list[SettingDef] = [
         description="沪/深/创业/科创伪行业哑变量中性化",
     ),
 
+    # ---------- 账户 / 撮合（P1 全收口）----------
+    SettingDef(
+        key="account.initial_cash",
+        group="account", type="float", default=1_000_000.0,
+        label="初始资金", unit="元",
+        description="仅对新创建账户 /「重置全部账户」生效；已有账户余额不变",
+        min_value=10_000, max_value=1e9,
+        danger="frozen",
+    ),
+    SettingDef(
+        key="trading.commission_rate",
+        group="trading", type="float", default=0.00025,
+        label="佣金费率",
+        description="双边佣金比例（如 0.00025=万一）",
+        min_value=0.0, max_value=0.01,
+        danger="confirm",
+    ),
+    SettingDef(
+        key="trading.commission_min",
+        group="trading", type="float", default=5.0,
+        label="佣金最低", unit="元",
+        min_value=0.0, max_value=100.0,
+        danger="confirm",
+    ),
+    SettingDef(
+        key="trading.stamp_tax_rate",
+        group="trading", type="float", default=0.0005,
+        label="印花税（卖出）",
+        description="仅卖出收取",
+        min_value=0.0, max_value=0.01,
+        danger="confirm",
+    ),
+    SettingDef(
+        key="trading.transfer_fee_rate",
+        group="trading", type="float", default=0.00001,
+        label="过户费",
+        min_value=0.0, max_value=0.001,
+        danger="confirm",
+    ),
+
     # ---------- 调度 ----------
+    SettingDef(
+        key="schedule.enabled",
+        group="schedule", type="bool", default=True,
+        label="启用定时调度",
+        description="关闭后不跑定时决策/选股/监控（可手动触发）",
+        requires_scheduler_reload=True,
+    ),
     SettingDef(
         key="schedule.daily_decision_time",
         group="schedule", type="time", default="14:35",
@@ -375,8 +524,105 @@ _DEFS: list[SettingDef] = [
         label="最少平仓笔数",
         description="样本门槛：已闭环成交笔数",
         min_value=1, max_value=10000,
+        danger="confirm",
+    ),
+    SettingDef(
+        key="race.max_live_rule_arms",
+        group="race", type="int", default=10,
+        label="可竞赛规则臂上限",
+        description="不含锚（池内等权）；含 S2 与研究晋升。满额需先退役再晋升",
+        min_value=2, max_value=50,
+        danger="confirm",
+    ),
+
+    # ---------- 日志 ----------
+    SettingDef(
+        key="logs.retention_days",
+        group="logs", type="int", default=30,
+        label="日志保留天数",
+        description="全局系统日志超过该天数自动清理（默认 30）",
+        min_value=1, max_value=365,
+    ),
+    SettingDef(
+        key="logs.min_level",
+        group="logs", type="str", default="INFO",
+        label="落库最低级别",
+        description="DEBUG / INFO / WARNING / ERROR（密钥永不入正文）",
+    ),
+
+    # ---------- 调试 ----------
+    SettingDef(
+        key="debug.pipeline_verbose",
+        group="debug", type="bool", default=False,
+        label="流水线详细进度",
+        description="日志与进度消息更细（Agent 级）；不影响是否落库",
+    ),
+    SettingDef(
+        key="debug.show_agent_io_default",
+        group="debug", type="bool", default=False,
+        label="决策页默认展开输入摘要",
+        description="Run 详情「调试」开关的默认值；密钥永不入日志",
+    ),
+    SettingDef(
+        key="research.inject_promoted_to_llm",
+        group="debug", type="bool", default=False,
+        label="研究晋升规格注入 LLM",
+        description="开启后决策流水线向交易员提示注入已晋升研究策略摘要（可参考不强制跟单）",
+    ),
+    SettingDef(
+        key="research.grid_max_combos",
+        group="debug", type="int", default=48,
+        label="网格最大组合数",
+        description="规则库批量回测笛卡尔积上限",
+        min_value=4, max_value=120,
     ),
 ]
+
+# 风控阈值：改前强确认
+def _patch_danger() -> None:
+    global _DEFS
+    patched = []
+    for d in _DEFS:
+        if d.group == "risk" and d.danger == "normal" and d.key.startswith("risk."):
+            if any(x in d.key for x in (
+                "deep_loss", "max_position", "max_total", "max_buy",
+                "take_profit", "stop_loss",
+            )):
+                patched.append(SettingDef(
+                    key=d.key, group=d.group, type=d.type, default=d.default,
+                    label=d.label, description=d.description,
+                    min_value=d.min_value, max_value=d.max_value, unit=d.unit,
+                    editable=d.editable,
+                    requires_scheduler_reload=d.requires_scheduler_reload,
+                    secret=d.secret, danger="confirm",
+                ))
+                continue
+        if d.group == "race" and d.danger == "normal":
+            patched.append(SettingDef(
+                key=d.key, group=d.group, type=d.type, default=d.default,
+                label=d.label, description=d.description,
+                min_value=d.min_value, max_value=d.max_value, unit=d.unit,
+                editable=d.editable,
+                requires_scheduler_reload=d.requires_scheduler_reload,
+                secret=d.secret, danger="confirm",
+            ))
+            continue
+        if d.group == "factor" and d.key == "factor.top_n" and d.danger == "normal":
+            patched.append(SettingDef(
+                key=d.key, group=d.group, type=d.type, default=d.default,
+                label=d.label, description=d.description,
+                min_value=d.min_value, max_value=d.max_value, unit=d.unit,
+                editable=d.editable,
+                requires_scheduler_reload=d.requires_scheduler_reload,
+                secret=d.secret, danger="confirm",
+            ))
+            continue
+        patched.append(d)
+    _DEFS = patched
+
+
+_patch_danger()
+
 
 REGISTRY: dict[str, SettingDef] = {d.key: d for d in _DEFS}
 

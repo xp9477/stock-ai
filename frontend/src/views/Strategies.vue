@@ -3,95 +3,219 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">策略</h1>
-        <p class="page-sub">规则基线与因子截面 · 不消耗 LLM</p>
+        <p class="page-sub">
+          在跑臂对照台 · 夏普主序 · 样本达标才授冠
+          <router-link class="link" to="/research">研究 / 回测 →</router-link>
+        </p>
       </div>
       <div class="head-actions">
-        <el-button size="small" :loading="backtesting" @click="runBacktest">历史回测</el-button>
+        <el-button size="small" :loading="loading" @click="load">刷新</el-button>
         <el-button size="small" type="warning" :loading="rebalancing" @click="rebalance">立即调仓</el-button>
       </div>
+    </div>
+
+    <div v-if="needsFirstRebalance" class="flow-hint panel">
+      <div class="flow-hint-text">
+        规则账户尚未建仓。点「立即调仓」按当前股池生成持仓，之后才会出现收益与夏普。
+      </div>
+      <el-button size="small" type="warning" :loading="rebalancing" @click="rebalance">立即调仓</el-button>
     </div>
 
     <div class="stat-grid">
       <div class="stat">
         <div class="stat-label">调仓节奏</div>
-        <div class="stat-value" style="font-size:15px">{{ rules.schedule || '周一 14:50' }}</div>
-        <div class="stat-hint">{{ rules.is_rebalance_day ? '今天是调仓日' : '非周一不自动调' }}</div>
+        <div class="stat-value" style="font-size:15px">{{ board.schedule || '周一 14:50' }}</div>
+        <div class="stat-hint">{{ board.is_rebalance_day ? '今天是调仓日' : '非周一不自动调' }}</div>
       </div>
       <div class="stat">
-        <div class="stat-label">S2 持仓只数 N</div>
-        <div class="stat-value mono">{{ rules.top_n || 10 }}</div>
+        <div class="stat-label">S2 持仓 N</div>
+        <div class="stat-value mono">{{ board.top_n || 10 }}</div>
         <div class="stat-hint">综合分前 N 等权</div>
       </div>
       <div class="stat">
-        <div class="stat-label">因子有效标的</div>
-        <div class="stat-value mono">{{ factors.items?.length || 0 }}</div>
-        <div class="stat-hint">当前股池截面</div>
+        <div class="stat-label">样本门槛</div>
+        <div class="stat-value mono" style="font-size:15px">
+          {{ board.race?.min_trade_days || 60 }}日 · {{ board.race?.min_closed_trades || 100 }}笔
+        </div>
+        <div class="stat-hint">未达标灰显，不授冠</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">当前冠军</div>
+        <div class="stat-value" style="font-size:15px">
+          {{ championName || '—' }}
+        </div>
+        <div class="stat-hint">{{ championName ? '样本达标 · 夏普第一' : '尚无达标可竞赛臂' }}</div>
       </div>
     </div>
 
-    <!-- Strategy cards -->
-    <div class="strat-grid">
-      <article
-        v-for="s in strategies"
-        :key="s.model_id"
-        class="panel strat-card"
-      >
-        <div class="strat-top">
-          <span class="lane-pill rule">RULE</span>
-          <el-tag v-if="s.enabled === false" size="small" type="info">已停用</el-tag>
-          <el-tag v-else size="small" type="success">启用</el-tag>
-        </div>
-        <h3 class="strat-name">{{ s.name || s.model_id }}</h3>
-        <p class="strat-desc">{{ descOf(s.model_id) }}</p>
-        <div class="strat-metrics">
-          <div>
-            <div class="m-label">总资产</div>
-            <div class="m-value">{{ s.exists ? fmt(s.total_equity) : '—' }}</div>
-          </div>
-          <div>
-            <div class="m-label">收益率</div>
-            <div class="m-value" :class="(s.pnl_pct || 0) >= 0 ? 'up' : 'down'">
-              {{ s.exists ? `${s.pnl_pct >= 0 ? '+' : ''}${s.pnl_pct}%` : '—' }}
+    <!-- 对照表 -->
+    <section class="panel">
+      <div class="panel-h">
+        <div class="panel-title">对照排行</div>
+        <span class="dim mono" style="font-size:11px">排序：夏普 ↓ · 锚置顶</span>
+      </div>
+
+      <div v-if="isMobile" class="m-list">
+        <article
+          v-for="(arm, i) in arms"
+          :key="arm.model_id"
+          class="m-card arm-card"
+          :class="{ crown: arm.crown, dimmed: arm.exists && !arm.sample_ok, anchor: arm.role === 'anchor' }"
+        >
+          <div class="arm-head">
+            <span class="rank mono">{{ arm.role === 'anchor' ? '锚' : i }}</span>
+            <div class="arm-titles">
+              <div class="arm-name">
+                {{ arm.name || arm.model_id }}
+                <span v-if="arm.crown" class="crown-badge">冠</span>
+              </div>
+              <div class="arm-tags">
+                <span class="lane-pill" :class="roleClass(arm)">{{ roleLabel(arm) }}</span>
+                <span class="lane-pill src">{{ sourceLabel(arm) }}</span>
+                <el-tag v-if="arm.enabled === false" size="small" type="info">停用</el-tag>
+                <el-tag v-else-if="arm.exists && !arm.sample_ok" size="small" type="warning">样本不足</el-tag>
+                <el-tag v-else-if="arm.exists" size="small" type="success">在跑</el-tag>
+              </div>
             </div>
           </div>
-          <div>
-            <div class="m-label">持仓数</div>
-            <div class="m-value">{{ s.exists ? s.position_count : '—' }}</div>
+          <p class="arm-desc">{{ arm.desc }}</p>
+          <div class="m-grid metrics" v-if="arm.exists">
+            <div><div class="m-label">夏普</div><div class="m-value mono">{{ fmtSharpe(arm.sharpe) }}</div></div>
+            <div><div class="m-label">收益</div><div class="m-value mono" :class="(arm.pnl_pct||0)>=0?'up':'down'">{{ fmtPct(arm.pnl_pct) }}</div></div>
+            <div><div class="m-label">回撤</div><div class="m-value mono down">{{ arm.max_drawdown_pct ?? '—' }}%</div></div>
+            <div><div class="m-label">超额</div><div class="m-value mono" :class="excessClass(arm)">{{ fmtExcess(arm) }}</div></div>
           </div>
-          <div>
-            <div class="m-label">现金</div>
-            <div class="m-value">{{ s.exists ? fmt(s.cash) : '—' }}</div>
+          <div v-if="arm.exists" class="arm-foot mono dim">
+            {{ arm.trade_days || 0 }}日 · {{ arm.closed_trades || 0 }}笔平仓
+            · 最近调仓 {{ arm.last_rebalance_at || '—' }}
           </div>
-        </div>
-        <el-button
-          size="small"
-          type="warning"
-          plain
-          class="strat-btn"
-          :loading="oneLoading === s.model_id"
-          :disabled="!s.exists"
-          @click="rebalanceOne(s.model_id)"
-        >单独调仓</el-button>
-      </article>
-    </div>
+          <el-button
+            v-if="arm.exists && arm.role !== 'anchor'"
+            size="small"
+            type="warning"
+            plain
+            :loading="oneLoading === arm.model_id"
+            @click="rebalanceOne(arm.model_id)"
+          >单独调仓</el-button>
+          <el-button
+            v-else-if="arm.exists"
+            size="small"
+            type="warning"
+            plain
+            :loading="oneLoading === arm.model_id"
+            @click="rebalanceOne(arm.model_id)"
+          >调仓（锚）</el-button>
+        </article>
+      </div>
 
-    <!-- Factor table -->
+      <el-table
+        v-else
+        :data="arms"
+        stripe
+        v-loading="loading"
+        :row-class-name="rowClass"
+        empty-text="暂无规则策略"
+      >
+        <el-table-column label="" width="48">
+          <template #default="{ row }">
+            <span v-if="row.crown" class="crown-badge">冠</span>
+            <span v-else-if="row.role === 'anchor'" class="mono dim">锚</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="策略" min-width="160">
+          <template #default="{ row }">
+            <div class="name-cell">
+              <b>{{ row.name || row.model_id }}</b>
+              <div class="arm-tags">
+                <span class="lane-pill" :class="roleClass(row)">{{ roleLabel(row) }}</span>
+                <span class="lane-pill src">{{ sourceLabel(row) }}</span>
+              </div>
+            </div>
+          </template>
+        </el-table-column>
+        <el-table-column label="夏普" width="90" sortable :sort-method="(a,b)=> (a.sharpe||0)-(b.sharpe||0)">
+          <template #default="{ row }">
+            <span class="mono" :class="{ dim: row.exists && !row.sample_ok }">{{ row.exists ? fmtSharpe(row.sharpe) : '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="收益" width="100">
+          <template #default="{ row }">
+            <span v-if="row.exists" class="mono" :class="(row.pnl_pct||0)>=0?'up':'down'">{{ fmtPct(row.pnl_pct) }}</span>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="最大回撤" width="100">
+          <template #default="{ row }">
+            <span v-if="row.exists" class="mono down">{{ row.max_drawdown_pct }}%</span>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="相对锚" width="100">
+          <template #default="{ row }">
+            <span class="mono" :class="excessClass(row)">{{ fmtExcess(row) }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="样本" width="120">
+          <template #default="{ row }">
+            <template v-if="row.exists">
+              <el-tag size="small" :type="row.sample_ok ? 'success' : 'info'">
+                {{ row.sample_ok ? '达标' : '不足' }}
+              </el-tag>
+              <div class="mono dim" style="font-size:11px;margin-top:2px">
+                {{ row.trade_days || 0 }}d · {{ row.closed_trades || 0 }}笔
+              </div>
+            </template>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="持仓/现金" width="140">
+          <template #default="{ row }">
+            <span v-if="row.exists" class="mono">
+              {{ row.position_count }} · {{ fmtMoney(row.cash) }}
+            </span>
+            <span v-else>—</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="最近调仓" width="140">
+          <template #default="{ row }">
+            <span class="mono dim">{{ row.last_rebalance_at || '—' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="110" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              v-if="row.exists"
+              size="small"
+              type="warning"
+              plain
+              :loading="oneLoading === row.model_id"
+              @click="rebalanceOne(row.model_id)"
+            >调仓</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+    </section>
+
+    <!-- 因子截面：按需加载，避免进页就卡在扶摇批量拉数 -->
     <section class="panel">
       <div class="panel-h">
         <div class="panel-title">S2 因子截面</div>
-        <el-button size="small" text type="primary" :loading="factorLoading" @click="loadFactors">刷新</el-button>
+        <el-button size="small" type="primary" plain :loading="factorLoading" @click="loadFactors">
+          {{ factors.items?.length ? '刷新截面' : '加载截面' }}
+        </el-button>
       </div>
+      <p class="hint">
+        需拉取股池日 K / 估值，可能需数十秒。仅运维查看时点加载，不影响对照表。
+      </p>
       <p v-if="factors.message" class="hint">{{ factors.message }}</p>
       <p v-if="factors.top_n?.length" class="hint">
         当前前 {{ factors.top_n_size }}：
         <span class="mono accent">{{ factors.top_n.join(' · ') }}</span>
       </p>
-      <el-table v-if="factors.items?.length" :data="factors.items" stripe size="small" max-height="420">
+      <el-table v-if="factors.items?.length" :data="factors.items" stripe size="small" max-height="360">
         <el-table-column prop="code" label="代码" width="90" />
         <el-table-column label="综合分" width="100">
-          <template #default="{ row }">
-            <span class="mono">{{ fmtNum(row.score) }}</span>
-          </template>
+          <template #default="{ row }"><span class="mono">{{ fmtNum(row.score) }}</span></template>
         </el-table-column>
         <el-table-column label="短动量" width="90">
           <template #default="{ row }"><span class="mono">{{ fmtNum(row.mom_short, 3) }}</span></template>
@@ -111,64 +235,79 @@
         <el-table-column label="ROE" width="80">
           <template #default="{ row }"><span class="mono">{{ fmtNum(row.quality_roe, 2) }}</span></template>
         </el-table-column>
-        <el-table-column prop="n_factors" label="有效因子" width="90" />
       </el-table>
-      <el-empty v-else description="股池为空或因子未算出 — 先在「股池」加票" :image-size="56" />
-    </section>
-
-    <!-- Backtest result -->
-    <section v-if="backtest" class="panel">
-      <div class="panel-h">
-        <div class="panel-title">最近一次历史回测</div>
-        <span class="dim" style="font-size:12px">{{ backtest.start }} → 今 · {{ backtest.codes?.length }} 只</span>
-      </div>
-      <div class="bt-grid">
-        <div class="bt-card" v-for="key in ['equal_weight', 'factor_weekly']" :key="key">
-          <div class="bt-name">{{ key === 'equal_weight' ? '池内等权' : 'S2 周频' }}</div>
-          <div class="bt-metrics" v-if="backtest[key]?.metrics">
-            <div><span class="m-label">总收益</span>
-              <span class="mono" :class="backtest[key].metrics.total_return >= 0 ? 'up' : 'down'">
-                {{ (backtest[key].metrics.total_return * 100).toFixed(2) }}%
-              </span>
-            </div>
-            <div><span class="m-label">夏普</span>
-              <span class="mono">{{ backtest[key].metrics.sharpe }}</span>
-            </div>
-            <div><span class="m-label">最大回撤</span>
-              <span class="mono down">{{ (backtest[key].metrics.max_drawdown * 100).toFixed(2) }}%</span>
-            </div>
-            <div><span class="m-label">平仓笔数</span>
-              <span class="mono">{{ backtest[key].closed_trades }}</span>
-            </div>
-          </div>
-        </div>
-      </div>
+      <el-empty
+        v-else-if="!factorLoading && factorsLoaded"
+        description="股池为空或因子未算出"
+        :image-size="48"
+      />
+      <el-empty
+        v-else-if="!factorLoading"
+        description="点击「加载截面」查看当前因子排名"
+        :image-size="48"
+      />
     </section>
   </div>
 </template>
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api/index.js'
+import { useIsMobile } from '../composables/useIsMobile.js'
 
-const rules = ref({ strategies: [] })
+const { isMobile } = useIsMobile()
+const board = ref({ arms: [], race: {} })
 const factors = ref({ items: [], top_n: [] })
+const loading = ref(false)
 const rebalancing = ref(false)
 const oneLoading = ref('')
 const factorLoading = ref(false)
-const backtesting = ref(false)
-const backtest = ref(null)
+const factorsLoaded = ref(false)
 
-const strategies = computed(() => rules.value.strategies || [])
+const arms = computed(() => board.value.arms || [])
+const championName = computed(() => {
+  const id = board.value.champion_model_id
+  if (!id) return ''
+  const a = arms.value.find((x) => x.model_id === id)
+  return a?.name || id
+})
+const needsFirstRebalance = computed(() => {
+  const live = arms.value.filter((a) => a.exists && a.enabled !== false)
+  if (!live.length) return false
+  return live.every((a) => !(a.position_count > 0) && !a.last_rebalance_at)
+})
 
-function descOf(id) {
-  if (id === 's2_weekly') return '六因子截面 z 分等权合成，每周持有综合分前 N 只'
-  if (id === 'pool_equal') return '股池全部标的等权持有，作为躺平锚'
-  return '规则策略'
+function roleLabel(arm) {
+  if (arm.role === 'anchor') return '锚'
+  return '竞赛'
 }
-
-function fmt(v) {
+function roleClass(arm) {
+  return arm.role === 'anchor' ? 'anchor' : 'rule'
+}
+function sourceLabel(arm) {
+  if (arm.source === 'research') return '研究晋升'
+  return '内置'
+}
+function fmtPct(v) {
+  if (v == null || Number.isNaN(Number(v))) return '—'
+  const n = Number(v)
+  return `${n >= 0 ? '+' : ''}${n.toFixed(2)}%`
+}
+function fmtSharpe(v) {
+  if (v == null || Number.isNaN(Number(v))) return '—'
+  return Number(v).toFixed(2)
+}
+function fmtExcess(arm) {
+  if (arm.role === 'anchor') return '基准'
+  if (arm.excess_vs_anchor_pct == null) return '—'
+  return fmtPct(arm.excess_vs_anchor_pct)
+}
+function excessClass(arm) {
+  if (arm.role === 'anchor' || arm.excess_vs_anchor_pct == null) return 'dim'
+  return arm.excess_vs_anchor_pct >= 0 ? 'up' : 'down'
+}
+function fmtMoney(v) {
   if (v == null) return '—'
   return Number(v).toLocaleString('zh-CN', { maximumFractionDigits: 0 })
 }
@@ -176,12 +315,22 @@ function fmtNum(v, d = 4) {
   if (v == null || Number.isNaN(Number(v))) return '—'
   return Number(v).toFixed(d)
 }
+function rowClass({ row }) {
+  const cls = []
+  if (row.crown) cls.push('row-crown')
+  if (row.role === 'anchor') cls.push('row-anchor')
+  if (row.exists && !row.sample_ok) cls.push('row-dim')
+  return cls.join(' ')
+}
 
-async function loadRules() {
+async function load() {
+  loading.value = true
   try {
-    rules.value = await api.rulesStatus()
+    board.value = await api.strategiesBoard()
   } catch (err) {
     ElMessage.error(err.message)
+  } finally {
+    loading.value = false
   }
 }
 
@@ -189,19 +338,36 @@ async function loadFactors() {
   factorLoading.value = true
   try {
     factors.value = await api.factorsSnapshot()
+    factorsLoaded.value = true
   } catch (err) {
-    ElMessage.error(err.message)
+    ElMessage.error(err.message || '因子截面加载失败（数据源超时可稍后重试）')
   } finally {
     factorLoading.value = false
   }
 }
 
 async function rebalance() {
+  try {
+    await ElMessageBox.confirm(
+      '对全部启用规则策略立即调仓（会真实买卖模拟盘）。',
+      '确认规则调仓',
+      { type: 'warning', confirmButtonText: '开始调仓', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
   rebalancing.value = true
   try {
-    await api.rulesRebalance()
-    ElMessage.success('规则组调仓完成')
-    await loadRules()
+    const res = await api.rulesRebalance()
+    const results = res.results || []
+    const ok = results.filter((r) => r.ok).length
+    const fail = results.filter((r) => r.ok === false)
+    if (fail.length) {
+      ElMessage.warning(`调仓 ${ok}/${results.length} 成功。失败：${fail.map((r) => r.model_id).join('、')}`)
+    } else {
+      ElMessage.success(`规则组调仓完成（${ok} 个）`)
+    }
+    await load()
   } catch (err) {
     ElMessage.error(err.message)
   } finally {
@@ -215,7 +381,7 @@ async function rebalanceOne(id) {
     const r = await api.rulesRebalanceOne(id)
     if (r.ok === false) ElMessage.warning(r.error || '调仓未完成')
     else ElMessage.success(`${id} 调仓完成`)
-    await loadRules()
+    await load()
   } catch (err) {
     ElMessage.error(err.message)
   } finally {
@@ -223,52 +389,53 @@ async function rebalanceOne(id) {
   }
 }
 
-async function runBacktest() {
-  backtesting.value = true
-  try {
-    backtest.value = await api.runBacktest({ years: 3 })
-    ElMessage.success('回测完成')
-  } catch (err) {
-    ElMessage.error(err.message)
-  } finally {
-    backtesting.value = false
-  }
-}
-
 onMounted(() => {
-  loadRules()
-  loadFactors()
+  load()
+  // 因子截面按需加载，避免进入策略页即被扶摇批量请求拖死
 })
 </script>
 
 <style scoped>
 .head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
-.strat-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 14px;
-}
-.strat-card { display: flex; flex-direction: column; gap: 10px; }
-.strat-top { display: flex; align-items: center; gap: 8px; }
-.strat-name { margin: 0; font-size: 17px; font-weight: 700; letter-spacing: -0.02em; }
-.strat-desc { margin: 0; font-size: 12px; color: var(--text-muted); line-height: 1.5; min-height: 2.8em; }
-.strat-metrics {
-  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
-  padding: 10px 0; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
-}
-.strat-btn { align-self: flex-start; margin-top: 4px; }
+.link { margin-left: 10px; color: var(--accent); font-size: 13px; }
 .hint { font-size: 12px; color: var(--text-muted); margin: 0 0 10px; }
 .accent { color: var(--accent); }
-.bt-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-.bt-card {
-  background: var(--panel-2); border: 1px solid var(--border);
-  border-radius: var(--radius-sm); padding: 14px;
+.flow-hint {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 12px 14px; margin-bottom: 4px;
+  border-color: rgba(251, 191, 36, 0.3);
+  background: rgba(251, 191, 36, 0.05);
 }
-.bt-name { font-weight: 600; margin-bottom: 10px; }
-.bt-metrics { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; font-size: 13px; }
-.bt-metrics .m-label { display: block; margin-bottom: 2px; }
+.flow-hint-text { font-size: 13px; color: var(--text-muted); line-height: 1.5; flex: 1; }
 
-@media (max-width: 700px) {
-  .bt-grid { grid-template-columns: 1fr; }
+.lane-pill {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.04em;
+  padding: 2px 7px; border-radius: 999px; text-transform: uppercase;
 }
+.lane-pill.rule { background: var(--lane-rule-dim, rgba(45,212,168,0.15)); color: var(--lane-rule, #2dd4a8); }
+.lane-pill.anchor { background: rgba(148,163,184,0.2); color: #94a3b8; }
+.lane-pill.src { background: var(--panel-2, #141e2e); color: var(--text-muted); border: 1px solid var(--border); }
+
+.crown-badge {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 999px;
+  background: rgba(232,184,74,0.25); color: var(--accent, #e8b84a);
+  font-size: 11px; font-weight: 800;
+}
+.name-cell { display: flex; flex-direction: column; gap: 4px; }
+.arm-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+
+.arm-card { display: flex; flex-direction: column; gap: 8px; }
+.arm-card.crown { border-color: rgba(232,184,74,0.45); }
+.arm-card.anchor { border-style: dashed; }
+.arm-card.dimmed { opacity: 0.72; }
+.arm-head { display: flex; gap: 10px; align-items: flex-start; }
+.rank { width: 28px; color: var(--text-dim); }
+.arm-name { font-weight: 700; display: flex; align-items: center; gap: 6px; }
+.arm-desc { margin: 0; font-size: 12px; color: var(--text-muted); line-height: 1.45; }
+.arm-foot { font-size: 11px; }
+
+:deep(.row-crown) { background: rgba(232,184,74,0.06) !important; }
+:deep(.row-dim) { opacity: 0.7; }
+:deep(.row-anchor td:first-child) { border-left: 3px solid #64748b; }
 </style>

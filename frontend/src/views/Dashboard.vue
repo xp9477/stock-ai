@@ -15,8 +15,8 @@
         <div class="stat-hint">样本门槛 · 笔数</div>
       </div>
       <div class="stat">
-        <div class="stat-label">交易日门槛</div>
-        <div class="stat-value mono">{{ ledger.min_trade_days || 60 }}</div>
+        <div class="stat-label">交易日</div>
+        <div class="stat-value mono">{{ ledger.trade_days ?? 0 }}<span class="slash">/{{ ledger.min_trade_days || 60 }}</span></div>
         <div class="stat-hint">日 ∧ 笔 都达标才可晋级</div>
       </div>
       <div class="stat">
@@ -28,6 +28,20 @@
         <div class="stat-label">规则调仓</div>
         <div class="stat-value sched">{{ rules.is_rebalance_day ? '今天·周一' : '周一 14:50' }}</div>
         <div class="stat-hint">{{ rules.schedule || '—' }}</div>
+      </div>
+    </div>
+
+    <div v-if="flowHint" class="flow-hint panel">
+      <div class="flow-hint-text">{{ flowHint.text }}</div>
+      <div class="flow-hint-actions">
+        <router-link v-if="flowHint.to" class="flow-link" :to="flowHint.to">{{ flowHint.cta }}</router-link>
+        <el-button
+          v-if="flowHint.rebalance"
+          size="small"
+          type="warning"
+          :loading="rebalancing"
+          @click="doRebalance"
+        >立即调仓</el-button>
       </div>
     </div>
 
@@ -53,6 +67,7 @@
           <div v-if="!aiRows.length" class="empty-lane">
             <img src="/empty-race.png" alt="" class="empty-img" width="72" height="72" />
             <p>暂无 AI 选手</p>
+            <router-link class="flow-link" to="/models">去参赛账户启用 →</router-link>
           </div>
           <button
             v-for="(row, i) in aiRows"
@@ -103,6 +118,7 @@
           <div v-if="!ruleRows.length" class="empty-lane">
             <img src="/empty-race.png" alt="" class="empty-img" width="72" height="72" />
             <p>暂无规则策略</p>
+            <router-link class="flow-link" to="/strategies">去策略页 →</router-link>
           </div>
           <button
             v-for="(row, i) in ruleRows"
@@ -139,29 +155,30 @@
       </section>
     </div>
 
-    <section class="panel">
+    <!-- 持仓放在曲线上方，避免「点了账户却找不到明细」 -->
+    <section ref="posSection" class="panel pos-panel">
       <div class="panel-h">
-        <div class="panel-title">收益曲线 · vs 沪深300</div>
+        <div class="panel-title" id="pos-title">
+          持仓明细
+          <span v-if="activeModelName" class="pos-account mono">· {{ activeModelName }}</span>
+        </div>
+        <div class="pos-tools">
+          <label class="sr-only" for="pos-model-select">选择账户</label>
+          <el-select
+            id="pos-model-select"
+            v-model="activeModel"
+            size="small"
+            style="width: 180px"
+            placeholder="选择账户"
+            aria-labelledby="pos-title"
+            @change="loadPortfolio"
+          >
+            <el-option v-for="m in leaderboard" :key="m.id" :value="m.id" :label="m.name" />
+          </el-select>
+          <el-button size="small" text type="primary" :loading="posLoading" @click="loadPortfolio">刷新</el-button>
+        </div>
       </div>
-      <div ref="chartEl" class="chart" :style="{ height: isMobile ? '240px' : '340px' }" />
-      <el-empty v-if="!hasCurve" description="暂无快照。规则调仓或 AI 决策后会生成曲线" :image-size="56" />
-    </section>
-
-    <section class="panel">
-      <div class="panel-h">
-        <div class="panel-title" id="pos-title">持仓明细</div>
-        <label class="sr-only" for="pos-model-select">选择选手</label>
-        <el-select
-          id="pos-model-select"
-          v-model="activeModel"
-          size="small"
-          style="width: 168px"
-          aria-labelledby="pos-title"
-          @change="loadPortfolio"
-        >
-          <el-option v-for="m in leaderboard" :key="m.id" :value="m.id" :label="m.name" />
-        </el-select>
-      </div>
+      <p class="pos-hint">点击上方赛道任意选手，或右侧下拉切换账户。持仓与现金按账户隔离。</p>
       <div v-if="portfolio.total_equity != null" class="stat-grid pos-stats">
         <div class="stat">
           <div class="stat-label">总资产</div>
@@ -194,11 +211,14 @@
           <div class="m-grid">
             <div><div class="m-label">持仓/可卖</div><div class="m-value">{{ row.total_qty }} / {{ row.available_qty }}</div></div>
             <div><div class="m-label">成本/现价</div><div class="m-value">{{ row.avg_cost }} / {{ row.price }}</div></div>
+            <div><div class="m-label">市值</div><div class="m-value mono">{{ fmtMoney(row.market_value) }}</div></div>
           </div>
+          <div v-if="row.buy_reason" class="pos-reason">{{ row.buy_reason }}</div>
         </div>
-        <el-empty v-if="!(portfolio.positions || []).length" description="空仓 — 点上方账户行或先调仓/决策" :image-size="48" />
+        <el-empty v-if="activeModel && !(portfolio.positions || []).length" description="该账户当前空仓 — 等 AI 决策或规则调仓后会出现持仓" :image-size="48" />
+        <el-empty v-else-if="!activeModel" description="请选择账户" :image-size="48" />
       </div>
-      <el-table v-else class="mt" :data="portfolio.positions || []" stripe empty-text="空仓 — 点击赛道行切换账户，或先调仓/决策">
+      <el-table v-else class="mt" :data="portfolio.positions || []" stripe empty-text="该账户空仓 — 点上方选手切换，或先跑 AI 决策 / 规则调仓">
         <el-table-column prop="code" label="代码" width="90" />
         <el-table-column prop="name" label="名称" width="100" />
         <el-table-column prop="total_qty" label="持仓" width="80" />
@@ -220,7 +240,16 @@
             </span>
           </template>
         </el-table-column>
+        <el-table-column prop="buy_reason" label="买入理由" min-width="160" show-overflow-tooltip />
       </el-table>
+    </section>
+
+    <section class="panel">
+      <div class="panel-h">
+        <div class="panel-title">收益曲线 · vs 沪深300</div>
+      </div>
+      <div ref="chartEl" class="chart" :style="{ height: isMobile ? '240px' : '340px' }" />
+      <el-empty v-if="!hasCurve" description="暂无快照。规则调仓或 AI 决策后会生成曲线" :image-size="56" />
     </section>
   </div>
 </template>
@@ -239,8 +268,10 @@ const rules = ref({})
 const activeModel = ref(null)
 const portfolio = ref({})
 const chartEl = ref(null)
+const posSection = ref(null)
 const hasCurve = ref(false)
 const rebalancing = ref(false)
+const posLoading = ref(false)
 let chart = null
 let timer = null
 let lastCurve = null
@@ -249,6 +280,8 @@ const aiRows = computed(() =>
   leaderboard.value.filter((r) => r.type !== 'rule'))
 const ruleRows = computed(() =>
   leaderboard.value.filter((r) => r.type === 'rule' || r.lane === 'rule'))
+const activeModelName = computed(() =>
+  leaderboard.value.find((m) => m.id === activeModel.value)?.name || '')
 
 const bestAi = computed(() => {
   if (!aiRows.value.length) return 0
@@ -257,6 +290,28 @@ const bestAi = computed(() => {
 const bestRule = computed(() => {
   if (!ruleRows.value.length) return 0
   return Math.max(...ruleRows.value.map((r) => Number(r.pnl_pct) || 0))
+})
+const ruleHasPositions = computed(() =>
+  ruleRows.value.some((r) => (r.position_count || 0) > 0),
+)
+const flowHint = computed(() => {
+  if (!aiRows.value.length && !ruleRows.value.length) {
+    return { text: '还没有参赛账户。先到「参赛账户」启用 LLM，规则策略由系统种子创建。', to: '/models', cta: '管理账户 →' }
+  }
+  if (ruleRows.value.length && !ruleHasPositions.value) {
+    return {
+      text: '规则赛道仍是空仓。点「立即调仓」按当前股池建仓（需扶摇 Key + 非空股池）。',
+      rebalance: true,
+    }
+  }
+  if (aiRows.value.length && aiRows.value.every((r) => (r.position_count || 0) === 0)) {
+    return {
+      text: 'AI 账户暂无持仓。可点右上角「立即 AI 决策」，或等每日定时跑完后再看战报。',
+      to: '/runs',
+      cta: '看决策记录 →',
+    }
+  }
+  return null
 })
 
 function fmtMoney(v) {
@@ -280,14 +335,21 @@ function fmtPct(v, signed = true) {
 function selectModel(id) {
   activeModel.value = id
   loadPortfolio()
+  // 滚到持仓区，避免选了账户却看不到明细
+  requestAnimationFrame(() => {
+    posSection.value?.scrollIntoView?.({ behavior: 'smooth', block: 'nearest' })
+  })
 }
 
 async function loadPortfolio() {
   if (activeModel.value == null) return
+  posLoading.value = true
   try {
     portfolio.value = await api.getPortfolio(activeModel.value)
   } catch (err) {
     ElMessage.error(err.message)
+  } finally {
+    posLoading.value = false
   }
 }
 
@@ -371,10 +433,26 @@ async function load() {
 }
 
 async function doRebalance() {
+  try {
+    await ElMessageBox.confirm(
+      '对规则赛道全部启用策略按当前股池立即调仓（会真实买卖模拟盘）。',
+      '确认规则调仓',
+      { type: 'warning', confirmButtonText: '开始调仓', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
   rebalancing.value = true
   try {
-    await api.rulesRebalance()
-    ElMessage.success('规则调仓完成')
+    const res = await api.rulesRebalance()
+    const results = res.results || []
+    const ok = results.filter((r) => r.ok).length
+    const fail = results.filter((r) => r.ok === false)
+    if (fail.length) {
+      ElMessage.warning(`调仓 ${ok}/${results.length} 成功。失败：${fail.map((r) => r.model_id).join('、')}`)
+    } else {
+      ElMessage.success(`规则调仓完成（${ok} 个）`)
+    }
     await load()
   } catch (err) {
     ElMessage.error(err.message)
@@ -415,9 +493,24 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.flow-hint {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  gap: 12px; padding: 12px 14px;
+  border-color: rgba(251, 191, 36, 0.3);
+  background: rgba(251, 191, 36, 0.05);
+}
+.flow-hint-text { font-size: 13px; color: var(--text-muted); line-height: 1.5; flex: 1; min-width: 200px; }
+.flow-hint-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.flow-link { color: var(--accent); font-size: 13px; font-weight: 600; }
+.empty-lane.soft { padding: 16px; gap: 10px; }
 .slash { font-size: 13px; color: var(--text-dim); font-weight: 500; }
 .stat-value.sm { font-size: 16px; }
 .stat-value.sched { font-size: 15px; font-weight: 600; }
+.pos-account { font-size: 13px; font-weight: 600; color: var(--accent, #e8b84a); margin-left: 4px; }
+.pos-tools { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pos-hint { margin: 0 0 12px; font-size: 12px; color: var(--text-dim); }
+.pos-reason { margin-top: 6px; font-size: 11px; color: var(--text-muted); line-height: 1.4; }
+.pos-panel { border-color: rgba(232, 184, 74, 0.25); }
 
 /*
  * 等高关键：父级 flex + align-items:stretch，

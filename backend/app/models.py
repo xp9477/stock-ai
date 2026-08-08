@@ -82,9 +82,11 @@ class Run(Base):
     __tablename__ = "runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    trigger: Mapped[str] = mapped_column(String(10))  # manual / schedule
-    status: Mapped[str] = mapped_column(String(10), default="running")  # running / done / failed
+    trigger: Mapped[str] = mapped_column(String(10))  # manual / schedule / selector
+    status: Mapped[str] = mapped_column(String(10), default="running")  # running / done / failed / cancelled
     error: Mapped[str] = mapped_column(Text, default="")
+    # 结构化结果（选股新增/移除、决策买卖计数等），JSON 字符串
+    result_json: Mapped[str] = mapped_column(Text, default="")
     started_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
@@ -201,5 +203,42 @@ class SettingOverride(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
     value: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class SystemLog(Base):
+    """全局系统日志（可清理；默认保留 30 天）。"""
+
+    __tablename__ = "system_logs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    level: Mapped[str] = mapped_column(String(10), default="INFO", index=True)
+    logger_name: Mapped[str] = mapped_column(String(120), default="", index=True)
+    message: Mapped[str] = mapped_column(Text, default="")
+    run_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now, index=True)
+
+
+class ResearchHypothesis(Base):
+    """研究假说：NL → 规格 → 回测 → 晋升/废弃（P3）。
+
+    status: draft | confirmed | backtested | suggested | discarded | promoted | retired
+    """
+
+    __tablename__ = "research_hypotheses"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    title: Mapped[str] = mapped_column(String(120), default="")
+    theory_text: Mapped[str] = mapped_column(Text, default="")
+    # 结构化规格 JSON
+    spec_json: Mapped[str] = mapped_column(Text, default="{}")
+    status: Mapped[str] = mapped_column(String(20), default="draft", index=True)
+    # 回测摘要 JSON（metrics + suggestion）
+    backtest_json: Mapped[str] = mapped_column(Text, default="")
+    suggestion: Mapped[str] = mapped_column(String(40), default="")  # promote | discard | review
+    discard_reason: Mapped[str] = mapped_column(String(500), default="")
+    # 晋升后的规则账户 model_id，如 res_12
+    promoted_model_id: Mapped[str] = mapped_column(String(40), default="", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 

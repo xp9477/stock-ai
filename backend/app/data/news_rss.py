@@ -18,16 +18,35 @@ from ..data.cache import ttl_cache
 
 logger = logging.getLogger(__name__)
 
-# 真实 RSS/Atom（stdlib 可解析；失效源自动跳过，可后续扩到 investment-news 全量）
+# 真实 RSS/Atom（stdlib 可解析；失效源自动跳过，探测页可见健康）
+# 国内财经向 + 国际宏观（保留，对风险偏好/外盘有指导意义）
 RSS_FEEDS: list[dict[str, str]] = [
-    {"id": "bbc_biz", "name": "BBC Business",
-     "url": "https://feeds.bbci.co.uk/news/business/rss.xml"},
-    {"id": "cnbc_top", "name": "CNBC Top News",
-     "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"},
+    # ----- 国内财经 -----
     {"id": "people_finance", "name": "人民网财经",
-     "url": "http://www.people.com.cn/rss/finance.xml"},
-    {"id": "36kr", "name": "36氪", "url": "https://36kr.com/feed"},
-    {"id": "sspai", "name": "少数派", "url": "https://sspai.com/feed"},
+     "url": "http://www.people.com.cn/rss/finance.xml", "region": "cn"},
+    {"id": "chinanews_finance", "name": "中新网财经",
+     "url": "https://www.chinanews.com.cn/rss/finance.xml", "region": "cn"},
+    {"id": "chinanews_stock", "name": "中新网证券",
+     "url": "https://www.chinanews.com.cn/rss/stock.xml", "region": "cn"},
+    {"id": "sina_finance", "name": "新浪财经滚动",
+     "url": "https://rss.sina.com.cn/roll/finance/hot_roll.xml", "region": "cn"},
+    {"id": "jrj_finance", "name": "金融界",
+     "url": "https://rss.jrj.com.cn/finance.xml", "region": "cn"},
+    {"id": "huxiu", "name": "虎嗅",
+     "url": "https://www.huxiu.com/rss/0.xml", "region": "cn"},
+    {"id": "36kr", "name": "36氪",
+     "url": "https://36kr.com/feed", "region": "cn"},
+    # ----- 国际 / 宏观（保留）-----
+    {"id": "bbc_biz", "name": "BBC Business",
+     "url": "https://feeds.bbci.co.uk/news/business/rss.xml", "region": "global"},
+    {"id": "cnbc_top", "name": "CNBC Top News",
+     "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+     "region": "global"},
+    {"id": "reuters_biz", "name": "Reuters Business",
+     "url": "https://www.reutersagency.com/feed/?taxonomy=best-topics&post_type=best",
+     "region": "global"},
+    {"id": "sspai", "name": "少数派",
+     "url": "https://sspai.com/feed", "region": "global"},
 ]
 
 # 合规粗滤（Vibe 同思路：剔除赌/预测市场/黄赌毒等）
@@ -103,7 +122,13 @@ def _parse_rss(xml_bytes: bytes, source: str) -> list[dict[str, Any]]:
     return items
 
 
-def _fetch_feed(url: str, timeout: int = 12) -> bytes | None:
+def _fetch_feed(url: str, timeout: int | None = None) -> bytes | None:
+    if timeout is None:
+        try:
+            from . import datasources as ds
+            timeout = ds.timeout_sec("rss", 12)
+        except Exception:  # noqa: BLE001
+            timeout = 12
     try:
         req = Request(url, headers={"User-Agent": "stock-ai-news/1.0"})
         with urlopen(req, timeout=timeout) as resp:
@@ -115,7 +140,17 @@ def _fetch_feed(url: str, timeout: int = 12) -> bytes | None:
 
 @ttl_cache(600)
 def fetch_all_headlines(limit_per_feed: int = 15) -> list[dict[str, Any]]:
-    """抓取全部配置源，合并去重。"""
+    """抓取全部配置源，合并去重。
+
+    源列表：本文件 RSS_FEEDS（硬编码）。启停/超时见设置 datasources.rss.*。
+    """
+    try:
+        from . import datasources as ds
+        if not ds.is_enabled("rss"):
+            return []
+    except Exception:  # noqa: BLE001
+        pass
+
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for feed in RSS_FEEDS:

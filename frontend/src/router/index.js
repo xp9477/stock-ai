@@ -5,6 +5,7 @@ export default createRouter({
   routes: [
     { path: '/', name: 'dashboard', component: () => import('../views/Dashboard.vue'), meta: { title: '战报' } },
     { path: '/strategies', name: 'strategies', component: () => import('../views/Strategies.vue'), meta: { title: '策略' } },
+    { path: '/research', name: 'research', component: () => import('../views/Research.vue'), meta: { title: '研究' } },
     { path: '/watchlist', name: 'watchlist', component: () => import('../views/Watchlist.vue'), meta: { title: '股池' } },
     { path: '/runs', name: 'runs', component: () => import('../views/Runs.vue'), meta: { title: '决策' } },
     { path: '/runs/:id', name: 'run-detail', component: () => import('../views/RunDetail.vue'), meta: { title: '决策详情' } },
