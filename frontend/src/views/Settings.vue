@@ -61,11 +61,11 @@
           <p class="sec-desc">{{ currentGroupMeta.description }}</p>
         </div>
 
-        <!-- 参赛账户：摘要 + 跳转（CRUD 仅在 /models） -->
+        <!-- 模型与策略：摘要 + 跳转（CRUD 仅在 /models） -->
         <div v-if="activeGroup === 'models'" class="models-sec">
           <div class="summary-grid" aria-live="polite">
             <div class="summary-card">
-              <div class="summary-label">全部账户</div>
+              <div class="summary-label">全部模型</div>
               <div class="summary-value mono">{{ modelStats.total }}</div>
             </div>
             <div class="summary-card">
@@ -73,12 +73,12 @@
               <div class="summary-value mono ok-text">{{ modelStats.enabled }}</div>
             </div>
             <div class="summary-card">
-              <div class="summary-label">AI 赛道</div>
+              <div class="summary-label">判断与正式策略</div>
               <div class="summary-value mono">{{ modelStats.ai }}</div>
               <div class="summary-hint">LLM + 合议</div>
             </div>
             <div class="summary-card">
-              <div class="summary-label">规则赛道</div>
+              <div class="summary-label">历史规则证据</div>
               <div class="summary-value mono">{{ modelStats.rule }}</div>
             </div>
           </div>
@@ -97,16 +97,16 @@
             </li>
           </ul>
           <p v-else-if="!modelsLoading" class="empty" role="status">
-            暂无参赛账户。请到「参赛账户」页添加 LLM。
+            暂无模型。请到「模型与策略」页添加 LLM 顾问。
           </p>
           <p v-else class="empty" role="status">加载中…</p>
 
           <div class="models-cta">
             <router-link class="cta-link" to="/models">
-              管理参赛账户（添加 / 启停 / 删除）→
+              管理模型与策略（添加 / 启停 / 删除）→
             </router-link>
             <p class="foot-note">
-              战报只看排行；增删与启停统一在「参赛账户」。LLM 密钥在左侧「密钥」。
+              只有 ensemble 是资金策略；LLM 是顾问，rule 是历史只读证据。LLM 密钥在左侧「密钥」。
             </p>
           </div>
         </div>
@@ -391,8 +391,8 @@ const logLevel = ref('')
 
 const STATIC_MODELS_GROUP = {
   id: 'models',
-  label: '参赛账户',
-  description: '摘要只读 · 增删启停请到「参赛账户」页',
+  label: '模型与策略',
+  description: '摘要只读 · 增删启停请到「模型与策略」页',
 }
 
 const itemMap = computed(() => Object.fromEntries(items.value.map((i) => [i.key, i])))
@@ -407,9 +407,9 @@ const FALLBACK_GROUPS = [
   { id: 'prompt', label: 'Prompt', description: '' },
   { id: 'risk', label: '风控', description: '' },
   { id: 'factor', label: '因子', description: '' },
-  { id: 'models', label: '参赛账户', description: '' },
+  { id: 'models', label: '模型与策略', description: '' },
   { id: 'schedule', label: '调度', description: '' },
-  { id: 'race', label: '赛马', description: '' },
+  { id: 'validation', label: '证据门槛', description: '' },
   { id: 'logs', label: '日志', description: '全局日志' },
   { id: 'debug', label: '调试', description: '' },
 ]
@@ -529,9 +529,9 @@ function laneClass(row) {
   return 'ai'
 }
 function laneLabel(row) {
-  if (row.type === 'rule') return '规则'
-  if (row.type === 'ensemble') return '合议'
-  return 'LLM'
+  if (row.type === 'rule') return '历史'
+  if (row.type === 'ensemble') return '正式策略'
+  return '顾问'
 }
 
 function selectGroup(id) {
@@ -665,7 +665,7 @@ async function save() {
     const names = needConfirm.map((i) => i.label).join('、')
     try {
       await ElMessageBox.confirm(
-        `以下配置会影响赛马可比性或仅对新账户生效：\n${names}\n\n确认保存？`,
+        `以下配置会影响前瞻证据可比性或仅对新实验生效：\n${names}\n\n确认保存？`,
         '危险配置确认',
         { type: 'warning', confirmButtonText: '仍要保存', cancelButtonText: '取消' },
       )
@@ -748,598 +748,4 @@ onUnmounted(() => {
 })
 </script>
 
-<style scoped>
-.settings-page {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  min-height: 0;
-}
-
-.page-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.head-text { min-width: 0; }
-
-.head-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
-  align-items: center;
-}
-
-/* 双栏壳 */
-.settings-shell {
-  display: grid;
-  grid-template-columns: 168px minmax(0, 1fr);
-  gap: 14px;
-  align-items: start;
-  min-height: 420px;
-}
-
-.settings-nav {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  position: sticky;
-  top: 8px;
-  padding: 6px;
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-}
-
-.nav-btn {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  width: 100%;
-  padding: 10px 12px;
-  border: 1px solid transparent;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 13px;
-  font-weight: 500;
-  text-align: left;
-  touch-action: manipulation;
-  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
-}
-
-.nav-btn:hover {
-  color: var(--text);
-  background: rgba(255, 255, 255, 0.04);
-}
-
-.nav-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.nav-btn.active {
-  color: var(--text);
-  background: var(--accent-dim);
-  border-color: rgba(232, 184, 74, 0.35);
-}
-
-.nav-label {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.nav-badge {
-  flex-shrink: 0;
-  font-family: var(--mono);
-  font-size: 10px;
-  font-variant-numeric: tabular-nums;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.06);
-  color: var(--text-dim);
-}
-
-.nav-btn.active .nav-badge {
-  background: rgba(232, 184, 74, 0.2);
-  color: var(--accent);
-}
-
-.settings-main {
-  min-width: 0;
-  padding: 18px 20px 22px;
-}
-
-.sec-head {
-  margin-bottom: 18px;
-  padding-bottom: 14px;
-  border-bottom: 1px solid var(--border);
-}
-
-.sec-title {
-  margin: 0 0 6px;
-  font-size: 1.1rem;
-  font-weight: 650;
-  letter-spacing: 0.01em;
-  text-wrap: balance;
-}
-
-.sec-desc {
-  margin: 0;
-  font-size: 13px;
-  color: var(--text-muted);
-  line-height: 1.45;
-  max-width: 56ch;
-}
-
-/* 表单：两列行 */
-.form-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-}
-
-.form-row {
-  display: grid;
-  grid-template-columns: minmax(140px, 1fr) minmax(200px, 1.1fr);
-  gap: 12px 20px;
-  padding: 14px 0;
-  border-bottom: 1px solid var(--border);
-  align-items: start;
-}
-
-.form-row:last-child {
-  border-bottom: none;
-}
-
-.form-row.dirty {
-  background: linear-gradient(90deg, rgba(232, 184, 74, 0.06), transparent 60%);
-  margin: 0 -12px;
-  padding-left: 12px;
-  padding-right: 12px;
-  border-radius: var(--radius-sm);
-}
-
-.row-label-col {
-  min-width: 0;
-}
-
-.row-control-col {
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: 8px;
-}
-
-.block-label {
-  display: inline-flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 6px;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text);
-  cursor: pointer;
-}
-
-.unit {
-  font-weight: 400;
-  font-size: 12px;
-  color: var(--text-dim);
-}
-
-.block-help {
-  margin: 4px 0 0;
-  font-size: 12px;
-  color: var(--text-muted);
-  line-height: 1.45;
-}
-
-.block-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
-}
-
-.tag {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: rgba(56, 189, 248, 0.12);
-  color: var(--lane-rule);
-}
-
-.tag.warn {
-  background: rgba(232, 184, 74, 0.16);
-  color: var(--accent);
-}
-
-.tag.ok {
-  background: rgba(52, 211, 153, 0.14);
-  color: var(--ok);
-}
-
-.tag.bad {
-  background: rgba(244, 63, 94, 0.14);
-  color: var(--danger);
-}
-
-.row-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-}
-
-.text-btn {
-  border: none;
-  background: none;
-  padding: 0;
-  font-size: 12px;
-  color: var(--accent);
-  text-decoration: underline;
-  text-underline-offset: 2px;
-  touch-action: manipulation;
-}
-
-.text-btn:hover { color: #f0c96a; }
-.text-btn:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-  border-radius: 2px;
-}
-
-.default-hint {
-  font-size: 11px;
-  color: var(--text-dim);
-  word-break: break-all;
-}
-
-.ctrl-input {
-  width: 100%;
-  max-width: 320px;
-}
-
-.pct-field {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 10px;
-}
-
-.pct-hint {
-  font-size: 12px;
-  color: var(--text-muted);
-  font-variant-numeric: tabular-nums;
-}
-
-.secret-field {
-  width: 100%;
-  max-width: 360px;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.secret-status {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-}
-
-.masked {
-  color: var(--text-dim);
-  letter-spacing: 0.04em;
-}
-
-.src {
-  color: var(--text-dim);
-  font-size: 11px;
-}
-
-/* Prompt */
-.prompt-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
-
-.form-block {
-  padding: 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--panel-2);
-}
-
-.form-block.dirty {
-  border-color: rgba(232, 184, 74, 0.45);
-}
-
-.block-head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 8px 12px;
-  margin-bottom: 6px;
-}
-
-.prompt-area :deep(textarea) {
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.55;
-}
-
-/* 参赛账户摘要（只读） */
-.summary-grid {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 10px;
-  margin-bottom: 16px;
-}
-
-.summary-card {
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--panel-2);
-  min-width: 0;
-}
-
-.summary-label {
-  font-size: 11px;
-  color: var(--text-muted);
-  margin-bottom: 4px;
-}
-
-.summary-value {
-  font-size: 1.35rem;
-  font-weight: 650;
-  font-variant-numeric: tabular-nums;
-}
-
-.summary-value.ok-text { color: var(--ok); }
-
-.summary-hint {
-  margin-top: 2px;
-  font-size: 11px;
-  color: var(--text-dim);
-}
-
-.model-peek {
-  list-style: none;
-  margin: 0 0 16px;
-  padding: 0;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  overflow: hidden;
-}
-
-.peek-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto auto;
-  gap: 10px;
-  align-items: center;
-  padding: 10px 14px;
-  border-bottom: 1px solid var(--border);
-  background: var(--panel-2);
-  font-size: 13px;
-}
-
-.peek-row:last-child { border-bottom: none; }
-
-.peek-name {
-  font-weight: 600;
-  min-width: 0;
-}
-
-.peek-state {
-  font-size: 11px;
-  font-weight: 600;
-}
-
-.peek-state.on { color: var(--ok); }
-.peek-state.off { color: var(--text-dim); }
-
-.peek-pnl {
-  font-variant-numeric: tabular-nums;
-  min-width: 4.2em;
-  text-align: right;
-}
-
-.truncate {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.lane-pill {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  padding: 2px 7px;
-  border-radius: 999px;
-  text-transform: uppercase;
-}
-
-.lane-pill.ai {
-  background: var(--accent-dim);
-  color: var(--lane-ai);
-}
-
-.lane-pill.ensemble {
-  background: rgba(167, 139, 250, 0.15);
-  color: #c4b5fd;
-}
-
-.lane-pill.rule {
-  background: var(--lane-rule-dim);
-  color: var(--lane-rule);
-}
-
-.models-cta {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-
-.cta-link {
-  display: inline-flex;
-  align-items: center;
-  align-self: flex-start;
-  padding: 10px 14px;
-  border-radius: var(--radius-sm);
-  border: 1px solid rgba(232, 184, 74, 0.4);
-  background: var(--accent-dim);
-  color: var(--accent);
-  font-size: 13px;
-  font-weight: 600;
-  transition: background-color 0.15s ease, border-color 0.15s ease;
-}
-
-.cta-link:hover {
-  border-color: var(--accent);
-  color: #f0c96a;
-}
-
-.cta-link:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
-.empty {
-  margin: 16px 0;
-  text-align: center;
-  color: var(--text-muted);
-  font-size: 13px;
-}
-
-.ds-health {
-  margin-bottom: 20px;
-  padding: 14px 16px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--panel-2);
-}
-.ds-health-head {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.ds-health-title { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
-.ds-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
-  gap: 10px;
-  margin-bottom: 8px;
-}
-.ds-card {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px 12px;
-  background: var(--panel);
-}
-.ds-card.ok { border-color: rgba(103, 194, 58, 0.35); }
-.ds-card.bad { border-color: rgba(245, 108, 108, 0.35); }
-.ds-card-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 4px;
-}
-.ds-role { font-size: 11px; margin-bottom: 6px; line-height: 1.4; }
-.ds-detail { font-size: 12px; margin-bottom: 4px; word-break: break-all; }
-.ds-meta { font-size: 11px; }
-.rss-ul { list-style: none; margin: 0; padding: 0; }
-.rss-ul li {
-  display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px;
-  padding: 6px 0; border-bottom: 1px solid var(--border); font-size: 12px;
-}
-.rss-url { font-size: 11px; word-break: break-all; }
-.log-box {
-  max-height: 420px; overflow: auto;
-  border: 1px solid var(--border); border-radius: 8px;
-  padding: 8px 10px; background: var(--panel);
-  font-size: 11px; line-height: 1.55;
-}
-.log-line { display: flex; flex-wrap: wrap; gap: 8px; padding: 3px 0; border-bottom: 1px solid var(--border); }
-.warn-text { color: #e6a23c; font-weight: 600; }
-.tag.bad { background: rgba(245,108,108,0.15); color: #f56c6c; }
-
-.foot-note {
-  margin: 0;
-  font-size: 12px;
-  color: var(--text-dim);
-  line-height: 1.5;
-  max-width: 62ch;
-}
-
-.foot-note code {
-  font-family: var(--mono);
-  font-size: 11px;
-}
-
-@media (max-width: 800px) {
-  .settings-shell {
-    grid-template-columns: 1fr;
-  }
-
-  .settings-nav {
-    position: static;
-    flex-direction: row;
-    flex-wrap: nowrap;
-    overflow-x: auto;
-    overscroll-behavior-x: contain;
-    -webkit-overflow-scrolling: touch;
-    gap: 6px;
-    padding: 8px;
-  }
-
-  .nav-btn {
-    flex: 0 0 auto;
-    white-space: nowrap;
-  }
-
-  .form-row {
-    grid-template-columns: 1fr;
-    gap: 8px;
-  }
-
-  .row-control-col {
-    width: 100%;
-  }
-
-  .ctrl-input,
-  .secret-field {
-    max-width: none;
-  }
-
-  .summary-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  .peek-row {
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 6px 10px;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .nav-btn {
-    transition: none;
-  }
-}
-</style>
+<style scoped src="../styles/settings.css"></style>

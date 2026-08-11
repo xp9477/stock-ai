@@ -128,3 +128,21 @@ def test_factsheet_hash_stable():
     h1 = factsheet_hash({"a": 1, "b": 2})
     h2 = factsheet_hash({"b": 2, "a": 1})
     assert h1 == h2 and len(h1) == 16
+
+
+def test_factor_rebalance_uses_previous_close_signal():
+    dates = [pd.Timestamp("2024-01-05"), pd.Timestamp("2024-01-08")]
+    rows = []
+    for dt in dates:
+        monday = dt.weekday() == 0
+        rows.extend([
+            {"date": dt, "code": "000001", "close": 10.0,
+             "mom_short": -5.0 if monday else 5.0, "mom_mid": -5.0 if monday else 5.0},
+            {"date": dt, "code": "000002", "close": 10.0,
+             "mom_short": 5.0 if monday else -5.0, "mom_mid": 5.0 if monday else -5.0},
+        ])
+    result = run_factor_weekly(
+        pd.DataFrame(rows), top_n=1, initial_cash=100_000, rebalance="W-MON")
+    assert result.holdings_log[0]["date"] == "2024-01-08"
+    assert result.holdings_log[0]["signal_date"] == "2024-01-05"
+    assert result.holdings_log[0]["codes"] == ["000001"]

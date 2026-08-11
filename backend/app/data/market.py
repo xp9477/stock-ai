@@ -66,11 +66,20 @@ def get_quote(code: str) -> dict | None:
         except (TypeError, ValueError):
             return None
 
-    price = to_float(fields[3])
-    if not price or price <= 0:
-        price = to_float(fields[4])  # 停牌用昨收
+    last_price = to_float(fields[3])
+    prev_close = to_float(fields[4])
+    tradable = bool(last_price and last_price > 0)
+    # 展示接口可以显示昨收，但必须显式标记不可交易；交易接口会拒绝。
+    price = last_price if tradable else prev_close
     if not price:
         return None
+    quote_time_raw = fields[30].strip() if len(fields) > 30 else ""
+    quote_asof = None
+    if quote_time_raw:
+        try:
+            quote_asof = datetime.strptime(quote_time_raw, "%Y%m%d%H%M%S").isoformat()
+        except ValueError:
+            quote_asof = quote_time_raw
     return {
         "code": code,
         "name": fields[1],
@@ -82,7 +91,12 @@ def get_quote(code: str) -> dict | None:
         "pb": to_float(fields[46]),
         "market_cap": (to_float(fields[45]) or 0.0) * 1e8 or None,  # 总市值(元)
         "source": "tencent",
-        "prev_close": to_float(fields[4]),
+        "prev_close": prev_close,
+        "open": to_float(fields[5]) if len(fields) > 5 else None,
+        "quote_asof": quote_asof,
+        "received_at": datetime.now().isoformat(),
+        "tradable": tradable,
+        "trade_status": "tradable" if tradable else "suspended_or_unavailable",
     }
 
 
@@ -128,6 +142,11 @@ def _fuyao_quote(code: str) -> dict | None:
         "market_cap": None,
         "source": "fuyao",
         "prev_close": None,
+        "open": None,
+        "quote_asof": None,
+        "received_at": datetime.now().isoformat(),
+        "tradable": True,
+        "trade_status": "unknown",
     }
 
 
@@ -151,6 +170,12 @@ def get_trade_quote(
                        code, bool(fuyao_q), bool(tx_q))
         return None
 
+    # 不允许把昨收价伪装成实时可成交价。扶摇为主时仍以腾讯交易状态确认。
+    if tx_q is not None and not bool(tx_q.get("tradable")):
+        logger.warning("交易行情不可交易/疑似停牌 code=%s status=%s",
+                       code, tx_q.get("trade_status"))
+        return None
+
     if require_cross_check and fuyao_q and tx_q:
         p1, p2 = float(fuyao_q["price"]), float(tx_q["price"])
         mid = (p1 + p2) / 2.0
@@ -163,7 +188,12 @@ def get_trade_quote(
             return None
         # 用两源均值更稳
         primary = {**fuyao_q, "price": round(mid, 4),
-                   "source": "fuyao+tencent", "tencent_price": p2, "fuyao_price": p1}
+                   "source": "fuyao+tencent", "tencent_price": p2, "fuyao_price": p1,
+                   "prev_close": tx_q.get("prev_close"), "open": tx_q.get("open"),
+                   "quote_asof": tx_q.get("quote_asof"),
+                   "received_at": tx_q.get("received_at"),
+                   "tradable": tx_q.get("tradable"),
+                   "trade_status": tx_q.get("trade_status")}
 
     cleaned = sanitize_quote(primary, code=code, avg_cost=avg_cost)
     if cleaned is None:
@@ -182,6 +212,50 @@ def get_trade_quote(
         cleaned.get("pct_change"), avg_cost,
     )
     return cleaned
+
+
+def get_execution_quote(
+    code: str,
+    *,
+    avg_cost: float | None = None,
+    require_cross_check: bool = True,
+    force_refresh: bool = True,
+    require_session: bool = True,
+) -> dict | None:
+    """审批/执行瞬间使用的报价快照。
+
+    与展示行情不同：默认绕过 30 秒缓存、要求连续竞价时段，并要求可交易、
+    开盘价、昨收价和供应商时间戳齐全。任何缺失都 fail closed。
+    """
+    if require_session and not is_trading_session():
+        logger.warning("非连续竞价时段，拒绝生成执行报价 code=%s", code)
+        return None
+    if force_refresh and hasattr(_tx_quote_raw, "cache_clear"):
+        _tx_quote_raw.cache_clear()
+    quote = get_trade_quote(
+        code, avg_cost=avg_cost, require_cross_check=require_cross_check)
+    if quote is None or not bool(quote.get("tradable", True)):
+        return None
+    required = ("price", "open", "prev_close", "quote_asof", "received_at")
+    if any(quote.get(key) in (None, "") for key in required):
+        logger.warning(
+            "执行报价字段不完整 code=%s missing=%s source=%s",
+            code, [key for key in required if quote.get(key) in (None, "")],
+            quote.get("source"),
+        )
+        return None
+    try:
+        price = float(quote["price"])
+        open_price = float(quote["open"])
+        prev_close = float(quote["prev_close"])
+    except (TypeError, ValueError):
+        return None
+    if min(price, open_price, prev_close) <= 0:
+        return None
+    return {
+        **quote,
+        "opening_gap_pct": open_price / prev_close - 1.0,
+    }
 
 
 @ttl_cache(1800)
@@ -310,8 +384,11 @@ def is_trade_date(day: date | None = None) -> bool:
     day = day or date.today()
     try:
         return day.strftime("%Y-%m-%d") in _trade_dates()
-    except Exception:  # noqa: BLE001
-        return day.weekday() < 5  # 日历获取失败退化为工作日判断
+    except Exception as err:  # noqa: BLE001
+        # 工作日不等于交易日。节假日日历不可验证时，交易安全边界必须
+        # fail closed，不能把普通周一误当作可成交日。
+        logger.error("交易日日历不可用，拒绝按工作日猜测: %s", err)
+        return False
 
 
 def is_trading_session(now: datetime | None = None) -> bool:
@@ -402,6 +479,45 @@ def validate_code(code: str) -> dict | None:
     if "ST" in quote["name"].upper():
         return None
     return quote
+
+
+def strategy_eligible_quote(code: str) -> tuple[dict | None, str]:
+    """Return a quote only when a new position can satisfy hard eligibility.
+
+    The watchlist is an observation list, not an execution universe.  Before
+    an LLM is allowed to consider a *new* position, code class, live quote
+    validity, ST/delisting labels and one-board-lot affordability are enforced
+    by deterministic code.  Existing positions are added separately by the
+    engine so an ineligible stock can still be reviewed and sold.
+    """
+    if not (len(code) == 6 and code.isdigit()):
+        return None, "invalid_code"
+    if not code.startswith(("60", "00", "30", "68")):
+        return None, "unsupported_board"
+    quote = get_quote(code)
+    if quote is None:
+        return None, "quote_unavailable"
+    if not bool(quote.get("tradable", True)):
+        return None, "not_tradable"
+    name = str(quote.get("name") or "")
+    if "ST" in name.upper() or "退" in name:
+        return None, "special_treatment_or_delisting"
+    try:
+        price = float(quote.get("price") or 0.0)
+    except (TypeError, ValueError):
+        return None, "invalid_price"
+    if price <= 0:
+        return None, "invalid_price"
+
+    from ..runtime_settings import get_setting
+
+    authorized = float(get_setting("capital.authorized_capital"))
+    absolute_cap = float(get_setting("capital.max_stock_exposure"))
+    single_cap = authorized * float(get_setting("risk.max_position_pct"))
+    lot_budget = min(authorized, absolute_cap, single_cap)
+    if price * 100 > lot_budget + 1e-9:
+        return None, "one_lot_exceeds_single_position_cap"
+    return quote, "eligible"
 
 
 # ---------- 自动选股 ----------

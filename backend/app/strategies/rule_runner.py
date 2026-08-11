@@ -11,7 +11,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..data import fuyao_client as fuyao
+from ..data import fuyao_client as fuyao, market
 from ..factors.panel import latest_factor_snapshot
 from ..factors.score import select_top_n
 from ..ledger import record_close_from_sell, record_open, strategy_key_for_model
@@ -110,17 +110,23 @@ def _rebalance_to_weights(
         if not px:
             skipped.append(f"sell {pos.code}: no price")
             continue
+        trade_quote = market.get_trade_quote(pos.code, avg_cost=pos.avg_cost)
+        if trade_quote is None:
+            skipped.append(f"sell {pos.code}: unsafe quote")
+            continue
+        px = trade_quote
         avg_cost = pos.avg_cost
         result = broker.sell(
             db, model_pk, None, pos.code, pos.name,
             px["price"], px["pct_change"], pos.available_qty,
+            autocommit=False,
         )
         if result.ok and result.order:
             record_close_from_sell(
                 db, strategy_key=sk, model_pk=model_pk, code=pos.code,
                 name=pos.name, qty=result.order.qty, price=px["price"],
                 signal_source=signal_source, order_id=result.order.id,
-                avg_cost=avg_cost,
+                avg_cost=avg_cost, autocommit=False,
             )
             sells.append({"code": pos.code, "qty": result.order.qty, "price": px["price"]})
         else:
@@ -136,8 +142,13 @@ def _rebalance_to_weights(
             skipped.append(f"adjust {code}: no price")
             continue
         name = names.get(code) or px.get("name") or code
-        price = px["price"]
         pos = broker.get_position(db, model_pk, code)
+        trade_quote = market.get_trade_quote(code, avg_cost=pos.avg_cost if pos else None)
+        if trade_quote is None:
+            skipped.append(f"adjust {code}: unsafe quote")
+            continue
+        px = trade_quote
+        price = px["price"]
         current_val = (pos.total_qty * price) if pos else 0.0
         target_val = target_pct * total
         delta = target_val - current_val
@@ -159,12 +170,13 @@ def _rebalance_to_weights(
             avg_cost = pos.avg_cost
             result = broker.sell(
                 db, model_pk, None, code, name, price, px["pct_change"], qty,
+                autocommit=False,
             )
             if result.ok and result.order:
                 record_close_from_sell(
                     db, strategy_key=sk, model_pk=model_pk, code=code, name=name,
                     qty=result.order.qty, price=price, signal_source=signal_source,
-                    order_id=result.order.id, avg_cost=avg_cost,
+                    order_id=result.order.id, avg_cost=avg_cost, autocommit=False,
                 )
                 sells.append({"code": code, "qty": result.order.qty, "price": price})
             else:
@@ -182,13 +194,14 @@ def _rebalance_to_weights(
             result = broker.buy(
                 db, model_pk, None, code, name, price, px["pct_change"],
                 buy_amount, reason=f"{signal_source} rebalance target {target_pct:.1%}",
+                autocommit=False,
             )
             if result.ok and result.order:
                 record_open(
                     db, strategy_key=sk, model_pk=model_pk, code=code, name=name,
                     qty=result.order.qty, price=price, signal_source=signal_source,
                     confidence=1.0, reason=f"target_pct={target_pct:.3f}",
-                    order_id=result.order.id,
+                    order_id=result.order.id, autocommit=False,
                 )
                 buys.append({"code": code, "qty": result.order.qty, "price": price})
             else:
@@ -210,7 +223,14 @@ def _rebalance_to_weights(
 
 
 def rebalance_strategy(db: Session, model_id: str) -> dict[str, Any]:
-    """对单个规则策略调仓。"""
+    """资本化规则调仓已退役；历史模型只读保留。"""
+    raise RuntimeError(
+        "capitalized rule rebalancing is retired; use zero-capital shadow evidence"
+    )
+
+    # The implementation below is intentionally unreachable for now. Keeping it
+    # in place lets historical evidence be interpreted without deleting code or
+    # data while every public mutation path remains fail-closed.
     model = (
         db.query(Model)
         .filter(Model.type == "rule", Model.model_id == model_id, Model.enabled.is_(True))
@@ -305,7 +325,12 @@ def _target_codes_research(db: Session, model: Model, codes: list[str]) -> list[
 
 
 def rebalance_all_rules(db: Session) -> dict[str, Any]:
-    """全部启用规则策略调仓（周频任务入口 + 研究晋升臂）。"""
+    """资本化规则调仓已退役；禁止批量产生订单或资金账户。"""
+    raise RuntimeError(
+        "capitalized rule rebalancing is retired; use zero-capital shadow evidence"
+    )
+
+    # Historical implementation retained below for evidence compatibility.
     results = []
     mids: list[str] = list(RULE_MODEL_IDS)
     for m in (

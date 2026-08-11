@@ -15,6 +15,38 @@ def test_registry_has_core_groups():
     assert REGISTRY["secrets.llm_api_key"].secret is True
 
 
+def test_accepted_capital_contract_is_read_only_and_race_group_is_retired():
+    ids = {g["id"] for g in GROUPS}
+    assert "validation" in ids
+    assert "race" not in ids
+    for key in (
+        "account.initial_cash",
+        "capital.authorized_capital",
+        "capital.max_stock_exposure",
+        "capital.drawdown_alert_1",
+        "capital.drawdown_alert_2",
+        "capital.canary_stop_drawdown",
+    ):
+        assert REGISTRY[key].editable is False
+    assert "重置全部账户" not in REGISTRY["account.initial_cash"].description
+
+
+def test_old_override_cannot_weaken_fixed_capital_contract(db):
+    db.add(SettingOverride(key="capital.authorized_capital", value="400000"))
+    db.add(SettingOverride(key="capital.canary_stop_drawdown", value="300000"))
+    db.add(SettingOverride(key="risk.deep_loss_auto_execute", value="true"))
+    db.commit()
+    invalidate_cache()
+
+    assert get_setting("capital.authorized_capital", db) == 100_000.0
+    assert get_setting("capital.canary_stop_drawdown", db) == 15_000.0
+    assert get_setting("risk.deep_loss_auto_execute", db) is False
+
+    items = {item["key"]: item for item in list_settings(group="capital", db=db)}
+    assert items["capital.authorized_capital"]["source"] == "fixed"
+    assert items["capital.authorized_capital"]["overridden"] is False
+
+
 def test_default_get_setting(db):
     """无覆盖时等于注册表默认（用测试库，避免污染真实 DB）。"""
     from unittest.mock import patch
@@ -69,6 +101,17 @@ def test_scheduler_flag_on_schedule_change(db):
     result = set_settings({"schedule.monitor_interval_minutes": 20}, db)
     assert result["reload_scheduler"] is True
     reset_settings(keys=["schedule.monitor_interval_minutes"], db=db)
+
+
+def test_settings_reset_requires_explicit_scope(db):
+    from fastapi import HTTPException
+    from app.api.routes import SettingsReset, reset_settings_api
+
+    try:
+        reset_settings_api(SettingsReset(), db)
+        assert False, "empty reset must be rejected"
+    except HTTPException as err:
+        assert err.status_code == 400
 
 
 def test_secret_masked_in_list(db):

@@ -2,18 +2,24 @@
   <div class="page stack">
     <div class="page-head">
       <div>
-        <h1 class="page-title">参赛账户</h1>
-        <p class="page-sub">增删启停的唯一入口 · 战报只看排行，设置只看摘要</p>
+        <h1 class="page-title">模型与策略</h1>
+        <p class="page-sub">LLM 只做独立判断 · 策略组合才拥有授权资金与持仓</p>
       </div>
       <div class="head-actions" role="toolbar" aria-label="账户操作">
         <el-button size="small" type="primary" @click="openLlmDialog">添加 LLM</el-button>
-        <el-button size="small" type="warning" @click="openEnsembleDialog">新建合议</el-button>
+        <el-button
+          size="small"
+          type="warning"
+          :disabled="hasEnsemble"
+          :title="hasEnsemble ? (hasOfficial ? '只允许一个官方策略账户，请编辑现有 ensemble' : '旧库存在多个候选 ensemble；请停用到只剩一个以完成官方身份迁移') : ''"
+          @click="openEnsembleDialog"
+        >{{ hasOfficial ? '官方策略已建立' : (hasEnsemble ? '官方策略身份冲突' : '建立官方策略') }}</el-button>
       </div>
     </div>
 
     <section class="panel" aria-label="账户列表">
       <p v-if="!loading && !models.length" class="empty" role="status">
-        暂无账户。先添加 LLM，再可选建合议；规则账户由系统种子创建。
+        暂无模型。先添加至少两个独立 LLM，再建立一个条件计划策略。
       </p>
 
       <div v-else-if="isMobile">
@@ -24,6 +30,7 @@
             <el-switch
               class="m-switch"
               :model-value="row.enabled"
+              :disabled="row.type === 'rule'"
               :aria-label="`启用 ${row.name}`"
               @change="(v) => toggle(row, v)"
             />
@@ -32,8 +39,9 @@
           <div v-else-if="row.type === 'ensemble'" class="meta">
             成员：{{ memberNames(row) }}
           </div>
-          <div v-else class="meta mono">策略 {{ row.model_id }}</div>
-          <div class="m-row">
+          <div v-else class="meta mono">历史规则证据 {{ row.model_id }}</div>
+          <div v-if="row.type === 'llm'" class="advisor-note">独立判断顾问 · 无资金账户</div>
+          <div v-else class="m-row">
             <span>
               收益
               <span class="mono" :class="row.pnl_pct >= 0 ? 'up' : 'down'">
@@ -41,11 +49,11 @@
               </span>
             </span>
             <div class="m-actions">
-              <el-button size="small" type="primary" plain @click="openPositions(row)">持仓</el-button>
+              <el-button v-if="row.is_official_strategy" size="small" type="primary" plain @click="openPositions(row)">策略持仓</el-button>
               <el-popconfirm
                 v-if="row.type !== 'rule'"
-                title="删除该账户全部数据？"
-                confirm-button-text="删除"
+                title="无证据时删除；已有证据时仅停用并保留历史。继续？"
+                confirm-button-text="继续"
                 cancel-button-text="取消"
                 @confirm="remove(row.id)"
               >
@@ -66,7 +74,7 @@
             <span translate="no">{{ row.name }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="赛道" width="100">
+        <el-table-column label="职责" width="110">
           <template #default="{ row }">
             <span class="lane-pill" :class="laneClass(row)">{{ laneLabel(row) }}</span>
           </template>
@@ -78,10 +86,10 @@
             <span v-else>{{ memberNames(row) || '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="收益率" width="110">
+        <el-table-column label="策略收益率" width="120">
           <template #default="{ row }">
             <span class="mono" :class="row.pnl_pct >= 0 ? 'up' : 'down'">
-              {{ formatPnl(row.pnl_pct) }}
+              {{ row.is_official_strategy ? formatPnl(row.pnl_pct) : '—' }}
             </span>
           </template>
         </el-table-column>
@@ -89,6 +97,7 @@
           <template #default="{ row }">
             <el-switch
               :model-value="row.enabled"
+              :disabled="row.type === 'rule'"
               :aria-label="`启用 ${row.name}`"
               @change="(v) => toggle(row, v)"
             />
@@ -96,11 +105,11 @@
         </el-table-column>
         <el-table-column label="操作" width="160">
           <template #default="{ row }">
-            <el-button size="small" type="primary" plain @click="openPositions(row)">持仓</el-button>
+            <el-button v-if="row.is_official_strategy" size="small" type="primary" plain @click="openPositions(row)">策略持仓</el-button>
             <el-popconfirm
               v-if="row.type !== 'rule'"
-              title="删除该账户全部数据？"
-              confirm-button-text="删除"
+              title="无证据时删除；已有证据时仅停用并保留历史。继续？"
+              confirm-button-text="继续"
               cancel-button-text="取消"
               @confirm="remove(row.id)"
             >
@@ -159,7 +168,7 @@
     </el-drawer>
 
     <p class="hint foot">
-      规则账户由系统维护，不可删除。LLM 共用
+      LLM 顾问不拥有账户；最终交易与风险复核使用不同成员模型。已有前瞻证据的模型只能停用，不能抹除历史。LLM 共用
       <router-link to="/settings?tab=secrets">设置 → 密钥</router-link>
       中的 Base URL / API Key。
     </p>
@@ -200,7 +209,7 @@
 
     <el-dialog
       v-model="ensembleDialog"
-      title="新建合议"
+      title="新建策略组合"
       :width="isMobile ? '92%' : '420px'"
       destroy-on-close
       @closed="ensembleForm = { name: '', members: [] }"
@@ -215,7 +224,7 @@
             spellcheck="false"
           />
         </el-form-item>
-        <el-form-item label="成员（至少 2 个 LLM）">
+        <el-form-item label="独立判断成员（至少 2 个 LLM）">
           <el-checkbox-group v-if="llmModels.length" v-model="ensembleForm.members" class="member-group">
             <el-checkbox
               v-for="m in llmModels"
@@ -227,7 +236,7 @@
           <p v-else class="hint">请先添加至少 2 个 LLM。</p>
         </el-form-item>
       </el-form>
-      <p class="hint">多数票合成，不额外消耗 LLM。</p>
+      <p class="hint">所有成员读取同一冻结事实；最终交易员与风险复核由两个不同模型完成。分析只生成候选计划，不成交。</p>
       <template #footer>
         <el-button @click="ensembleDialog = false">取消</el-button>
         <el-button type="warning" :loading="saving" @click="createEnsemble">创建</el-button>
@@ -256,6 +265,8 @@ const posData = ref({})
 const posLoading = ref(false)
 
 const llmModels = computed(() => models.value.filter((m) => m.type === 'llm'))
+const hasEnsemble = computed(() => models.value.some((m) => m.type === 'ensemble'))
+const hasOfficial = computed(() => models.value.some((m) => m.is_official_strategy))
 const nameOf = (pk) => models.value.find((m) => m.id === pk)?.name || pk
 function memberNames(row) {
   const ms = row?.members
@@ -284,13 +295,15 @@ async function openPositions(row) {
 
 function laneClass(row) {
   if (row.type === 'rule') return 'rule'
+  if (row.type === 'ensemble' && !row.is_official_strategy) return 'historical'
   if (row.type === 'ensemble') return 'ensemble'
   return 'ai'
 }
 function laneLabel(row) {
-  if (row.type === 'rule') return '规则'
-  if (row.type === 'ensemble') return '合议'
-  return 'LLM'
+  if (row.type === 'rule') return '历史证据'
+  if (row.type === 'ensemble' && !row.is_official_strategy) return '历史合议'
+  if (row.type === 'ensemble') return '策略'
+  return '判断顾问'
 }
 
 function formatPnl(v) {
@@ -315,6 +328,12 @@ function openLlmDialog() {
   llmDialog.value = true
 }
 function openEnsembleDialog() {
+  if (hasEnsemble.value) {
+    ElMessage.info(hasOfficial.value
+      ? '只允许一个官方策略账户，请编辑现有 ensemble 的成员'
+      : '旧库 ensemble 身份冲突：请先停用到只剩一个启用项，系统会将其设为官方策略')
+    return
+  }
   ensembleForm.value = { name: '', members: [] }
   ensembleDialog.value = true
 }
@@ -327,7 +346,7 @@ async function createLlm() {
   saving.value = true
   try {
     await api.createModel({ ...llmForm.value, type: 'llm' })
-    ElMessage.success('已添加 LLM。启用后点右上角「AI 决策」即可参赛')
+    ElMessage.success('已添加独立判断模型；它不会获得资金账户')
     llmDialog.value = false
     await load()
   } catch (err) {
@@ -349,7 +368,7 @@ async function createEnsemble() {
       type: 'ensemble',
       members: ensembleForm.value.members,
     })
-    ElMessage.success('已创建合议。下轮 AI 决策会在成员跑完后自动合成')
+    ElMessage.success('已创建条件计划策略；下轮分析只会生成候选计划')
     ensembleDialog.value = false
     await load()
   } catch (err) {
@@ -370,8 +389,8 @@ async function toggle(row, enabled) {
 
 async function remove(id) {
   try {
-    await api.deleteModel(id)
-    ElMessage.success('已删除')
+    const result = await api.deleteModel(id)
+    ElMessage.success(result.archived ? '已有证据，已停用并保留历史' : '未产生证据，已删除')
     await load()
   } catch (err) {
     ElMessage.error(err.message)
@@ -391,6 +410,11 @@ onMounted(load)
 }
 .m-switch { margin-left: auto; }
 .meta { font-size: 12px; color: var(--text-muted); margin: 6px 0; }
+.advisor-note {
+  margin-top: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
 .m-row {
   display: flex;
   justify-content: space-between;
@@ -457,4 +481,5 @@ onMounted(load)
 .lane-pill.ai { background: var(--accent-dim); color: var(--lane-ai); }
 .lane-pill.ensemble { background: rgba(167, 139, 250, 0.15); color: #c4b5fd; }
 .lane-pill.rule { background: var(--lane-rule-dim); color: var(--lane-rule); }
+.lane-pill.historical { background: var(--lane-rule-dim); color: var(--text-muted); }
 </style>

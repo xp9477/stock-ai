@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import itertools
 import logging
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 from sqlalchemy.orm import Session
 
 from ..backtest.engine import run_equal_weight_buyhold
-from ..backtest.spec_runner import run_spec_backtest
+from ..backtest import evidence
+from ..backtest.validation import split_development_holdout
 from ..factors.panel import build_factor_panel
 from ..models import Watchlist
 from ..runtime_settings import get_setting
@@ -111,6 +112,15 @@ def run_grid(
     if "close" not in panel.columns and "收盘" in panel.columns:
         panel = panel.rename(columns={"收盘": "close"})
 
+    # 网格搜索永远看不到最后 20% 保留样本，避免用测试集挑参数。
+    development, holdout = split_development_holdout(panel)
+    if development.empty or holdout.empty:
+        raise RuntimeError("开发期/封存保留样本切分失败，数据不足")
+    holdout_start = pd.to_datetime(holdout["date"], errors="coerce").min()
+    if pd.isna(holdout_start):
+        raise RuntimeError("封存保留样本缺少有效日期")
+    development_cutoff = datetime.combine(
+        holdout_start.date(), time.min, tzinfo=timezone.utc)
     specs = expand_grid(
         factor_set_ids=factor_set_ids,
         top_n_list=top_n_list,
@@ -119,26 +129,36 @@ def run_grid(
         include_equal_weight=include_equal_weight,
         max_combos=max_combos,
     )
-    anchor = run_equal_weight_buyhold(panel)
+    anchor = run_equal_weight_buyhold(development)
     a_metrics = anchor.metrics or {}
 
     rows: list[dict[str, Any]] = []
     for i, spec in enumerate(specs):
         try:
-            res = run_spec_backtest(panel, spec)
-            m = res.metrics or {}
+            experiment = evidence.run_reproducible_development(
+                db,
+                panel=development,
+                spec=spec,
+                universe=codes,
+                data_cutoff_at=development_cutoff,
+            )
+            result_row = evidence.get_result(db, experiment.id, "development")
+            persisted = evidence.result_dict(result_row)["strategy"]
+            m = persisted.get("metrics") or {}
             sharpe = float(m.get("sharpe") or 0)
             a_sh = float(a_metrics.get("sharpe") or 0)
             suggestion = "review"
             if m.get("sample_ok") and sharpe > a_sh and sharpe > 0:
-                suggestion = "promote"
+                suggestion = "candidate"
             elif m.get("sample_ok") and (sharpe < a_sh - 0.2 or sharpe < 0):
                 suggestion = "discard"
             rows.append({
                 "rank": 0,
+                "experiment_id": experiment.id,
+                "result_fingerprint": result_row.result_fingerprint,
                 "spec": spec,
                 "metrics": m,
-                "closed_trades": res.closed_trades,
+                "closed_trades": int(persisted.get("closed_trades") or 0),
                 "suggestion": suggestion,
                 "sharpe": sharpe,
                 "excess_sharpe_vs_anchor": round(sharpe - a_sh, 4),
@@ -167,7 +187,8 @@ def run_grid(
         "anchor": anchor.to_dict(),
         "race": {"min_trade_days": min_days, "min_closed_trades": min_trades},
         "rows": rows,
-        "survivors": [r for r in rows if r.get("suggestion") == "promote"],
+        "survivors": [r for r in rows if r.get("suggestion") == "candidate"],
+        "holdout_reserved": True,
     }
 
 

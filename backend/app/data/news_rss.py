@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import logging
 import re
+import hashlib
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Any
@@ -138,26 +140,29 @@ def _fetch_feed(url: str, timeout: int | None = None) -> bytes | None:
         return None
 
 
-@ttl_cache(600)
-def fetch_all_headlines(limit_per_feed: int = 15) -> list[dict[str, Any]]:
-    """抓取全部配置源，合并去重。
-
-    源列表：本文件 RSS_FEEDS（硬编码）。启停/超时见设置 datasources.rss.*。
-    """
+def _collect_headlines(limit_per_feed: int = 15) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """抓取一次并同时返回逐源健康状态；供盘前强制刷新使用。"""
     try:
         from . import datasources as ds
         if not ds.is_enabled("rss"):
-            return []
+            return [], [{"id": f["id"], "ok": False, "reason": "disabled"}
+                        for f in RSS_FEEDS]
     except Exception:  # noqa: BLE001
         pass
 
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
+    sources: list[dict[str, Any]] = []
     for feed in RSS_FEEDS:
         raw = _fetch_feed(feed["url"])
         if not raw:
+            sources.append({"id": feed["id"], "name": feed["name"],
+                            "ok": False, "item_count": 0, "reason": "fetch_failed"})
             continue
-        for item in _parse_rss(raw, feed["name"])[:limit_per_feed]:
+        parsed = _parse_rss(raw, feed["name"])[:limit_per_feed]
+        sources.append({"id": feed["id"], "name": feed["name"],
+                        "ok": True, "item_count": len(parsed), "reason": ""})
+        for item in parsed:
             title = item.get("title") or ""
             if not title or _BLOCK.search(title) or _BLOCK.search(item.get("content") or ""):
                 continue
@@ -165,13 +170,23 @@ def fetch_all_headlines(limit_per_feed: int = 15) -> list[dict[str, Any]]:
             if key in seen:
                 continue
             seen.add(key)
-            out.append(item)
-    return out
+            normalized = {**item, "feed_id": feed["id"], "region": feed.get("region", "")}
+            normalized["content_hash"] = hashlib.sha256(
+                f"{normalized.get('url', '')}\n{title}\n{normalized.get('content', '')}".encode("utf-8")
+            ).hexdigest()
+            out.append(normalized)
+    return out, sources
 
 
-def news_for_stock(code: str, name: str = "", limit: int = 10) -> list[dict[str, Any]]:
-    """按代码/简称过滤相关资讯；无命中则返回宏观头条前几条并标注 general。"""
-    headlines = fetch_all_headlines()
+@ttl_cache(600)
+def fetch_all_headlines(limit_per_feed: int = 15) -> list[dict[str, Any]]:
+    """展示/分析用缓存聚合；不能单独证明盘前信息覆盖完整。"""
+    return _collect_headlines(limit_per_feed)[0]
+
+
+def _match_stock_news(
+    headlines: list[dict[str, Any]], code: str, name: str, limit: int,
+) -> list[dict[str, Any]]:
     keys = [code]
     if name:
         # 去掉常见后缀
@@ -188,9 +203,50 @@ def news_for_stock(code: str, name: str = "", limit: int = 10) -> list[dict[str,
         if len(matched) >= limit:
             break
 
-    if matched:
-        return matched[:limit]
+    return matched[:limit]
+
+
+def news_for_stock(
+    code: str, name: str = "", limit: int = 10, *, include_general: bool = True,
+) -> list[dict[str, Any]]:
+    """按代码/简称过滤资讯。
+
+    通用头条只用于 LLM 的宏观背景；信息门禁必须使用
+    :func:`stock_news_gate_snapshot`，绝不能把 general 当作个股覆盖证明。
+    """
+    headlines = fetch_all_headlines()
+    matched = _match_stock_news(headlines, code, name, limit)
+    if matched or not include_general:
+        return matched
 
     # 无个股命中：给宏观样本，避免底稿新闻全空
     general = [{**h, "match": "general"} for h in headlines[:limit]]
     return general
+
+
+def stock_news_gate_snapshot(
+    code: str, name: str = "", limit: int = 20, *, force_refresh: bool = True,
+) -> dict[str, Any]:
+    """盘前增量审查快照。
+
+    RSS 是补充信息源，不是法定披露源，因此 ``official_coverage`` 永远为
+    False，直到项目显式接入并验证正式公告供应商。调用者必须 fail closed
+    或要求用户逐笔确认已经人工核对正式公告。
+    """
+    if force_refresh and hasattr(fetch_all_headlines, "cache_clear"):
+        fetch_all_headlines.cache_clear()
+    headlines, sources = _collect_headlines()
+    items = _match_stock_news(headlines, code, name, limit)
+    fingerprint = hashlib.sha256(
+        "\n".join(sorted(str(i.get("content_hash") or "") for i in items)).encode("utf-8")
+    ).hexdigest()
+    successful = sum(1 for source in sources if source.get("ok"))
+    return {
+        "code": code,
+        "items": items,
+        "fingerprint": fingerprint,
+        "fetched_at": datetime.now().isoformat(),
+        "rss_coverage_ok": successful > 0,
+        "official_coverage": False,
+        "source_results": sources,
+    }

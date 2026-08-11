@@ -4,7 +4,7 @@
       <div>
         <h1 class="page-title">研究</h1>
         <p class="page-sub">
-          理论 → 规格 → 回测 → 晋升 · 存活者进入
+          理论 → 规格 → 开发集筛选 → 保留样本验证 → 晋升
           <router-link class="link" to="/strategies">策略对照台</router-link>
         </p>
       </div>
@@ -25,7 +25,7 @@
         <span class="dim" style="font-size:12px">研究层预赛 · 不自动开户</span>
       </div>
       <p class="hint">
-        预设因子组合 × TopN × 调仓 × 止损，一次拉面板批量回测；勾选存活者导入为假说后再人工晋升。
+        预设因子组合 × TopN × 调仓 × 止损，一次拉面板批量筛选；候选导入后还要通过网格搜索从未见过的保留样本，才允许晋升。
       </p>
       <div class="grid-controls">
         <el-select v-model="gridPresets" multiple collapse-tags placeholder="因子预设" style="min-width:200px">
@@ -81,7 +81,7 @@
       </el-table>
       <p v-if="gridMeta" class="hint mono">
         {{ gridMeta.n_combos }} 组合 · 股池 {{ gridMeta.codes?.length }} · {{ gridMeta.start }} 起
-        · 存活建议 {{ gridMeta.survivors?.length || 0 }}
+        · 待保留样本验证 {{ gridMeta.survivors?.length || 0 }}
       </p>
     </section>
 
@@ -178,7 +178,7 @@
           :disabled="!canPromote"
           :loading="promoting"
           @click="doPromote"
-        >④ 晋升到策略</el-button>
+        >④ 批准为候选证据</el-button>
         <el-button type="danger" plain :loading="discarding" @click="doDiscard">废弃</el-button>
         <el-button
           v-if="current.status === 'promoted'"
@@ -189,7 +189,7 @@
       </div>
 
       <!-- 回测结果 -->
-      <div v-if="current.backtest?.result" class="bt-wrap">
+    <div v-if="current.backtest?.result" class="bt-wrap">
         <div class="bt-banner" :class="current.suggestion">
           建议：
           <b>{{ suggestText(current.suggestion) }}</b>
@@ -232,6 +232,15 @@
               </div>
             </div>
           </div>
+          <div class="bt-card" v-if="current.backtest.holdout?.metrics">
+            <h4>保留样本（网格搜索不可见）</h4>
+            <div class="bt-metrics">
+              <div><span>总收益</span><b class="mono" :class="retClass(current.backtest.holdout.metrics.total_return)">{{ pct(current.backtest.holdout.metrics.total_return) }}</b></div>
+              <div><span>夏普</span><b class="mono">{{ current.backtest.holdout.metrics.sharpe }}</b></div>
+              <div><span>最大回撤</span><b class="mono down">{{ pct(current.backtest.holdout.metrics.max_drawdown) }}</b></div>
+              <div><span>样本</span><b class="mono">{{ current.backtest.holdout.metrics.n_days }} 日 · {{ current.backtest.holdout.closed_trades }} 笔</b></div>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -261,7 +270,11 @@
         <el-table-column label="建议" width="90">
           <template #default="{ row }">{{ suggestText(row.suggestion) || '—' }}</template>
         </el-table-column>
-        <el-table-column prop="promoted_model_id" label="晋升账户" width="110" />
+        <el-table-column label="证据实验" width="110">
+          <template #default="{ row }">
+            {{ row.promoted_experiment_id ? `#${row.promoted_experiment_id}` : '—' }}
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="100">
           <template #default="{ row }">
             <el-button size="small" text type="primary" @click="selectItem(row)">打开</el-button>
@@ -296,11 +309,9 @@
 
 <script setup>
 import { computed, onMounted, reactive, ref, watch } from 'vue'
-import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api/index.js'
 
-const router = useRouter()
 
 const FACTOR_OPTS = [
   'mom_short', 'mom_mid', 'low_vol', 'ep', 'bp', 'quality_roe',
@@ -345,11 +356,13 @@ const proposing = ref(false)
 
 const canPromote = computed(() => {
   const s = current.value?.status
-  // 须已回测且未终态；草稿无 backtest 不可晋升
+  // 只能消费已经通过不可变 development + holdout 门槛的证据。
   return Boolean(
     s
     && !['draft', 'discarded', 'promoted', 'retired'].includes(s)
-    && current.value?.backtest?.result,
+    && current.value?.suggestion === 'promote'
+    && current.value?.backtest?.result
+    && current.value?.backtest?.holdout,
   )
 })
 
@@ -366,7 +379,7 @@ function statusText(s) {
   })[s] || s
 }
 function suggestText(s) {
-  return ({ promote: '晋升', discard: '废弃', review: '复核' })[s] || ''
+  return ({ promote: '晋升', discard: '废弃', review: '复核', candidate: '候选' })[s] || ''
 }
 function pct(v) {
   if (v == null || Number.isNaN(Number(v))) return '—'
@@ -505,31 +518,19 @@ async function doPromote() {
     ElMessage.warning('请先完成回测再晋升')
     return
   }
-  const suggest = current.value.suggestion
-  const warn = suggest === 'discard'
-    ? '当前回测建议为「废弃」，仍要强行晋升开户吗？'
-    : suggest === 'review'
-      ? '样本不足或灰区建议「复核」，确认仍要晋升？'
-      : '将开独立规则账户参赛（标签：研究晋升）。确认晋升？'
   try {
-    await ElMessageBox.confirm(warn, '晋升', { type: 'warning' })
+    await ElMessageBox.confirm(
+      '将当前不可变 experiment 及其 development / holdout 结果批准为候选证据。不会创建模型、资金账户或订单。确认？',
+      '批准候选证据',
+      { type: 'warning' },
+    )
   } catch { return }
   promoting.value = true
   try {
     const res = await api.promoteHypothesis(current.value.id)
     selectItem(res)
     await loadList()
-    ElMessage.success(`已晋升：${res.promoted_model_id}`)
-    try {
-      await ElMessageBox.confirm(
-        `已开独立规则账户「${res.promoted_model_id}」。是否前往策略页查看并调仓？`,
-        '晋升成功',
-        { type: 'success', confirmButtonText: '去策略页', cancelButtonText: '留在研究' },
-      )
-      router.push('/strategies')
-    } catch {
-      /* 用户选择留在研究页 */
-    }
+    ElMessage.success(`候选证据已批准：experiment #${res.promoted_experiment_id}，未创建资金账户`)
   } catch (err) {
     ElMessage.error(err.message)
   } finally {
@@ -567,7 +568,7 @@ async function doRetire() {
   try {
     const res = await api.retireHypothesis(current.value.id)
     selectItem(res)
-    ElMessage.success('已退役（账户停用）')
+    ElMessage.success('候选证据已退役；未创建或变更资金账户')
     await loadList()
   } catch (err) {
     ElMessage.error(err.message)
@@ -615,7 +616,7 @@ async function runGrid() {
     })
     gridRows.value = data.rows || []
     gridMeta.value = data
-    ElMessage.success(`网格完成 ${data.n_combos} 组合，建议晋升 ${data.survivors?.length || 0}`)
+    ElMessage.success(`网格完成 ${data.n_combos} 组合，候选 ${data.survivors?.length || 0}（仍需保留样本验证）`)
   } catch (err) {
     ElMessage.error(err.message)
   } finally {

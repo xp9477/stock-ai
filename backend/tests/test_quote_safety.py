@@ -22,6 +22,20 @@ def test_sanitize_quote_accepts_normal_price():
         assert out["price"] == 56.0
 
 
+def test_trade_calendar_failure_is_fail_closed():
+    with patch("app.data.market._trade_dates", side_effect=RuntimeError("offline")):
+        assert market.is_trade_date() is False
+
+
+def test_continuous_and_closing_session_boundaries():
+    with patch("app.data.market.is_trade_date", return_value=True):
+        assert market.is_trading_session(datetime(2026, 8, 10, 9, 29)) is False
+        assert market.is_trading_session(datetime(2026, 8, 10, 9, 30)) is True
+        assert market.is_trading_session(datetime(2026, 8, 10, 12, 0)) is False
+        assert market.is_trading_session(datetime(2026, 8, 10, 14, 59)) is True
+        assert market.is_trading_session(datetime(2026, 8, 10, 15, 1)) is False
+
+
 def test_run_monitor_skips_outside_session(db, model_a):
     broker.get_account(db, model_a.id)
     db.add(Position(

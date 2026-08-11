@@ -1,7 +1,7 @@
 """事件回测：池内等权买入持有 + S2 周频前 N 等权。
 
-简化假设（第一季可接受）：
-- 调仓日按收盘价成交
+简化假设：
+- 前一交易日收盘生成信号，下一交易日收盘成交
 - 不考虑涨跌停无法成交（历史回测后续可加）
 - 费用按 settings 佣金/印花税近似（双边）
 - 整手忽略，用金额权重（便于向量化）；与实盘模拟撮合分开记账
@@ -45,11 +45,18 @@ class BacktestResult:
 
 def _fee_rate() -> float:
     # 近似单边：佣金 + 过户；卖出再加印花税 → 换手时用往返
-    return settings.commission_rate + settings.transfer_fee_rate
+    from ..runtime_settings import get_setting
+
+    return (
+        float(get_setting("trading.commission_rate"))
+        + float(get_setting("trading.transfer_fee_rate"))
+    )
 
 
 def _roundtrip_fee_rate() -> float:
-    return 2 * _fee_rate() + settings.stamp_tax_rate
+    from ..runtime_settings import get_setting
+
+    return 2 * _fee_rate() + float(get_setting("trading.stamp_tax_rate"))
 
 
 def _pivot_close(panel: pd.DataFrame) -> pd.DataFrame:
@@ -65,7 +72,12 @@ def run_equal_weight_buyhold(
     name: str = "pool_equal_weight",
 ) -> BacktestResult:
     """池内所有股票等权买入持有（锚）。"""
-    initial_cash = initial_cash or settings.initial_cash
+    from ..runtime_settings import get_setting
+
+    initial_cash = (
+        initial_cash if initial_cash is not None
+        else float(get_setting("account.initial_cash"))
+    )
     closes = _pivot_close(panel)
     if closes.empty or len(closes) < 2:
         eq = pd.Series(dtype=float)
@@ -95,8 +107,8 @@ def run_equal_weight_buyhold(
     eq = pd.Series(equity, index=idx)
     metrics = mark_sample_ok(
         compute_metrics(eq, closed_trades=0),
-        settings.race_min_trade_days,
-        settings.race_min_closed_trades,
+        int(get_setting("race.min_trade_days")),
+        int(get_setting("race.min_closed_trades")),
     )
     return BacktestResult(name=name, equity=eq, closed_trades=0, metrics=metrics,
                           holdings_log=[{"date": str(idx[0])[:10], "codes": list(shares)}])
@@ -110,8 +122,13 @@ def run_factor_weekly(
     rebalance: str | None = None,
 ) -> BacktestResult:
     """每周按截面综合分选前 top_n 等权再平衡。"""
-    top_n = top_n or settings.factor_top_n
-    initial_cash = initial_cash or settings.initial_cash
+    from ..runtime_settings import get_setting
+
+    top_n = top_n if top_n is not None else int(get_setting("factor.top_n"))
+    initial_cash = (
+        initial_cash if initial_cash is not None
+        else float(get_setting("account.initial_cash"))
+    )
     rebalance = rebalance or settings.factor_rebalance
 
     if panel is None or panel.empty:
@@ -142,9 +159,6 @@ def run_factor_weekly(
     rebal_set = {d for d in closes.index if d in rebal_set or _is_week_start(d, closes.index)}
     if not rebal_set:
         rebal_set = {closes.index[0]}
-    # 确保首日调仓
-    rebal_set.add(closes.index[0])
-
     cash = float(initial_cash)
     holdings: dict[str, float] = {}  # code -> shares
     equity_vals = []
@@ -152,11 +166,11 @@ def run_factor_weekly(
     closed_trades = 0
     fee_rt = _roundtrip_fee_rate()
 
+    previous_dt = None
     for dt, row in closes.iterrows():
-        if dt in rebal_set or (not holdings and dt == closes.index[0]):
-            target_codes = score_by_date.get(dt) or score_by_date.get(
-                max((d for d in score_by_date if d <= dt), default=dt), []
-            )
+        # T 日收盘生成信号，只允许在下一个交易日价格执行。
+        if previous_dt is not None and dt in rebal_set:
+            target_codes = score_by_date.get(previous_dt, [])
             # 当前市值
             port_val = cash
             for c, q in holdings.items():
@@ -188,6 +202,7 @@ def run_factor_weekly(
                 cash = port_val
             holdings_log.append({
                 "date": str(dt)[:10],
+                "signal_date": str(previous_dt)[:10],
                 "codes": buyable,
                 "n": len(buyable),
             })
@@ -199,13 +214,16 @@ def run_factor_weekly(
             if px is not None and np.isfinite(px):
                 val += q * float(px)
         equity_vals.append(val)
+        previous_dt = dt
 
     eq = pd.Series(equity_vals, index=closes.index)
     # 基准超额：池内等权
     bench = run_equal_weight_buyhold(panel, initial_cash=initial_cash)
     metrics = compute_metrics(eq, closed_trades=closed_trades, benchmark=bench.equity)
     metrics = mark_sample_ok(
-        metrics, settings.race_min_trade_days, settings.race_min_closed_trades
+        metrics,
+        int(get_setting("race.min_trade_days")),
+        int(get_setting("race.min_closed_trades")),
     )
     return BacktestResult(
         name=name,

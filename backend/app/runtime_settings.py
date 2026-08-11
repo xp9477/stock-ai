@@ -155,6 +155,11 @@ def _load_override_map(db: Session | None = None) -> dict[str, str]:
 
 
 def _resolve_one(key: str, defn: SettingDef, overrides: dict[str, str]) -> Any:
+    # Non-editable entries are code-owned invariants/contracts.  Old database
+    # overrides (or a stale .env value) must not silently weaken them after an
+    # upgrade merely because the row predates the read-only flag.
+    if not defn.editable:
+        return _coerce(defn, defn.default)
     if key in overrides:
         try:
             return _coerce(defn, overrides[key])
@@ -192,7 +197,8 @@ def get_setting(key: str, db: Session | None = None) -> Any:
 
 
 def is_overridden(key: str, db: Session | None = None) -> bool:
-    return key in _load_override_map(db)
+    defn = get_def(key)
+    return defn.editable and key in _load_override_map(db)
 
 
 def secret_source(key: str, db: Session | None = None) -> str:
@@ -228,8 +234,9 @@ def list_settings(group: str | None = None, db: Session | None = None) -> list[d
             "min_value": defn.min_value,
             "max_value": defn.max_value,
             "secret": _is_secret(defn),
-            "overridden": defn.key in overrides,
+            "overridden": defn.editable and defn.key in overrides,
             "danger": getattr(defn, "danger", "normal") or "normal",
+            "evidence_role": getattr(defn, "evidence_role", "operational") or "operational",
         }
         if _is_secret(defn):
             configured = bool(str(raw or "").strip())
@@ -243,8 +250,10 @@ def list_settings(group: str | None = None, db: Session | None = None) -> list[d
             item["default"] = defn.default
             item["configured"] = True
             item["masked"] = ""
-            item["source"] = "override" if defn.key in overrides else (
+            item["source"] = "fixed" if not defn.editable else (
+                "override" if defn.key in overrides else (
                 "env" if _env_fallback(defn.key) is not None else "default"
+                )
             )
         out.append(item)
     return out

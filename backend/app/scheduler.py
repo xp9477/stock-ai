@@ -1,4 +1,4 @@
-"""APScheduler:每日决策 + 盘中监控 + 规则组周频调仓。"""
+"""APScheduler：每日决策、选股与盘中复审。"""
 import logging
 from datetime import datetime, time as dtime
 
@@ -48,24 +48,6 @@ def _monitor_job():
         logger.exception("盘中监控失败")
 
 
-def _rule_rebalance_job():
-    """周一（交易日）规则组调仓。"""
-    if not market.is_trade_date():
-        logger.info("今日非交易日,跳过规则调仓")
-        return
-    from .database import SessionLocal
-    from .strategies.rule_runner import rebalance_all_rules
-
-    db = SessionLocal()
-    try:
-        result = rebalance_all_rules(db)
-        logger.info("规则组调仓完成: %s", result)
-    except Exception:  # noqa: BLE001
-        logger.exception("规则组调仓失败")
-    finally:
-        db.close()
-
-
 def _sched_params() -> dict:
     """从运行时配置读取调度参数（设置页可改）。"""
     try:
@@ -113,14 +95,17 @@ def _register_jobs(sched: BackgroundScheduler) -> None:
         misfire_grace_time=60,
     )
 
-    # 规则组：每周一 14:50（决策后）
-    sched.add_job(_rule_rebalance_job,
-                  CronTrigger(day_of_week="mon", hour=14, minute=50),
-                  id="rule_rebalance", max_instances=1, coalesce=True, replace_existing=True)
+    # 资本化规则赛马已退役。清理进程内可能由旧版本遗留的 job，且不再注册。
+    try:
+        sched.remove_job("rule_rebalance")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def start():
     global _scheduler
+    if _scheduler is not None and _scheduler.running:
+        return
     try:
         from .runtime_settings import get_setting
         enabled = bool(get_setting("schedule.enabled"))
@@ -134,7 +119,7 @@ def start():
     _scheduler.start()
     p = _sched_params()
     logger.info(
-        "调度器已启动: 每日决策 %s, 自动选股 %s, 盘中监控每 %d 分钟, 规则调仓 周一 14:50",
+        "调度器已启动: 每日决策 %s, 自动选股 %s, 盘中监控每 %d 分钟",
         p["decision_time"],
         p["select_time"] if p["select_enabled"] else "关闭",
         p["monitor_minutes"],
@@ -143,8 +128,17 @@ def start():
 
 def reload_jobs() -> None:
     """设置页改调度参数后热重载 job（不重启进程）。"""
+    global _scheduler
+    from .runtime_settings import get_setting
+
+    if not bool(get_setting("schedule.enabled")):
+        if _scheduler is not None and _scheduler.running:
+            _scheduler.shutdown(wait=False)
+        _scheduler = None
+        logger.info("调度器已关闭")
+        return
     if _scheduler is None or not _scheduler.running:
-        logger.info("调度器未运行,跳过 reload_jobs")
+        start()
         return
     _register_jobs(_scheduler)
     p = _sched_params()
@@ -171,7 +165,6 @@ def schedule_times() -> str:
     if p["select_enabled"]:
         parts.append(f"选股 {p['select_time']}")
     parts.append(f"监控每{p['monitor_minutes']}分")
-    parts.append("规则周一14:50")
     return " · ".join(parts)
 
 

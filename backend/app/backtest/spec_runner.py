@@ -81,8 +81,6 @@ def _run_factor_spec(
             if key not in seen_months:
                 seen_months.add(key)
                 rebal_set.add(d)
-    rebal_set.add(closes.index[0])
-
     cash = float(initial_cash)
     holdings: dict[str, float] = {}
     cost: dict[str, float] = {}  # 成本价
@@ -113,15 +111,21 @@ def _run_factor_spec(
             ma[c] = closes[c].rolling(ma_win, min_periods=max(2, ma_win // 2)).mean()
 
     day_i = 0
+    previous_dt = None
+    previous_row = None
     for dt, row in closes.iterrows():
-        # 事件：止损/止盈/均线/持有天数
+        # 事件信号基于上一交易日收盘，在当前交易日价格执行。
         for c in list(holdings.keys()):
-            px = row.get(c)
-            if px is None or not np.isfinite(px) or float(px) <= 0:
+            signal_px = previous_row.get(c) if previous_row is not None else None
+            execution_px = row.get(c)
+            if (signal_px is None or execution_px is None
+                    or not np.isfinite(signal_px) or not np.isfinite(execution_px)
+                    or float(execution_px) <= 0):
                 continue
-            px = float(px)
-            basis = cost.get(c) or px
-            pnl = px / basis - 1 if basis else 0
+            signal_px = float(signal_px)
+            execution_px = float(execution_px)
+            basis = cost.get(c) or signal_px
+            pnl = signal_px / basis - 1 if basis else 0
             exit_pos = False
             if stop is not None and pnl <= stop:
                 exit_pos = True
@@ -129,27 +133,26 @@ def _run_factor_spec(
                 exit_pos = True
             if hold_max is not None and c in entry_i and (day_i - entry_i[c]) >= hold_max:
                 exit_pos = True
-            if ma_win and c in ma:
-                mv = ma[c].get(dt) if hasattr(ma[c], "get") else ma[c].loc[dt] if dt in ma[c].index else None
+            if ma_win and c in ma and previous_dt is not None:
+                mv = (
+                    ma[c].get(previous_dt)
+                    if hasattr(ma[c], "get")
+                    else ma[c].loc[previous_dt] if previous_dt in ma[c].index else None
+                )
                 try:
-                    if mv is not None and np.isfinite(mv) and px < float(mv):
+                    if mv is not None and np.isfinite(mv) and signal_px < float(mv):
                         exit_pos = True
                 except Exception:  # noqa: BLE001
                     pass
             if exit_pos:
-                cash += holdings[c] * px * (1 - fee_rt * 0.25)
+                cash += holdings[c] * execution_px * (1 - fee_rt * 0.25)
                 del holdings[c]
                 cost.pop(c, None)
                 entry_i.pop(c, None)
                 closed_trades += 1
 
-        if dt in rebal_set or (not holdings and dt == closes.index[0]):
-            target_codes = score_by_date.get(dt) or []
-            # 找最近截面
-            if not target_codes:
-                prev = [d for d in score_by_date if d <= dt]
-                if prev:
-                    target_codes = score_by_date[max(prev)]
+        if previous_dt is not None and dt in rebal_set:
+            target_codes = score_by_date.get(previous_dt) or []
 
             port_val = cash
             for c, q in holdings.items():
@@ -183,6 +186,7 @@ def _run_factor_spec(
                 cash = port_val
             holdings_log.append({
                 "date": str(dt)[:10],
+                "signal_date": str(previous_dt)[:10],
                 "codes": buyable,
                 "n": len(buyable),
             })
@@ -194,6 +198,8 @@ def _run_factor_spec(
             if px is not None and np.isfinite(px):
                 val += q * float(px)
         equity_vals.append(val)
+        previous_dt = dt
+        previous_row = row
 
     eq = pd.Series(equity_vals, index=closes.index)
     bench = run_equal_weight_buyhold(panel, initial_cash=initial_cash)
@@ -279,25 +285,30 @@ def _run_equal_with_events(
     cash = 0.0
     closed = 0
     equity_vals = []
+    previous_dt = None
+    previous_row = None
     for dt, row in closes.iterrows():
         for c in list(holdings.keys()):
-            px = row.get(c)
-            if px is None or not np.isfinite(px):
+            signal_px = previous_row.get(c) if previous_row is not None else None
+            execution_px = row.get(c)
+            if (signal_px is None or execution_px is None
+                    or not np.isfinite(signal_px) or not np.isfinite(execution_px)):
                 continue
-            px = float(px)
-            basis = cost.get(c) or px
-            pnl = px / basis - 1
+            signal_px = float(signal_px)
+            execution_px = float(execution_px)
+            basis = cost.get(c) or signal_px
+            pnl = signal_px / basis - 1
             exit_pos = False
             if stop is not None and pnl <= stop:
                 exit_pos = True
             if take is not None and pnl >= take:
                 exit_pos = True
-            if ma_win and c in ma and dt in ma[c].index:
-                mv = ma[c].loc[dt]
-                if np.isfinite(mv) and px < float(mv):
+            if ma_win and c in ma and previous_dt in ma[c].index:
+                mv = ma[c].loc[previous_dt]
+                if np.isfinite(mv) and signal_px < float(mv):
                     exit_pos = True
             if exit_pos:
-                cash += holdings[c] * px * (1 - fee_rt * 0.25)
+                cash += holdings[c] * execution_px * (1 - fee_rt * 0.25)
                 del holdings[c]
                 cost.pop(c, None)
                 closed += 1
@@ -307,6 +318,8 @@ def _run_equal_with_events(
             if px is not None and np.isfinite(px):
                 val += q * float(px)
         equity_vals.append(val)
+        previous_dt = dt
+        previous_row = row
 
     eq = pd.Series(equity_vals, index=closes.index)
     metrics = mark_sample_ok(

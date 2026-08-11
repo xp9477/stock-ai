@@ -5,8 +5,14 @@ const client = axios.create({ baseURL: '/api', timeout: 120000 })
 client.interceptors.response.use(
   (resp) => resp.data,
   (err) => {
-    const msg = err.response?.data?.detail || err.message
-    return Promise.reject(new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)))
+    const detail = err.response?.data?.detail
+    const message = typeof detail === 'string'
+      ? detail
+      : detail?.reason || (detail ? JSON.stringify(detail) : err.message)
+    const apiError = new Error(message)
+    apiError.status = detail?.status
+    apiError.httpStatus = err.response?.status
+    return Promise.reject(apiError)
   },
 )
 
@@ -36,12 +42,18 @@ export default {
   purgeLogs: () => client.post('/logs/purge'),
   getOrders: (modelPk) => client.get('/orders', { params: modelPk != null ? { model_pk: modelPk } : {} }),
   getMonitorEvents: () => client.get('/monitor-events'),
-  resetAccount: () => client.post('/account/reset'),
+  getTradePlans: (params) => client.get('/trade-plans', { params: params || {} }),
+  getTradePlan: (id) => client.get(`/trade-plans/${id}`),
+  refreshTradePlanInformation: (id, data) =>
+    client.post(`/trade-plans/${id}/refresh-information`, data),
+  validateTradePlanPrice: (id, data) =>
+    client.post(`/trade-plans/${id}/validate-price`, data),
+  approveTradePlan: (id, data) => client.post(`/trade-plans/${id}/approve`, data),
+  rejectTradePlan: (id, data) => client.post(`/trade-plans/${id}/reject`, data),
+  getExecutionIntents: (params) => client.get('/execution-intents', { params: params || {} }),
   // 规则 / 因子 / 账本
   rulesStatus: () => client.get('/rules/status'),
   strategiesBoard: () => client.get('/strategies/board'),
-  rulesRebalance: () => client.post('/rules/rebalance'),
-  rulesRebalanceOne: (modelId) => client.post(`/rules/rebalance/${modelId}`),
   factorsSnapshot: () => client.get('/factors/snapshot'),
   ledgerStats: () => client.get('/ledger/stats'),
   runBacktest: (data) => client.post('/backtest/run', data || { years: 3 }),

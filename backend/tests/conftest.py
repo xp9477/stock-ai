@@ -4,10 +4,10 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 
-from app.database import Base
+from app.database import Base, enable_sqlite_foreign_keys
 from app import models  # noqa: F401
 from app.models import Model
 
@@ -16,6 +16,7 @@ from app.models import Model
 def db():
     engine = create_engine("sqlite:///:memory:",
                            connect_args={"check_same_thread": False})
+    event.listen(engine, "connect", enable_sqlite_foreign_keys)
     Base.metadata.create_all(engine)
     Session = sessionmaker(bind=engine, expire_on_commit=False)
     session = Session()
