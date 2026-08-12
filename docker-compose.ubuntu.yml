@@ -1,0 +1,13 @@
+services:
+  stock-ai:
+    # The published :latest image is built only from main.  Build this checked
+    # out branch locally so Ubuntu runs the audited code being deployed.
+    build:
+      context: .
+    image: stock-ai:local
+    environment:
+      BROKER_REFERENCE_REQUIRED: "true"
+      BROKER_SNAPSHOT_INITIAL_EQUITY: "200000"
+    volumes:
+      - /var/lib/stock-ai/data:/data
+      - /var/lib/stock-ai/broker:/data/broker:ro

@@ -29,6 +29,17 @@ class Settings(BaseSettings):
 
     db_path: str = "stock_ai.db"
 
+    # External broker SDKs run in an isolated read-only bridge.  The web app
+    # consumes only its normalized, atomically-written simulation snapshot.
+    broker_snapshot_path: str = "/data/broker/emt_snapshot.json"
+    broker_snapshot_max_age_seconds: int = 60
+    # Accepted personal-capital boundary. A broker query can be technically
+    # complete yet still be the vendor's huge seeded demo portfolio; that
+    # state must never become decision reference data.
+    broker_snapshot_max_total_asset: float = 400_000.0
+    broker_reference_required: bool = False
+    broker_snapshot_initial_equity: float = 200_000.0
+
     # 行情/财务主源：同花顺扶摇（唯一；不够再用 Tushare，不做免费源降级）
     fuyao_api_key: str = ""
     # 可选备份，默认不用

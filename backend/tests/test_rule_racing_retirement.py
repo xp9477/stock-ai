@@ -101,6 +101,22 @@ def test_seed_does_not_promote_or_fund_a_single_disabled_ensemble(db):
     assert db.query(Account).filter(Account.model_pk == historical.id).count() == 0
 
 
+def test_disabling_one_ambiguous_legacy_ensemble_promotes_the_remaining_one(db):
+    selected = Model(name="remaining legacy ensemble", type="ensemble", enabled=True)
+    historical = Model(name="retired legacy ensemble", type="ensemble", enabled=True)
+    db.add_all([selected, historical])
+    db.commit()
+
+    assert update_model(historical.id, ModelUpdate(enabled=False), db) == {"ok": True}
+
+    db.refresh(selected)
+    db.refresh(historical)
+    assert selected.enabled is True
+    assert selected.is_official_strategy is True
+    assert historical.enabled is False
+    assert historical.is_official_strategy is False
+
+
 @pytest.mark.parametrize(
     ("call", "args"),
     [

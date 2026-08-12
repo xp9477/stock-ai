@@ -1,0 +1,24 @@
+[Unit]
+Description=Stock AI EMT simulation read-only bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stock-ai
+Group=stock-ai
+WorkingDirectory=/opt/stock-ai/backend
+EnvironmentFile=/etc/stock-ai/emt-bridge.env
+Environment=PYTHONUNBUFFERED=1
+Environment=LD_LIBRARY_PATH=/opt/emt-api/python/lib/linux
+ExecStart=/usr/bin/python3 -m emt_bridge.main
+Restart=on-failure
+RestartSec=5
+UMask=0077
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/stock-ai/broker
+
+[Install]
+WantedBy=multi-user.target

@@ -328,6 +328,52 @@ def approve_plan(
     if quote_time is None:
         raise PlanBlocked("blocked_quote", "成交报价缺少时间戳")
 
+    from .broker_snapshot import (
+        BrokerSnapshotError,
+        reconcile_configured_broker_portfolio,
+    )
+    try:
+        broker_reference = reconcile_configured_broker_portfolio(
+            db, [plan.model_pk],
+        )
+    except BrokerSnapshotError as exc:
+        reason = f"券商组合参考不可用: {exc}"
+        record_gate(
+            db,
+            plan,
+            gate_type="broker_reconciliation",
+            outcome="blocked_broker",
+            reason_code="broker_reference_unavailable",
+            reason=reason,
+            checked_at=approved_at,
+            metrics={"reference_ready": False},
+            input_hash=hashlib.sha256(reason.encode("utf-8")).hexdigest(),
+            idempotency_key=f"{idempotency_key}:broker",
+            next_status="blocked_capital",
+            commit=False,
+        )
+        if commit:
+            db.commit()
+        raise PlanBlocked("blocked_capital", reason) from exc
+    if broker_reference is not None:
+        broker_json = json.dumps(
+            broker_reference, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), default=str,
+        )
+        record_gate(
+            db,
+            plan,
+            gate_type="broker_reconciliation",
+            outcome=PASS,
+            reason_code="broker_reference_ready",
+            reason="Fresh EMT simulation portfolio projected before authorization",
+            checked_at=approved_at,
+            metrics=broker_reference,
+            input_hash=hashlib.sha256(broker_json.encode("utf-8")).hexdigest(),
+            idempotency_key=f"{idempotency_key}:broker",
+            commit=False,
+        )
+
     authorization = portfolio.authorize_execution_intent(
         db,
         model_pk=plan.model_pk,

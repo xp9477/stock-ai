@@ -140,6 +140,20 @@ def run_monitor() -> int:
     try:
         official_model_pks = broker.enabled_official_strategy_ids(db)
         broker.settle_t1(db, model_pks=official_model_pks)
+        from ..trading.broker_snapshot import (
+            BrokerSnapshotError,
+            reconcile_configured_broker_portfolio,
+        )
+        try:
+            broker_reference = reconcile_configured_broker_portfolio(
+                db, official_model_pks,
+            )
+            if broker_reference is not None:
+                db.commit()
+        except BrokerSnapshotError as exc:
+            db.rollback()
+            logger.warning("券商参考状态不可用，跳过本轮监控: %s", exc)
+            return 0
         for pos in db.query(Position).all():
             model = db.get(Model, pos.model_pk)
             if model is None or not model.enabled:

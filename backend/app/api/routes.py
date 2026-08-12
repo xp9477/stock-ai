@@ -150,6 +150,10 @@ def update_model(model_pk: int, body: ModelUpdate, db: Session = Depends(get_db)
                 raise HTTPException(409, "已有启用的官方 ensemble 策略账户")
         model.enabled = body.enabled
     if model.type == "ensemble":
+        # SessionLocal disables autoflush. Without this explicit flush, a
+        # legacy migration that disables one of two active ensembles still
+        # counts both rows and leaves the remaining strategy uncapitalized.
+        db.flush()
         official_count = db.query(Model).filter(
             Model.is_official_strategy.is_(True)).count()
         enabled_ensembles = db.query(Model).filter(
@@ -641,7 +645,9 @@ def list_monitor_events(db: Session = Depends(get_db)):
 def status(db: Session = Depends(get_db)):
     from .. import scheduler
     from ..agents import selector as selector_mod
+    from ..config import settings
     from ..runtime_settings import get_setting
+    from ..trading.broker_snapshot import broker_snapshot_status
 
     progress = engine.get_progress()
     pool_size = db.query(Watchlist).count()
@@ -655,6 +661,11 @@ def status(db: Session = Depends(get_db)):
     ).count()
     authorized_capital = float(get_setting("capital.authorized_capital"))
     max_stock_exposure = float(get_setting("capital.max_stock_exposure"))
+    broker_sync = broker_snapshot_status(
+        settings.broker_snapshot_path,
+        max_age_seconds=settings.broker_snapshot_max_age_seconds,
+        max_total_asset=settings.broker_snapshot_max_total_asset,
+    )
     live_funds_blockers = [
         "official_disclosure_provider_not_configured",
         "broker_execution_not_configured",
@@ -679,6 +690,7 @@ def status(db: Session = Depends(get_db)):
         "pool_size": pool_size,
         "factor_top_n": get_setting("factor.top_n"),
         "execution_mode": "manual_ticket_only",
+        "broker_sync": broker_sync,
         "official_disclosure_provider": False,
         "live_funds_ready": False,
         "live_funds_blockers": live_funds_blockers,

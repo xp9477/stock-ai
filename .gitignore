@@ -5,6 +5,8 @@ backend/.env
 backend/*.db
 .env
 /data/
+deploy/*.env
+!deploy/*.env.example
 node_modules/
 frontend/dist/
 .pytest_cache/

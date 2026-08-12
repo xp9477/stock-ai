@@ -483,6 +483,7 @@ def _create_ensemble_candidate(
     frozen_snapshot: str,
     snapshot_hash: str,
     judgments_by_model: dict[int, dict[str, Any]],
+    broker_reference: dict[str, Any] | None = None,
 ) -> tuple[Decision, Any | None]:
     """Use two distinct member models for final trading and risk review."""
     from ..backtest.shadow import verify_run_market_artifact
@@ -561,6 +562,7 @@ def _create_ensemble_candidate(
         f"【冻结事实】\n{frozen_snapshot}\n\n"
         f"【独立判断】\n{json.dumps(compact_judgments, ensure_ascii=False, sort_keys=True)}\n\n"
         f"【授权账户状态】\n{_position_context(db, ensemble.id, code)}\n\n"
+        f"【券商事实来源】\n{json.dumps(broker_reference or {'required': False}, ensure_ascii=False, sort_keys=True)}\n\n"
         f"【系统允许的最晚有效期】\n{system_deadline.isoformat()}"
     )
     trader_prompt = str(get_setting("prompt.final_trader"))
@@ -654,6 +656,7 @@ def _create_ensemble_candidate(
         "final_model_id": final_model.model_id,
         "risk_model_id": risk_model.model_id,
         "independent_model_ids": [row["model_id"] for row in valid],
+        "broker_reference": broker_reference or {"required": False},
         "prompt_hashes": {
             key: hashlib.sha256(str(get_setting(key)).encode("utf-8")).hexdigest()
             for key in (
@@ -718,6 +721,12 @@ def run_pipeline(trigger: str = "manual") -> int | None:
     try:
         official_model_pks = broker.enabled_official_strategy_ids(db)
         broker.settle_t1(db, model_pks=official_model_pks)
+        from ..trading.broker_snapshot import reconcile_configured_broker_portfolio
+        broker_reference = reconcile_configured_broker_portfolio(
+            db, official_model_pks,
+        )
+        if broker_reference is not None:
+            db.commit()
         _check_cancel()
 
         # Watchlist 只是观察列表。新标的必须先通过确定性的可交易/板块/
@@ -884,6 +893,7 @@ def run_pipeline(trigger: str = "manual") -> int | None:
                         frozen_snapshot=frozen[code][0],
                         snapshot_hash=frozen[code][1],
                         judgments_by_model=judgments[code],
+                        broker_reference=broker_reference,
                     )
                 except PipelineCancelled:
                     raise
@@ -921,6 +931,7 @@ def run_pipeline(trigger: str = "manual") -> int | None:
             "signal_buy": plan_counts.get("buy", 0),
             "signal_sell": plan_counts.get("sell", 0),
             "execution_mode": "human_confirmation",
+            "broker_reference": broker_reference or {"required": False},
         }, ensure_ascii=False)
         run.status = "done"
         _set_progress(phase="done", message="完成", agent="")
