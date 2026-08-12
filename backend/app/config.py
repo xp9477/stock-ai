@@ -12,12 +12,13 @@ class Settings(BaseSettings):
     initial_cash: float = 100_000.0
 
     schedule_enabled: bool = True
-    daily_decision_time: str = "16:00"
+    morning_decision_time: str = "09:35"
+    daily_decision_time: str = "14:10"
     monitor_interval_minutes: int = 5
 
     # 自动选股 / 候选池（确定性资格筛选后上限 30）
     stock_select_enabled: bool = True
-    stock_select_time: str = "15:30"
+    stock_select_time: str = "08:50"
     pool_max: int = 30
 
     # 盘中只告警/复审，任何卖出都必须人工确认。

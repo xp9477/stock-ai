@@ -560,10 +560,17 @@ _DEFS: list[SettingDef] = [
         requires_scheduler_reload=True,
     ),
     SettingDef(
+        key="schedule.morning_decision_time",
+        group="schedule", type="time", default="09:35",
+        label="上午 AI 决策时间",
+        description="集合竞价结束后，用最新价格与隔夜信息生成上午候选计划；绝不直接成交",
+        requires_scheduler_reload=True,
+    ),
+    SettingDef(
         key="schedule.daily_decision_time",
-        group="schedule", type="time", default="16:00",
-        label="每日 AI 决策时间",
-        description="收盘数据确认后生成候选计划；绝不直接成交",
+        group="schedule", type="time", default="14:10",
+        label="下午 AI 决策时间",
+        description="午后用变化后的行情与信息重新生成候选计划；绝不直接成交",
         requires_scheduler_reload=True,
     ),
     SettingDef(
@@ -574,9 +581,9 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="schedule.stock_select_time",
-        group="schedule", type="time", default="15:30",
+        group="schedule", type="time", default="08:50",
         label="自动选股时间",
-        description="交易日 cron，格式 HH:MM",
+        description="开盘前准备候选股与当日数据，交易日 cron，格式 HH:MM",
         requires_scheduler_reload=True,
     ),
     SettingDef(

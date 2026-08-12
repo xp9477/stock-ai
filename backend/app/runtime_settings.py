@@ -42,6 +42,7 @@ def _env_fallback(key: str) -> Any | None:
         "trading.stamp_tax_rate": settings.stamp_tax_rate,
         "trading.transfer_fee_rate": settings.transfer_fee_rate,
         "schedule.enabled": settings.schedule_enabled,
+        "schedule.morning_decision_time": settings.morning_decision_time,
         "schedule.daily_decision_time": settings.daily_decision_time,
         "schedule.stock_select_enabled": settings.stock_select_enabled,
         "schedule.stock_select_time": settings.stock_select_time,
