@@ -23,6 +23,8 @@ def load_stock_factors(
     start: date | None = None,
     end: date | None = None,
     use_tushare: bool = False,  # 保留参数兼容旧调用，忽略
+    roe_years: int = 4,
+    fetch_latest_valuation: bool = True,
 ) -> pd.DataFrame:
     """单票因子时间序列（含 code 列）。主源：扶摇。"""
     del use_tushare
@@ -39,23 +41,24 @@ def load_stock_factors(
 
     # 估值：扶摇仅最新快照 → 只挂在序列最后一日，历史 EP/BP 保持 NaN（防把今日 PE 填进过去）
     basic = pd.DataFrame()
-    try:
-        snap = fuyao.valuation_snapshot([code])
-        if not snap.empty:
-            last_date = bars["date"].iloc[-1]
-            pe = snap.iloc[0].get("pe_ttm")
-            pb = snap.iloc[0].get("pb")
-            basic = pd.DataFrame([{
-                "date": last_date,
-                "pe_ttm": pe if pe is not None else np.nan,
-                "pb": pb if pb is not None else np.nan,
-            }])
-    except Exception as err:  # noqa: BLE001
-        logger.warning("valuation %s: %s", code, err)
+    if fetch_latest_valuation:
+        try:
+            snap = fuyao.valuation_snapshot([code])
+            if not snap.empty:
+                last_date = bars["date"].iloc[-1]
+                pe = snap.iloc[0].get("pe_ttm")
+                pb = snap.iloc[0].get("pb")
+                basic = pd.DataFrame([{
+                    "date": last_date,
+                    "pe_ttm": pe if pe is not None else np.nan,
+                    "pb": pb if pb is not None else np.nan,
+                }])
+        except Exception as err:  # noqa: BLE001
+            logger.warning("valuation %s: %s", code, err)
 
     fina = pd.DataFrame()
     try:
-        fina = fuyao.roe_history(code, years=4)
+        fina = fuyao.roe_history(code, years=roe_years)
     except Exception as err:  # noqa: BLE001
         logger.warning("roe_history %s: %s", code, err)
 
@@ -69,13 +72,17 @@ def build_factor_panel(
     start: date | None = None,
     end: date | None = None,
     use_tushare: bool = False,
+    roe_years: int = 4,
+    fetch_latest_valuation: bool = True,
 ) -> pd.DataFrame:
     """长表：date, code, factors..."""
     del use_tushare
     frames = []
     for code in codes:
         try:
-            f = load_stock_factors(code, start=start, end=end)
+            f = load_stock_factors(
+                code, start=start, end=end, roe_years=roe_years,
+                fetch_latest_valuation=fetch_latest_valuation)
             if not f.empty:
                 frames.append(f)
         except Exception as err:  # noqa: BLE001
@@ -94,7 +101,14 @@ def latest_factor_snapshot(
     del use_tushare
     asof = asof or date.today()
     start = asof - timedelta(days=120)
-    panel = build_factor_panel(codes, start=start, end=asof)
+    # Live ranking only needs the latest two reported ROE observations.  One
+    # year is sufficient and avoids fetching four years of quarterly reports
+    # for every twice-daily decision run.  Historical panel builders retain the
+    # four-year default.
+    panel = build_factor_panel(
+        codes, start=start, end=asof, roe_years=1,
+        fetch_latest_valuation=False,
+    )
     if panel.empty:
         return pd.DataFrame()
     panel["date"] = panel["date"].astype(str)

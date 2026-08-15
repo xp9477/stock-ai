@@ -217,3 +217,32 @@ def test_run_monitor_skips_rule_positions(db):
         assert broker.get_position(db, rule.id, "000001") is not None
     finally:
         db.close = real_close  # type: ignore[method-assign]
+
+
+def test_get_portfolio_hides_zero_qty_vendor_placeholders(db):
+    from app.api.routes import get_portfolio
+
+    official = Model(
+        name="官方策略", type="ensemble", enabled=True, is_official_strategy=True,
+    )
+    db.add(official)
+    db.flush()
+    broker.get_account(db, official.id)
+    db.add_all([
+        Position(
+            model_pk=official.id, code="000001", name="not_ready",
+            total_qty=0, available_qty=0, avg_cost=0.0,
+        ),
+        Position(
+            model_pk=official.id, code="600519", name="贵州茅台",
+            total_qty=100, available_qty=100, avg_cost=10.0,
+        ),
+    ])
+    db.commit()
+
+    quote = {"price": 11.0, "pct_change": 1.0}
+    with patch("app.api.routes.market.get_quote", return_value=quote):
+        result = get_portfolio(official.id, db)
+
+    assert [row["code"] for row in result["positions"]] == ["600519"]
+    assert result["positions"][0]["name"] == "贵州茅台"

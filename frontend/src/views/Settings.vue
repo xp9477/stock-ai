@@ -230,14 +230,15 @@
                     :id="inputId(item.key)"
                     v-model="draft[item.key]"
                     :disabled="!item.editable"
-                    :step="0.01"
-                    :precision="2"
+                    :step="numberStep(item)"
+                    :precision="numberPrecision(item)"
                     :min="item.min_value ?? undefined"
                     :max="item.max_value ?? undefined"
                     controls-position="right"
                     :aria-label="item.label"
+                    class="num-input"
                   />
-                  <span class="pct-hint mono">{{ formatPct(draft[item.key]) }}</span>
+                  <span class="pct-hint mono">{{ formatPct(draft[item.key], item) }}</span>
                 </div>
 
                 <!-- number -->
@@ -246,12 +247,13 @@
                   :id="inputId(item.key)"
                   v-model="draft[item.key]"
                   :disabled="!item.editable"
-                  :step="item.type === 'int' ? 1 : 0.1"
-                  :precision="item.type === 'int' ? 0 : 2"
+                  :step="numberStep(item)"
+                  :precision="numberPrecision(item)"
                   :min="item.min_value ?? undefined"
                   :max="item.max_value ?? undefined"
                   controls-position="right"
                   :aria-label="item.label"
+                  class="num-input"
                 />
 
                 <div class="row-actions">
@@ -274,7 +276,7 @@
             <div class="ds-health-head">
               <div>
                 <div class="ds-health-title">数据源健康</div>
-                <p class="block-help">角色固定：扶摇主源 · 新浪兜底 · 腾讯实时 · Tushare 备 · RSS 新闻。下方可探测连通性。</p>
+                <p class="block-help">角色固定：扶摇个股主源 · 新浪指数/日历兜底 · Tushare 备 · RSS 新闻。下方可探测连通性。</p>
               </div>
               <el-button size="small" type="primary" plain :loading="probing" @click="probeAll">
                 立即探测
@@ -311,6 +313,22 @@
               失败策略：<code>fallback</code> 降级下一源 · <code>hard</code> 立即失败 · <code>skip</code> 跳过。
               启停/超时已接入行情·指数·选股·新闻路径。源 URL 在
               <code>backend/app/data/news_rss.py</code>。
+            </p>
+          </div>
+
+          <!-- Bark 通知测试 -->
+          <div v-if="activeGroup === 'notifications'" class="ds-health panel-inset">
+            <div class="ds-health-head">
+              <div>
+                <div class="ds-health-title">通知通道测试</div>
+                <p class="block-help">先保存 Bark Server 与 Device Key，再发送真实测试通知。测试不要求先打开“启用”开关。</p>
+              </div>
+              <el-button size="small" type="primary" plain :loading="testingBark" @click="testBark">
+                发送测试通知
+              </el-button>
+            </div>
+            <p class="foot-note">
+              系统只提醒候选计划、持仓复审和运行异常；普通观望不会推送。推送失败只写日志，不会改变交易决策。
             </p>
           </div>
 
@@ -369,6 +387,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api/index.js'
+import { formatNumber, numberPrecision, numberStep } from '../utils/numberInput.js'
 
 const route = useRoute()
 const router = useRouter()
@@ -383,6 +402,7 @@ const activeGroup = ref('secrets')
 const draft = reactive({})
 const baseline = reactive({})
 const probing = ref(false)
+const testingBark = ref(false)
 const probeResults = ref([])
 const rssFeeds = ref([])
 const logItems = ref([])
@@ -400,7 +420,8 @@ const itemMap = computed(() => Object.fromEntries(items.value.map((i) => [i.key,
 /** 客户端保底分组顺序：后端未热更时也能看到「数据源」等入口 */
 const FALLBACK_GROUPS = [
   { id: 'secrets', label: '密钥', description: 'LLM / 数据源 API' },
-  { id: 'datasources', label: '数据源', description: '扶摇/新浪/腾讯/Tushare/RSS' },
+  { id: 'datasources', label: '数据源', description: '扶摇/新浪/Tushare/RSS' },
+  { id: 'notifications', label: '通知', description: 'Bark 人工介入提醒' },
   { id: 'account', label: '账户', description: '初始资金' },
   { id: 'trading', label: '撮合', description: '佣金印花税' },
   { id: 'selector', label: '选股', description: '' },
@@ -502,9 +523,10 @@ function same(a, b) {
   return a === b
 }
 
-function formatPct(v) {
+function formatPct(v, item) {
   if (v == null || Number.isNaN(Number(v))) return '—'
-  return `${(Number(v) * 100).toFixed(1)}%`
+  const digits = Math.max(numberPrecision(item || { type: 'percent' }) - 2, 1)
+  return `${(Number(v) * 100).toFixed(digits)}%`
 }
 
 function formatPctNum(v) {
@@ -514,8 +536,11 @@ function formatPctNum(v) {
 }
 
 function formatDefault(item) {
-  if (item.type === 'percent') return formatPct(item.default)
+  if (item.type === 'percent') return formatPct(item.default, item)
   if (item.type === 'bool') return item.default ? '开' : '关'
+  if (item.type === 'float' || item.type === 'int') {
+    return formatNumber(item.default, numberPrecision(item))
+  }
   if (item.type === 'text') {
     const s = String(item.default || '')
     return s.length > 28 ? `${s.slice(0, 28)}…` : s
@@ -599,6 +624,22 @@ async function probeAll() {
     ElMessage.error(err.message)
   } finally {
     probing.value = false
+  }
+}
+
+async function testBark() {
+  if (dirtyCount.value) {
+    ElMessage.warning('请先保存通知配置，再发送测试')
+    return
+  }
+  testingBark.value = true
+  try {
+    const data = await api.testBark()
+    ElMessage.success(data.detail || 'Bark 测试通知已发送')
+  } catch (err) {
+    ElMessage.error(err.message)
+  } finally {
+    testingBark.value = false
   }
 }
 

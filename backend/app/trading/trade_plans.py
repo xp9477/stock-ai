@@ -229,6 +229,7 @@ def evaluate_price_gate(
     dynamic_gap_threshold: float | None,
     expires_at: datetime | None,
     valid_from_at: datetime | None = None,
+    enforce_valid_from: bool = True,
     now: datetime | None = None,
     quote_asof: datetime | None = None,
     max_quote_age_seconds: float | None = None,
@@ -270,7 +271,7 @@ def evaluate_price_gate(
             max_buy_price=max_buy_price, signal_deviation=None,
             opening_gap=None, dynamic_threshold=dynamic_gap_threshold,
             quote_asof=quote_asof)
-    if valid_from_at is not None:
+    if enforce_valid_from and valid_from_at is not None:
         start_delta = _datetime_delta_seconds(checked_at, valid_from_at)
         if start_delta is None:
             return _result(

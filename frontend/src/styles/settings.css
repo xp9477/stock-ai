@@ -258,6 +258,10 @@
   max-width: 320px;
 }
 
+.num-input {
+  width: 220px;
+}
+
 .pct-field {
   display: flex;
   flex-wrap: wrap;
@@ -572,7 +576,9 @@
   }
 
   .ctrl-input,
-  .secret-field {
+  .secret-field,
+  .num-input {
+    width: 100%;
     max-width: none;
   }
 

@@ -1,14 +1,14 @@
 """Application service for conditional trade plans.
 
-The service deliberately stops at a human-approved ``ExecutionIntent``.  It
-does not call the broker: analysis, pre-open review, price validation and
-approval are separate auditable facts, while a later explicit fill action owns
-the actual simulated/real execution.
+The service stops at an ``ExecutionIntent`` ticket.  It does not call the
+broker: analysis, information/price/capital gates and ticket issuance are
+separate auditable facts.  Manual confirmation is optional.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import asdict
 from datetime import date, datetime, timezone
 from typing import Any
@@ -28,6 +28,8 @@ from .trade_plans import (
     historical_gap_threshold,
     record_gate,
 )
+
+logger = logging.getLogger(__name__)
 
 
 UTC = timezone.utc
@@ -165,7 +167,11 @@ def review_preopen_information(
         reason_code = "new_direct_news"
         reason = "分析截止后出现新的个股相关新闻，旧计划需要重新分析"
         next_status = outcome
-    elif not snapshot.get("official_coverage") and not human_official_confirmed:
+    elif (
+        not snapshot.get("official_coverage")
+        and bool(get_setting("execution.require_human_information_check"))
+        and not human_official_confirmed
+    ):
         outcome = "blocked_information"
         reason_code = "official_disclosure_unverified"
         reason = "尚未接入可靠正式披露源，必须人工核对公告后才能批准"
@@ -212,6 +218,7 @@ def validate_plan_price(
     daily_bars: Any | None = None,
     now: datetime | None = None,
     require_session: bool = True,
+    enforce_valid_from: bool = True,
     idempotency_key: str | None = None,
     commit: bool = False,
 ) -> tuple[GateCheck, PriceGateResult, dict[str, Any] | None]:
@@ -243,6 +250,7 @@ def validate_plan_price(
         dynamic_gap_threshold=threshold,
         expires_at=_as_utc(plan.expires_at),
         valid_from_at=_as_utc(plan.valid_from_at),
+        enforce_valid_from=enforce_valid_from,
         now=checked_at,
         quote_asof=quote_asof,
         max_quote_age_seconds=max_age,
@@ -284,9 +292,11 @@ def approve_plan(
     daily_bars: Any | None = None,
     now: datetime | None = None,
     require_session: bool = True,
+    enforce_valid_from: bool = True,
+    approved_by: str = "local_user",
     commit: bool = True,
 ) -> ExecutionIntent:
-    """Run all gates again and create one human-approved ticket.
+    """Run machine gates and create one execution ticket.
 
     This function never fills the ticket and never calls ``broker``.
     """
@@ -297,17 +307,21 @@ def approve_plan(
             raise IdempotencyConflict(
                 "approval idempotency key belongs to another trade plan")
         return existing
-    if not confirmed:
+    require_manual = bool(get_setting("execution.require_manual_confirmation"))
+    require_official = bool(get_setting("execution.require_human_information_check"))
+    if require_manual and not confirmed:
         raise PlanBlocked("awaiting_approval", "必须明确确认该条件计划")
     if plan.status in TERMINAL_STATUSES:
         raise PlanBlocked(plan.status, plan.status_reason or "计划已经失效")
     if plan.lock_version != expected_lock_version:
         raise PlanBlocked("version_conflict", "计划已被更新，请刷新后重新确认")
-    if not human_official_confirmed:
+    if require_manual and require_official and not human_official_confirmed:
         raise PlanBlocked("blocked_information", "必须确认已经核对正式公告与重大新闻")
 
     info = review_preopen_information(
-        db, plan, human_official_confirmed=True, force_refresh=True,
+        db, plan,
+        human_official_confirmed=human_official_confirmed or not require_official,
+        force_refresh=True,
         idempotency_key=f"{idempotency_key}:information", commit=False)
     if info.outcome != PASS:
         if commit:
@@ -317,6 +331,7 @@ def approve_plan(
     _, evaluation, refreshed_quote = validate_plan_price(
         db, plan, quote=quote, daily_bars=daily_bars, now=now,
         require_session=require_session,
+        enforce_valid_from=enforce_valid_from,
         idempotency_key=f"{idempotency_key}:price", commit=False)
     if evaluation.outcome != PASS or refreshed_quote is None:
         if commit:
@@ -423,7 +438,7 @@ def approve_plan(
         plan_id=plan.id,
         status="ticket_ready",
         idempotency_key=idempotency_key,
-        approved_by="local_user",
+        approved_by=approved_by,
         approved_at=approved_at,
         approval_quote_price=float(refreshed_quote["price"]),
         approval_quote_asof=quote_time,
@@ -443,14 +458,239 @@ def approve_plan(
     )
     db.add(intent)
     plan.status = "ticket_ready"
-    plan.status_reason_code = "human_approved"
-    plan.status_reason = "全部门禁通过，已生成人工下单票据；尚未成交"
+    auto_issued = approved_by == "system"
+    plan.status_reason_code = "auto_approved" if auto_issued else "human_approved"
+    plan.status_reason = (
+        "机器门禁通过，已自动生成待执行票据；尚未向券商下单"
+        if auto_issued
+        else "全部门禁通过，已生成待执行票据；尚未成交"
+    )
     plan.approved_at = approved_at
     plan.lock_version += 1
     plan.updated_at = utc_now()
     db.flush()
     if commit:
         db.commit()
+    return intent
+
+
+def maybe_auto_issue_ticket(
+    db: Session,
+    plan: TradePlan,
+    *,
+    now: datetime | None = None,
+) -> ExecutionIntent | None:
+    """Mint a ticket when manual confirmation is off. Never places an order."""
+    if bool(get_setting("execution.require_manual_confirmation")):
+        return None
+    existing = (
+        db.query(ExecutionIntent)
+        .filter(ExecutionIntent.plan_id == plan.id)
+        .first()
+    )
+    if existing is not None:
+        return existing
+    try:
+        return approve_plan(
+            db,
+            plan,
+            expected_lock_version=plan.lock_version,
+            idempotency_key=f"auto-approve:plan:{plan.id}",
+            confirmed=True,
+            human_official_confirmed=True,
+            now=now,
+            require_session=False,
+            enforce_valid_from=False,
+            approved_by="system",
+            commit=True,
+        )
+    except PlanBlocked as error:
+        logger.info(
+            "自动出票未通过 plan=%s status=%s: %s",
+            plan.id, error.status, error.reason,
+        )
+        return None
+    except Exception:  # noqa: BLE001
+        logger.exception("自动出票异常 plan=%s", plan.id)
+        return None
+
+
+def _fill_via_emt(
+    db: Session, plan: TradePlan, intent: ExecutionIntent,
+) -> ExecutionIntent:
+    import time
+
+    from ..config import settings as app_settings
+    from . import emt_orders
+    from .broker_snapshot import (
+        BrokerSnapshotError,
+        load_broker_snapshot,
+        reconcile_snapshot_projection,
+    )
+
+    price = float(intent.approval_quote_price or 0.0)
+    if plan.side == "buy" and plan.max_buy_price:
+        cap = float(plan.max_buy_price)
+        price = min(price, cap) if price > 0 else cap
+    if price <= 0:
+        logger.warning("EMT 委托跳过 plan=%s: 无有效限价", plan.id)
+        return intent
+
+    result = emt_orders.submit_simulation_order(
+        side=plan.side,
+        code=plan.code,
+        quantity=int(intent.authorized_qty),
+        price=price,
+    )
+    if not result.get("accepted"):
+        plan.status_reason_code = "emt_order_rejected"
+        plan.status_reason = f"EMT 模拟委托未接受: {result.get('error') or 'unknown'}"
+        db.commit()
+        logger.warning("EMT 委托失败 plan=%s: %s", plan.id, plan.status_reason)
+        return intent
+
+    deadline = time.monotonic() + float(app_settings.broker_order_timeout_seconds) + 30
+    seen = False
+    while time.monotonic() < deadline:
+        try:
+            snapshot = load_broker_snapshot(
+                app_settings.broker_snapshot_path,
+                max_age_seconds=max(
+                    int(app_settings.broker_snapshot_max_age_seconds), 120),
+            )
+        except BrokerSnapshotError:
+            time.sleep(1)
+            continue
+        if plan.side == "buy":
+            seen = any(
+                str(row.get("ticker") or "") == plan.code
+                and int(row.get("total_qty") or 0) > 0
+                for row in snapshot.positions
+            )
+        else:
+            seen = any(
+                str(row.get("ticker") or "") == plan.code
+                for row in snapshot.trades
+            )
+        if seen:
+            try:
+                reconcile_snapshot_projection(
+                    db,
+                    model_pk=plan.model_pk,
+                    snapshot=snapshot,
+                    initial_equity=float(app_settings.broker_snapshot_initial_equity),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("EMT 成交后回写账户失败 plan=%s", plan.id)
+            intent.status = "executed"
+            plan.status = "executed"
+            plan.status_reason_code = "emt_filled"
+            plan.status_reason = (
+                f"EMT 模拟盘已成交，委托号 {result.get('order_emt_id')}"
+            )
+            plan.lock_version += 1
+            db.commit()
+            logger.info("EMT 模拟成交 plan=%s emt_id=%s", plan.id, result.get("order_emt_id"))
+            return intent
+        time.sleep(1)
+
+    plan.status_reason_code = "emt_order_pending"
+    plan.status_reason = (
+        f"EMT 已报单 {result.get('order_emt_id')}，等待下一轮快照回写持仓"
+    )
+    db.commit()
+    logger.info("EMT 报单已接受但尚未回写 plan=%s", plan.id)
+    return intent
+
+
+def maybe_auto_fill_ticket(
+    db: Session,
+    plan: TradePlan,
+    intent: ExecutionIntent,
+) -> ExecutionIntent:
+    """Execute a ticket on the EMT simulation account, or locally if no EMT."""
+    if not bool(get_setting("execution.auto_fill_tickets")):
+        return intent
+    if intent.status != "ticket_ready" or intent.authorized_qty <= 0:
+        return intent
+
+    from ..config import settings as app_settings
+    from . import emt_orders
+
+    if emt_orders.inbox_ready():
+        return _fill_via_emt(db, plan, intent)
+
+    if app_settings.broker_reference_required:
+        logger.warning("自动成交跳过 plan=%s: EMT 委托通道未就绪", plan.id)
+        return intent
+
+    from ..ledger import record_close_from_sell, record_open, strategy_key_for_model
+    from . import broker
+
+    quote = market.get_trade_quote(plan.code)
+    if quote is None:
+        logger.warning("自动成交跳过 plan=%s: 无安全报价", plan.id)
+        return intent
+    price = float(quote["price"])
+    pct_change = float(quote.get("pct_change") or 0.0)
+    if plan.side == "buy" and plan.max_buy_price and price > float(plan.max_buy_price) + 1e-9:
+        logger.info("自动成交跳过 plan=%s: 现价 %.3f 高于最高买价", plan.id, price)
+        return intent
+
+    from ..models import Model
+    model = db.get(Model, plan.model_pk)
+    sk = strategy_key_for_model(plan.model_pk, model.type if model else "ensemble")
+    if plan.side == "buy":
+        result = broker.buy(
+            db, plan.model_pk, plan.run_id, plan.code, plan.name,
+            price, pct_change, intent.authorized_qty * price,
+            plan.thesis or "", autocommit=False,
+        )
+        if result.ok and result.order:
+            record_open(
+                db, strategy_key=sk, model_pk=plan.model_pk,
+                code=plan.code, name=plan.name,
+                qty=result.order.qty, price=price, signal_source="ai",
+                reason=plan.thesis or "", order_id=result.order.id,
+                autocommit=False,
+            )
+    elif plan.side == "sell":
+        pos = broker.get_position(db, plan.model_pk, plan.code)
+        avg_cost = pos.avg_cost if pos else 0.0
+        result = broker.sell(
+            db, plan.model_pk, plan.run_id, plan.code, plan.name,
+            price, pct_change, intent.authorized_qty, autocommit=False,
+        )
+        if result.ok and result.order:
+            record_close_from_sell(
+                db, strategy_key=sk, model_pk=plan.model_pk,
+                code=plan.code, name=plan.name,
+                qty=result.order.qty, price=price, signal_source="ai",
+                order_id=result.order.id, avg_cost=avg_cost, autocommit=False,
+            )
+    else:
+        return intent
+
+    if result.ok and result.order:
+        intent.status = "executed"
+        intent.order_id = result.order.id
+        plan.status = "executed"
+        plan.status_reason_code = "auto_filled"
+        plan.status_reason = (
+            f"模拟盘已自动成交 {result.order.qty} 股 @ {price:.3f}"
+        )
+        plan.lock_version += 1
+        db.commit()
+        logger.info(
+            "模拟盘自动成交 plan=%s %s %s x%s @ %s",
+            plan.id, plan.side, plan.code, result.order.qty, price,
+        )
+    else:
+        db.commit()
+        logger.info(
+            "模拟盘自动成交未成功 plan=%s: %s",
+            plan.id, result.reason if result else "unknown",
+        )
     return intent
 
 

@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     broker_snapshot_max_total_asset: float = 400_000.0
     broker_reference_required: bool = False
     broker_snapshot_initial_equity: float = 200_000.0
+    broker_order_inbox: str = "/data/emt-orders/inbox"
+    broker_order_outbox: str = "/data/emt-orders/outbox"
+    broker_order_timeout_seconds: int = 45
 
     # 行情/财务主源：同花顺扶摇（唯一；不够再用 Tushare，不做免费源降级）
     fuyao_api_key: str = ""

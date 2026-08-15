@@ -35,37 +35,6 @@ Set `HOST_PORT=18000` if port 8000 is already occupied, then tunnel with
 Do not change `BIND_ADDRESS` to `0.0.0.0`
 until an authenticated reverse proxy has been deployed.
 
-## Resetting the application database
-
-When the old application data is intentionally discarded and the EMT account
-is a new empty simulation account, reset only the SQLite application database.
-Keep the broker directory: it contains the new EMT bridge snapshot and journal.
-
-From the checkout root:
-
-```bash
-cd /opt/stock-ai
-docker compose stop stock-ai
-
-# Preview the exact files first. This does not delete anything.
-./deploy/reset-stock-ai-data.sh
-
-# After confirming the target path, remove the application database.
-./deploy/reset-stock-ai-data.sh --yes
-
-docker compose up -d stock-ai
-```
-
-The script removes only `/var/lib/stock-ai/data/stock_ai.db` and its SQLite
-`-wal`, `-shm`, and `-journal` sidecars. It refuses to run while the
-`stock-ai` container is running and never deletes `/var/lib/stock-ai/broker`.
-On the next start, `init_db()` creates the schema and seeds the default LLM
-advisors plus the unique official ensemble account.
-
-If a secret was saved only in the web UI, it lived in the old database and
-must be entered again after the reset. Secrets in the deployment `.env` or in
-the separate EMT bridge environment file are not deleted by this procedure.
-
 The EMT v2.27.0 archives are not vendored.  The official Python archive must
 be MD5-verified before its `emt_api_python/lib/linux` directory is installed at
 `/opt/emt-api/python/lib/linux`.  Expected MD5 for the archive downloaded on

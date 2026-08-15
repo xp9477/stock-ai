@@ -9,7 +9,7 @@ import logging
 import re
 import hashlib
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 from html import unescape
 from typing import Any
@@ -197,6 +197,17 @@ def _match_stock_news(
 
     matched = []
     for item in headlines:
+        raw_time = str(item.get("time") or "").strip()
+        try:
+            published = datetime.fromisoformat(raw_time.replace("Z", "+00:00"))
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+            now = datetime.now(timezone.utc)
+            if published < now - timedelta(days=30) or published > now + timedelta(days=1):
+                continue
+        except ValueError:
+            # 无法证明发布时间的新条目不进入交易事实底稿。
+            continue
         blob = f"{item.get('title', '')} {item.get('content', '')}"
         if any(k and k in blob for k in keys):
             matched.append({**item, "match": "stock"})

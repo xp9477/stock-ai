@@ -26,7 +26,7 @@ from .evidence import canonical_json, fingerprint
 
 BENCHMARK_KEY = "eligible_universe_equal_weight_v1"
 ARTIFACT_SOURCE_KEY = "engine_strategy_eligible_quote_v1"
-TRUSTED_QUOTE_SOURCES = frozenset({"tencent", "fuyao+tencent"})
+TRUSTED_QUOTE_SOURCES = frozenset({"fuyao"})
 
 
 def _aware_utc(

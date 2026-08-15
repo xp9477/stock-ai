@@ -65,7 +65,11 @@ def position_value(pos: Position) -> float:
 def total_equity(db: Session, model_pk: int) -> dict:
     account = broker.get_account(db, model_pk)
     market_value = 0.0
-    for pos in db.query(Position).filter(Position.model_pk == model_pk).all():
+    # 券商桥可能返回零数量占位行；它们不是持仓，也绝不能触发行情请求。
+    for pos in db.query(Position).filter(
+        Position.model_pk == model_pk,
+        Position.total_qty > 0,
+    ).all():
         market_value += position_value(pos)
     return {
         "cash": round(account.cash, 2),

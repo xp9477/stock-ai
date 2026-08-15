@@ -41,16 +41,19 @@ def test_new_prompts_define_information_and_execution_boundaries():
     assert "不得使用训练记忆" in independent
     assert "不可信数据" in independent
     assert "账户资金" in independent and "不应出现在输入中" in independent
+    assert "entry_setup" in independent and "5–20" in independent
 
     trader = prompts.FINAL_TRADER
     assert "条件的交易计划" in trader
     assert "不得声称已经下单" in trader
     assert "max_buy_price" in trader and "valid_until" in trader
+    assert "当前零持仓不是反证" in trader
 
     risk = prompts.RISK_REVIEW
     assert "高水位" in risk and "剩余损失预算" in risk
     assert "5,000/10,000" in risk and "15,000" in risk
     assert "不得下单" in risk and "等待人工批准" in risk
+    assert "谨慎起见" in risk
 
 
 def test_parse_independent_judgment_accepts_exact_strict_payload():

@@ -1,4 +1,6 @@
 """RSS 新闻解析单测（无网络）。"""
+from datetime import datetime, timedelta, timezone
+
 from app.data.news_rss import _parse_rss, _strip_html, news_for_stock
 
 
@@ -36,10 +38,11 @@ def test_news_for_stock_matches(monkeypatch):
     from app.data import news_rss
 
     def fake_headlines():
+        now = datetime.now(timezone.utc).isoformat()
         return [
-            {"title": "600519 贵州茅台上涨", "content": "白酒", "time": "t",
+            {"title": "600519 贵州茅台上涨", "content": "白酒", "time": now,
              "url": "u", "source": "s"},
-            {"title": "无关宏观", "content": "美联储", "time": "t",
+            {"title": "无关宏观", "content": "美联储", "time": now,
              "url": "u", "source": "s"},
         ]
 
@@ -49,6 +52,19 @@ def test_news_for_stock_matches(monkeypatch):
     miss = news_for_stock("000001", "平安银行", limit=5)
     # 无命中时退回 general
     assert miss and miss[0]["match"] == "general"
+
+
+def test_stock_news_excludes_stale_items(monkeypatch):
+    from app.data import news_rss
+
+    stale = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    monkeypatch.setattr(news_rss, "fetch_all_headlines", lambda: [{
+        "title": "600519 贵州茅台旧闻", "content": "旧内容", "time": stale,
+        "url": "u", "source": "s",
+    }])
+
+    assert news_for_stock(
+        "600519", "贵州茅台", limit=5, include_general=False) == []
 
 
 def test_market_get_news_uses_rss(monkeypatch):

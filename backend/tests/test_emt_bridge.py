@@ -5,6 +5,7 @@ import pytest
 
 from emt_bridge.config import BridgeConfig, BridgeConfigError
 from emt_bridge.main import ensure_supported_python
+from emt_bridge.orders import market_for_code, process_inbox
 from emt_bridge.state import BridgeState
 
 
@@ -131,3 +132,43 @@ def test_query_error_fails_closed_and_journal_whitelists_fields(tmp_path):
     event = json.loads(Path(tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert event["payload"]["data"] == {"ticker": "000001", "order_emt_id": 7}
     assert "password" not in json.dumps(event)
+
+
+def test_market_for_code_matches_snapshot_convention():
+    assert market_for_code("000001") == 1
+    assert market_for_code("300001") == 1
+    assert market_for_code("600000") == 2
+    assert market_for_code("688001") == 2
+
+
+def test_process_inbox_submits_limit_order_and_writes_outbox(tmp_path):
+    inbox = tmp_path / "inbox"
+    outbox = tmp_path / "outbox"
+    inbox.mkdir()
+    request_id = "ord-testorder1"
+    (inbox / f"{request_id}.json").write_text(json.dumps({
+        "request_id": request_id,
+        "side": "buy",
+        "code": "600000",
+        "quantity": 100,
+        "price": 10.5,
+    }), encoding="utf-8")
+    captured = {}
+
+    class Api:
+        def insertOrder(self, payload, session):
+            captured["payload"] = payload
+            captured["session"] = session
+            return 4242
+
+    handled = process_inbox(api=Api(), session=9, inbox=inbox, outbox=outbox)
+    assert handled == 1
+    assert captured["session"] == 9
+    assert captured["payload"]["ticker"] == "600000"
+    assert captured["payload"]["market"] == 2
+    assert captured["payload"]["side"] == 1
+    assert captured["payload"]["quantity"] == 100
+    result = json.loads((outbox / f"{request_id}.json").read_text(encoding="utf-8"))
+    assert result["accepted"] is True
+    assert result["order_emt_id"] == 4242
+    assert not (inbox / f"{request_id}.json").exists()

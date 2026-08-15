@@ -77,7 +77,7 @@ def _attach_run_artifact(db, run, inputs, codes=("600519",)):
             "price": 100.0,
             "quote_asof": (cutoff - timedelta(minutes=2)).isoformat(),
             "received_at": (cutoff - timedelta(minutes=1)).isoformat(),
-            "source": "tencent",
+            "source": "fuyao",
             "tradable": True,
             "trade_status": "tradable",
         }
@@ -160,7 +160,8 @@ def test_final_and_risk_models_create_plan_without_execution(
     with patch("app.agents.engine.llm.chat", side_effect=fake_chat), \
          patch("app.agents.engine.market.is_trade_date", return_value=True), \
          patch("app.agents.engine.market.get_quote", return_value=quote), \
-         patch("app.trading.portfolio.market.get_trade_quote", return_value=quote):
+         patch("app.trading.portfolio.market.get_trade_quote", return_value=quote), \
+         patch("app.trading.plan_service.maybe_auto_issue_ticket", return_value=None):
         decision, plan = engine._create_ensemble_candidate(
             db,
             run_id=run.id,
@@ -207,6 +208,48 @@ def test_final_and_risk_models_create_plan_without_execution(
     assert policy["final_model_id"] != policy["risk_model_id"]
 
 
+def test_expired_buy_is_saved_as_immutable_hold_without_transaction_failure(
+    db, model_a, model_b, model_c,
+):
+    run = Run(trigger="schedule")
+    db.add(run)
+    db.commit()
+    ensemble = _ensemble(db, [model_a, model_b, model_c])
+    inputs = _inputs()
+    _attach_run_artifact(db, run, inputs)
+    frozen, snapshot_hash = engine._frozen_snapshot(
+        "600519", "测试股", inputs, "市场中性")
+    judgments = {
+        model.id: _judgment_row(model)
+        for model in (model_a, model_b, model_c)
+    }
+    expired = json.loads(_trade_output())
+    expired["valid_until"] = "2000-01-01T10:30:00+08:00"
+
+    with patch(
+        "app.agents.engine.llm.chat",
+        return_value=json.dumps(expired, ensure_ascii=False),
+    ), patch("app.agents.engine.market.is_trade_date", return_value=True):
+        decision, plan = engine._create_ensemble_candidate(
+            db,
+            run_id=run.id,
+            ensemble=ensemble,
+            code="600519",
+            name="测试股",
+            inputs=inputs,
+            frozen_snapshot=frozen,
+            snapshot_hash=snapshot_hash,
+            judgments_by_model=judgments,
+        )
+
+    assert decision.action == "hold"
+    assert decision.target_position_pct == 0.0
+    assert decision.error == "invalid_plan_expiry"
+    assert plan is None
+    assert db.query(TradePlan).count() == 0
+    assert db.is_active
+
+
 def test_missing_two_thirds_quorum_fails_closed_without_llm_or_plan(
     db, model_a, model_b, model_c,
 ):
@@ -237,6 +280,48 @@ def test_missing_two_thirds_quorum_fails_closed_without_llm_or_plan(
     assert plan is None
     assert db.query(TradePlan).count() == 0
     assert db.query(Order).count() == 0
+    chat.assert_not_called()
+
+
+def test_new_entry_gate_skips_final_and_risk_models(db, model_a, model_b, model_c):
+    run = Run(trigger="schedule")
+    db.add(run)
+    db.commit()
+    ensemble = _ensemble(db, [model_a, model_b, model_c])
+    inputs = _inputs() | {
+        "entry_setup": {
+            "version": "entry_setup_v1",
+            "status": "watch",
+            "actionable": False,
+            "reasons": ["动量/趋势确认 2/4", "接近门禁但确认不足，仅列观察"],
+            "hard_blockers": [],
+        },
+    }
+    _attach_run_artifact(db, run, inputs)
+    frozen, snapshot_hash = engine._frozen_snapshot(
+        "600519", "测试股", inputs, "市场中性")
+    judgments = {
+        model.id: _judgment_row(model)
+        for model in (model_a, model_b, model_c)
+    }
+
+    with patch("app.agents.engine.llm.chat") as chat:
+        decision, plan = engine._create_ensemble_candidate(
+            db,
+            run_id=run.id,
+            ensemble=ensemble,
+            code="600519",
+            name="测试股",
+            inputs=inputs,
+            frozen_snapshot=frozen,
+            snapshot_hash=snapshot_hash,
+            judgments_by_model=judgments,
+        )
+
+    assert decision.action == "hold"
+    assert decision.error == ""
+    assert "entry_setup_v1 未通过" in decision.reason
+    assert plan is None
     chat.assert_not_called()
 
 

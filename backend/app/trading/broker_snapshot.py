@@ -180,6 +180,7 @@ def broker_snapshot_status(
 
     try:
         snapshot = load_broker_snapshot(path, max_age_seconds=max_age_seconds, now=now)
+        open_positions = normalized_positions(snapshot)
     except BrokerSnapshotError as exc:
         return {
             "provider": "emt",
@@ -207,7 +208,7 @@ def broker_snapshot_status(
         "reference_ready": ready,
         "account_ref": snapshot.account_ref,
         "observed_at": snapshot.observed_at.isoformat(),
-        "position_count": len(snapshot.positions),
+        "position_count": len(open_positions),
         "order_count": len(snapshot.orders),
         "trade_count": len(snapshot.trades),
         "capital_boundary_ok": (
@@ -292,6 +293,10 @@ def normalized_positions(snapshot: BrokerSnapshot) -> tuple[dict[str, Any], ...]
             raise BrokerSnapshotError(
                 f"positions[{index}].avg_price must be positive for an open position"
             )
+        # EMT 会返回 total_qty=0、ticker_name=not_ready 的占位行。
+        # 它们不是持仓；投影后反而会制造行情请求、限流与超时。
+        if total_qty == 0:
+            continue
         rows.append({
             "code": code,
             "name": str(raw.get("ticker_name") or raw.get("name") or code).strip(),

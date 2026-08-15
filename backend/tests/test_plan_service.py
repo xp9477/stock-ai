@@ -19,6 +19,8 @@ from app.models import (
 from app.trading.plan_service import (
     PlanBlocked,
     approve_plan,
+    maybe_auto_fill_ticket,
+    maybe_auto_issue_ticket,
     review_preopen_information,
 )
 from app.trading.trade_plans import create_plan_from_decision
@@ -106,11 +108,29 @@ def test_official_disclosure_check_is_explicitly_fail_closed(db, model_a):
     with patch(
         "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
         return_value=_news(),
+    ), patch(
+        "app.trading.plan_service.get_setting",
+        side_effect=lambda key, db=None: (
+            True if key == "execution.require_human_information_check"
+            else False if key == "execution.require_manual_confirmation"
+            else 60 if key.endswith("seconds") else 0
+        ),
     ):
         blocked = review_preopen_information(db, plan, human_official_confirmed=False)
     assert blocked.outcome == "blocked_information"
     assert blocked.reason_code == "official_disclosure_unverified"
     assert plan.status == "blocked_information"
+
+
+def test_information_gate_passes_without_human_check_when_disabled(db, model_a):
+    plan = _plan(db, model_a)
+    with patch(
+        "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
+        return_value=_news(),
+    ):
+        check = review_preopen_information(db, plan, human_official_confirmed=False)
+    assert check.outcome == "pass"
+    assert plan.status == "preopen_validated"
 
 
 def test_new_direct_news_requires_reanalysis_even_after_human_check(db, model_a):
@@ -190,6 +210,98 @@ def test_human_approval_creates_ticket_but_no_order_or_position(db, model_a):
     assert intent.authorized_target_position_pct == pytest.approx(0.101)
     assert intent.estimated_fee > 0
     assert "canary_status" in intent.risk_snapshot_json
+
+
+def test_auto_issue_ticket_skips_human_confirmation(db, model_a):
+    plan = _plan(db, model_a)
+    with patch(
+        "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
+        return_value=_news(),
+    ), patch(
+        "app.trading.plan_service.market.get_execution_quote",
+        return_value=_quote(),
+    ), patch(
+        "app.trading.plan_service.market.get_daily_kline",
+        return_value=_bars(),
+    ):
+        intent = maybe_auto_issue_ticket(db, plan, now=NOW)
+
+    assert intent is not None
+    assert intent.status == "ticket_ready"
+    assert intent.approved_by == "system"
+    assert plan.status == "ticket_ready"
+    assert plan.status_reason_code == "auto_approved"
+    assert db.query(Order).count() == 0
+
+
+def test_auto_fill_ticket_creates_local_order_and_position(db, model_a):
+    plan = _plan(db, model_a)
+    quote = _quote(101.0)
+    with patch(
+        "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
+        return_value=_news(),
+    ), patch(
+        "app.trading.plan_service.market.get_execution_quote",
+        return_value=quote,
+    ), patch(
+        "app.trading.plan_service.market.get_daily_kline",
+        return_value=_bars(),
+    ), patch(
+        "app.trading.plan_service.market.get_trade_quote",
+        return_value={**quote, "pct_change": 0.5},
+    ):
+        intent = maybe_auto_issue_ticket(db, plan, now=NOW)
+        filled = maybe_auto_fill_ticket(db, plan, intent)
+
+    assert filled.status == "executed"
+    assert plan.status == "executed"
+    assert db.query(Order).filter(Order.status == "filled").count() == 1
+    pos = db.query(Position).filter_by(model_pk=model_a.id, code="600519").one()
+    assert pos.total_qty > 0
+
+
+def test_auto_fill_uses_emt_inbox_when_broker_reference_required(db, model_a, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "broker_reference_required", True)
+    plan = _plan(db, model_a)
+    quote = _quote(101.0)
+    from app.trading.broker_snapshot import BrokerSnapshot
+    snap = BrokerSnapshot(
+        provider="emt", mode="simulation", read_only=True, connected=True,
+        reconciled=True, account_ref="emt-sim-primary",
+        observed_at=NOW,
+        asset={"total_asset": 200000.0, "buying_power": 189900.0},
+        positions=({"ticker": "600519", "total_qty": 100, "sellable_qty": 0,
+                    "avg_price": 101.0, "unrealized_pnl": 0.0},),
+        orders=(), trades=(), query_errors=(),
+    )
+    with patch(
+        "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
+        return_value=_news(),
+    ), patch(
+        "app.trading.plan_service.market.get_execution_quote",
+        return_value=quote,
+    ), patch(
+        "app.trading.plan_service.market.get_daily_kline",
+        return_value=_bars(),
+    ), patch(
+        "app.trading.emt_orders.submit_simulation_order",
+        return_value={"accepted": True, "order_emt_id": 88, "error": ""},
+    ) as submit, patch(
+        "app.trading.broker_snapshot.load_broker_snapshot",
+        return_value=snap,
+    ), patch(
+        "app.trading.broker_snapshot.reconcile_snapshot_projection",
+        return_value={"position_count": 1},
+    ):
+        intent = maybe_auto_issue_ticket(db, plan, now=NOW)
+        filled = maybe_auto_fill_ticket(db, plan, intent)
+
+    assert submit.called
+    assert filled.status == "executed"
+    assert plan.status_reason_code == "emt_filled"
+    assert db.query(Order).count() == 0
 
 
 def test_approval_idempotency_returns_same_ticket(db, model_a):

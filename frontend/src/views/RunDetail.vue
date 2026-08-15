@@ -101,6 +101,23 @@
         <span>观望 {{ detail.result.hold || 0 }}</span>
         <span>独立模型 {{ detail.result.llm_models || 0 }} · 最终汇总 {{ detail.result.ensembles || 0 }}</span>
       </div>
+      <div v-if="detail.result.entry_setup_counts" class="sel-stats mono" style="margin-top:10px">
+        <span>门禁通过 <b class="up">{{ detail.result.entry_setup_counts.actionable || 0 }}</b></span>
+        <span>观察 {{ detail.result.entry_setup_counts.watch || 0 }}</span>
+        <span>拒绝 {{ detail.result.entry_setup_counts.rejected || 0 }}</span>
+        <span>数据不足 {{ detail.result.entry_setup_counts.data_insufficient || 0 }}</span>
+        <span>{{ detail.result.entry_setup_version }}</span>
+      </div>
+      <div v-if="(detail.result.entry_setup_actionable_codes || []).length" class="sel-tags" style="margin-top:10px">
+        <span class="dim" style="margin-right:8px">进入合议</span>
+        <el-tag
+          v-for="code in detail.result.entry_setup_actionable_codes"
+          :key="code" size="small" type="danger" effect="plain" class="mr"
+        >{{ code }}</el-tag>
+      </div>
+      <p v-if="detail.result.degraded" class="down" style="margin:10px 0 0">
+        本轮存在数据或模型降级；请查看判断失败数与具体决策错误后再审批。
+      </p>
     </section>
 
     <!-- 时间线（当前模型） -->

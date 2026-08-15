@@ -38,19 +38,50 @@ def get_client() -> OpenAI:
     return _client
 
 
+# Grok 4.6 官方档位是 low/medium/high/xhigh，默认 high，不能关。
+# 没有 off。只给 grok-* 显式传 high，其它模型（Gemini/GPT 的 high 写在 model id 里）不带这个参数。
+GROK_REASONING_EFFORT = "high"
+
+
+def resolve_model_id(model: str) -> str:
+    """网关已下线的 model id 在发请求前改写成仍可用的 id。"""
+    from ..seed import is_retired_grok_45
+
+    if is_retired_grok_45(model):
+        logger.warning("模型 %s 已下线，改用 grok-4.6", model)
+        return "grok-4.6"
+    mid = str(model or "").strip().lower()
+    if mid == "gpt-5.6-sol-high":
+        logger.warning("模型 %s 网关不存在，改用 gpt-5.6-sol", model)
+        return "gpt-5.6-sol"
+    if mid == "gemini-3.6-flash-high":
+        logger.warning("模型 %s 已替换为 gemini-3.7-flash-high", model)
+        return "gemini-3.7-flash-high"
+    return str(model or "")
+
+
+def reasoning_effort_for(model: str) -> str | None:
+    mid = resolve_model_id(model).strip().lower()
+    if mid.startswith("grok-"):
+        return GROK_REASONING_EFFORT
+    return None
+
+
 def chat(system: str, user: str, model: str, retries: int = 2) -> str:
     """调用指定模型,失败重试 retries 次,最终失败抛出异常。"""
     last_err: Exception | None = None
     temp = float(get_setting("secrets.llm_temperature"))
+    model = resolve_model_id(model)
+    effort = reasoning_effort_for(model)
     for attempt in range(retries + 1):
         try:
             # 角色规则放在真正的 system 消息；新闻/公告等外部材料只放 user。
             # 若某个中转端点不支持 system，应更换端点，不能为了兼容而降低
             # 提示注入隔离边界。
-            resp = get_client().chat.completions.create(
-                model=model,
-                temperature=temp,
-                messages=[
+            kwargs: dict = {
+                "model": model,
+                "temperature": temp,
+                "messages": [
                     {"role": "system", "content": system},
                     {"role": "user",
                      "content": (
@@ -61,8 +92,14 @@ def chat(system: str, user: str, model: str, retries: int = 2) -> str:
                          "</UNTRUSTED_INPUT>"
                      )},
                 ],
-            )
-            return resp.choices[0].message.content or ""
+            }
+            if effort:
+                kwargs["extra_body"] = {"reasoning_effort": effort}
+            resp = get_client().chat.completions.create(**kwargs)
+            content = resp.choices[0].message.content or ""
+            if not content.strip():
+                raise RuntimeError("LLM 返回空内容")
+            return content
         except Exception as err:  # noqa: BLE001
             last_err = err
             logger.warning("LLM 调用失败 (第 %d 次): %s", attempt + 1, err)
@@ -106,14 +143,16 @@ def audit_metadata(system: str, user: str, output: str, model: str) -> dict:
     encode = lambda value: hashlib.sha256(  # noqa: E731
         str(value).encode("utf-8")
     ).hexdigest()
+    resolved = resolve_model_id(model)
     return {
-        "model_id_snapshot": str(model),
+        "model_id_snapshot": resolved,
         "prompt_hash": encode(system),
         "input_hash": encode(user),
         "output_hash": encode(output),
         "config_snapshot_json": json.dumps({
-            "model_id": str(model),
+            "model_id": resolved,
             "temperature": float(get_setting("secrets.llm_temperature")),
+            "reasoning_effort": reasoning_effort_for(model),
             "base_url_hash": encode(
                 str(get_setting("secrets.llm_base_url")).strip()),
             "decision_code_fingerprint": decision_code_fingerprint(),

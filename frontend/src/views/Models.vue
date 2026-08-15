@@ -185,7 +185,7 @@
           <el-input
             v-model="llmForm.name"
             name="model_name"
-            placeholder="如 Grok 4.5…"
+            placeholder="如 GPT 5.6 Sol High…"
             autocomplete="off"
             spellcheck="false"
           />
@@ -194,7 +194,7 @@
           <el-input
             v-model="llmForm.model_id"
             name="model_id"
-            placeholder="如 grok-4.5…"
+            placeholder="如 gpt-5.6-sol…"
             autocomplete="off"
             spellcheck="false"
             translate="no"

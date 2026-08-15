@@ -306,7 +306,7 @@ def _trusted_quote(code: str, price: float, quote_asof: datetime, received_at=No
         "price": price,
         "quote_asof": quote_asof.isoformat(),
         "received_at": (received_at or quote_asof + timedelta(seconds=1)).isoformat(),
-        "source": "tencent",
+        "source": "fuyao",
         "tradable": True,
         "trade_status": "tradable",
     }

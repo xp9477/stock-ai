@@ -234,6 +234,8 @@ def list_settings(group: str | None = None, db: Session | None = None) -> list[d
             "requires_scheduler_reload": defn.requires_scheduler_reload,
             "min_value": defn.min_value,
             "max_value": defn.max_value,
+            "step": defn.step,
+            "precision": defn.precision,
             "secret": _is_secret(defn),
             "overridden": defn.editable and defn.key in overrides,
             "danger": getattr(defn, "danger", "normal") or "normal",
@@ -338,7 +340,7 @@ def _clear_data_caches() -> None:
     try:
         from .data import market, news_rss
         for fn in (
-            market._tx_quote_raw, market.get_daily_kline, market.get_news,
+            market.get_quote, market.get_daily_kline, market.get_news,
             market.get_index_daily, market.get_hs300_history, market._trade_dates,
             market.get_market_snapshot, market.get_screen_universe,
             news_rss.fetch_all_headlines,

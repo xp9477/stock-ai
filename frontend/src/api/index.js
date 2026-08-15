@@ -38,6 +38,7 @@ export default {
     client.post('/datasources/probe', null, {
       params: sourceId ? { source_id: sourceId } : {},
     }),
+  testBark: () => client.post('/notifications/bark/test'),
   getLogs: (params) => client.get('/logs', { params: params || {} }),
   purgeLogs: () => client.post('/logs/purge'),
   getOrders: (modelPk) => client.get('/orders', { params: modelPk != null ? { model_pk: modelPk } : {} }),

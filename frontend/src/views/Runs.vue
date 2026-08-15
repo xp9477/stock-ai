@@ -159,7 +159,9 @@ function summaryLine(row) {
     return `选股完成 · 池内 ${r.pool_size ?? '—'} · 无变动`
   }
   if (r?.kind === 'pipeline' && r.trade_n === 0 && row.status === 'done') {
-    return `决策完成 · ${r.hold || 0} 条观望 · 无买卖`
+    const gate = r.entry_setup_counts?.actionable
+    const gateText = gate == null ? '' : ` · 门禁通过 ${gate}`
+    return `决策完成 · ${r.hold || 0} 条观望${gateText} · 无买卖`
   }
   if (r?.kind === 'pipeline' && row.status === 'done') {
     return `买 ${r.buy || 0} · 卖 ${r.sell || 0} · 观望 ${r.hold || 0}`

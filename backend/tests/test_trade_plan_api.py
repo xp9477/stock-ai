@@ -165,6 +165,11 @@ def test_information_refresh_is_fail_closed(api_env):
     with patch(
         "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
         return_value=_news(),
+    ), patch(
+        "app.trading.plan_service.get_setting",
+        side_effect=lambda key, db=None: (
+            True if key == "execution.require_human_information_check" else False
+        ),
     ):
         response = api_client.post(
             f"/api/trade-plans/{plan.id}/refresh-information",

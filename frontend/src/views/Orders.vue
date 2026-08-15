@@ -3,7 +3,7 @@
     <div class="page-head">
       <div>
         <h1 class="page-title">交易计划</h1>
-        <p class="page-sub">候选计划 → 信息门禁 → 价格门禁 → 人工强确认 → 待执行票据</p>
+        <p class="page-sub">{{ pageSub }}</p>
       </div>
       <div class="head-actions">
         <el-select
@@ -36,9 +36,13 @@
     </div>
 
     <el-alert
-      type="warning"
-      title="这里不成交：人工批准只生成待执行票据"
-      description="系统不会因 BUY / SELL 结论自动下单。请先刷新信息、校验当前价格，再核对官方公告并强确认；批准后仍需在独立执行环节处理。"
+      :type="autoTicket ? 'info' : 'warning'"
+      :title="autoFill ? '模拟盘自动成交：票据通过后门禁后立即撮合' : (autoTicket ? '这里不成交：机器门禁通过后自动生成待执行票据' : '这里不成交：人工批准只生成待执行票据')"
+      :description="autoFill
+        ? '不再人工确认。系统向 EMT 模拟盘报单，成交后用快照回写持仓。东财模拟盘账户与本系统会保持同一本账。'
+        : autoTicket
+        ? '不再需要勾选公告或点确认。价格、资金和券商快照仍会机器校验；票据就绪后仍需在独立执行环节处理。'
+        : '系统不会因 BUY / SELL 结论自动下单。请先刷新信息、校验当前价格，再核对官方公告并强确认；批准后仍需在独立执行环节处理。'"
       :closable="false"
       show-icon
       class="flow-alert"
@@ -300,7 +304,10 @@
           <el-empty v-else description="尚无门禁记录" :image-size="64" />
         </section>
 
-        <section v-if="isPlanMutable(selectedPlan)" class="detail-section action-section">
+        <section
+          v-if="isPlanMutable(selectedPlan) && !autoTicket"
+          class="detail-section action-section"
+        >
           <h3>人工门禁与强确认</h3>
           <div class="official-confirm">
             <el-checkbox v-model="officialConfirmed">
@@ -403,6 +410,14 @@ const selectedPlan = ref(null)
 const selectedIntent = ref(null)
 const officialConfirmed = ref(false)
 const busyAction = ref('')
+const autoTicket = ref(true)
+const autoFill = ref(true)
+
+const pageSub = computed(() => autoFill.value
+  ? '候选计划 → 机器门禁 → 本系统模拟成交'
+  : autoTicket.value
+    ? '候选计划 → 机器门禁 → 待执行票据'
+    : '候选计划 → 信息门禁 → 价格门禁 → 人工强确认 → 待执行票据')
 
 const STATUS_META = {
   candidate: { label: '候选计划', type: 'info' },
@@ -532,14 +547,17 @@ function intentParams() {
 async function reload() {
   loading.value = true
   try {
-    const [planResponse, intentResponse, modelResponse] = await Promise.all([
+    const [planResponse, intentResponse, modelResponse, status] = await Promise.all([
       api.getTradePlans(planParams()),
       api.getExecutionIntents(intentParams()),
       api.getModels().catch(() => []),
+      api.getStatus().catch(() => ({})),
     ])
     plans.value = Array.isArray(planResponse?.items) ? planResponse.items : []
     intents.value = Array.isArray(intentResponse?.items) ? intentResponse.items : []
     models.value = Array.isArray(modelResponse) ? modelResponse : []
+    autoTicket.value = status?.execution_mode !== 'manual_ticket_only'
+    autoFill.value = status?.execution_mode === 'auto_fill'
   } catch (error) {
     ElMessage.error(error.message)
   } finally {

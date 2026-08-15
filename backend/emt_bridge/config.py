@@ -39,6 +39,9 @@ class BridgeConfig:
     refresh_seconds: int
     mode: str = "simulation"
     read_only: bool = True
+    sim_orders: bool = False
+    order_inbox: Path = Path("/var/lib/stock-ai/data/emt-orders/inbox")
+    order_outbox: Path = Path("/var/lib/stock-ai/data/emt-orders/outbox")
 
     @classmethod
     def from_env(cls) -> "BridgeConfig":
@@ -46,6 +49,10 @@ class BridgeConfig:
         if mode != "simulation":
             raise BridgeConfigError("EMT_MODE must remain simulation")
         _true_only("EMT_READ_ONLY")
+        sim_orders_raw = os.environ.get("EMT_SIM_ORDERS", "false").strip().lower()
+        sim_orders = sim_orders_raw in {"1", "true", "yes", "on"}
+        if sim_orders and mode != "simulation":
+            raise BridgeConfigError("EMT_SIM_ORDERS is only allowed in simulation")
 
         try:
             port = int(_required("EMT_SERVER_PORT"))
@@ -82,4 +89,10 @@ class BridgeConfig:
             refresh_seconds=refresh_seconds,
             mode=mode,
             read_only=True,
+            sim_orders=sim_orders,
+            order_inbox=Path(os.environ.get(
+                "EMT_ORDER_INBOX", "/var/lib/stock-ai/data/emt-orders/inbox")),
+            order_outbox=Path(os.environ.get(
+                "EMT_ORDER_OUTBOX", "/var/lib/stock-ai/data/emt-orders/outbox")),
         )
+

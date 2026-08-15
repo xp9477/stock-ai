@@ -8,10 +8,70 @@ from .config import settings
 from .models import Account, Model
 
 DEFAULT_MODELS = [
-    {"name": "Grok 4.5", "model_id": "grok-4.5"},
-    {"name": "Gemini 3.6 Flash", "model_id": "gemini-3.6-flash-high"},
-    {"name": "Opus 4.6 Thinking", "model_id": "claude-opus-4-6-thinking"},
+    {"name": "Grok 4.6", "model_id": "grok-4.6"},
+    {"name": "GPT 5.6 Sol High", "model_id": "gpt-5.6-sol"},
+    {"name": "Gemini 3.7 Flash", "model_id": "gemini-3.7-flash-high"},
 ]
+
+LEGACY_MODEL_REPLACEMENTS = {
+    "claude-opus-4-6-thinking": ("Grok 4.6", "grok-4.6"),
+    "gpt-5.6-sol-high": ("GPT 5.6 Sol High", "gpt-5.6-sol"),
+    "gemini-3.6-flash-high": ("Gemini 3.7 Flash", "gemini-3.7-flash-high"),
+}
+
+# Grok 4.5 已从网关下线。已有 4.6 时，这个顾问位改成 GPT Sol High；
+# 否则原地升级成 4.6，避免选股还打到已删除的 model id。
+_RETIRED_GROK_45_IDS = frozenset({"grok-4.5", "grok-4-5"})
+
+
+def normalize_model_id(model_id: str) -> str:
+    return str(model_id or "").strip().lower().replace("_", "-")
+
+
+def is_retired_grok_45(model_id: str) -> bool:
+    return normalize_model_id(model_id) in _RETIRED_GROK_45_IDS
+
+
+def _align_default_advisor_order(db: Session, llm_models: list[Model]) -> None:
+    """选股取 id 最小的启用 LLM，所以默认三人组按 DEFAULT_MODELS 顺序排到最前几个主键。"""
+    wanted = [(item["name"], item["model_id"]) for item in DEFAULT_MODELS]
+    wanted_ids = {normalize_model_id(model_id) for _, model_id in wanted}
+    holders = [
+        model for model in llm_models
+        if normalize_model_id(model.model_id) in wanted_ids
+    ]
+    if len(holders) != len(wanted):
+        return
+    holders.sort(key=lambda model: model.id)
+    current = [normalize_model_id(model.model_id) for model in holders]
+    target = [normalize_model_id(model_id) for _, model_id in wanted]
+    if current == target:
+        return
+    # name / model_id 都有唯一约束，必须先腾出旧值再写入目标顺序。
+    for index, model in enumerate(holders):
+        model.name = f"__reorder_{index}__"
+        model.model_id = f"__reorder_{index}__"
+    db.flush()
+    for model, (name, model_id) in zip(holders, wanted):
+        model.name, model.model_id = name, model_id
+    logger.warning(
+        "已重排默认顾问顺序: %s",
+        " → ".join(model_id for _, model_id in wanted),
+    )
+
+
+def replacement_for(model: Model, sibling_ids: set[str] | None = None) -> tuple[str, str] | None:
+    mid = normalize_model_id(model.model_id)
+    explicit = LEGACY_MODEL_REPLACEMENTS.get(mid)
+    if explicit:
+        return explicit
+    if is_retired_grok_45(mid):
+        siblings = {normalize_model_id(item) for item in (sibling_ids or set())}
+        siblings.discard(mid)
+        if "grok-4.6" in siblings:
+            return ("GPT 5.6 Sol High", "gpt-5.6-sol")
+        return ("Grok 4.6", "grok-4.6")
+    return None
 
 # 仅用于识别旧库中的历史规则账户。新安装不再创建资本化规则账户。
 RULE_STRATEGIES = [
@@ -48,6 +108,18 @@ def seed_models(db: Session):
             db.flush()
             llm_pks.append(model.id)
         llm_models = db.query(Model).filter(Model.id.in_(llm_pks)).all()
+
+    # 保留数据库主键，使既有 ensemble.members 和历史审计关联不变；只替换
+    # 已确认不可用的旧模型名称与网关 ID。
+    sibling_ids = {item.model_id for item in llm_models}
+    for model in llm_models:
+        replacement = replacement_for(model, sibling_ids)
+        if replacement:
+            old_id = model.model_id
+            model.name, model.model_id = replacement
+            logger.warning("已替换停用模型 %s → %s (%s)", old_id, model.model_id, model.name)
+
+    _align_default_advisor_order(db, llm_models)
 
     ensembles = db.query(Model).filter(Model.type == "ensemble").order_by(Model.id).all()
     official = next((model for model in ensembles if model.is_official_strategy), None)

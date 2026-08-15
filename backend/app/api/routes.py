@@ -343,7 +343,11 @@ def get_portfolio(model_pk: int, db: Session = Depends(get_db)):
         )
     eq = portfolio.total_equity(db, model_pk)
     positions = []
-    for pos in db.query(Position).filter(Position.model_pk == model_pk).all():
+    # EMT 模拟盘会塞 total_qty=0、name=not_ready 的占位行。它们不是持仓。
+    for pos in db.query(Position).filter(
+        Position.model_pk == model_pk,
+        Position.total_qty > 0,
+    ).all():
         quote = None
         try:
             quote = market.get_quote(pos.code)
@@ -689,7 +693,13 @@ def status(db: Session = Depends(get_db)):
         "pool_max": get_setting("selector.pool_max"),
         "pool_size": pool_size,
         "factor_top_n": get_setting("factor.top_n"),
-        "execution_mode": "manual_ticket_only",
+        "execution_mode": (
+            "manual_ticket_only"
+            if bool(get_setting("execution.require_manual_confirmation"))
+            else "auto_fill"
+            if bool(get_setting("execution.auto_fill_tickets"))
+            else "auto_ticket"
+        ),
         "broker_sync": broker_sync,
         "official_disclosure_provider": False,
         "live_funds_ready": False,
@@ -715,6 +725,9 @@ def status(db: Session = Depends(get_db)):
         "destructive_reset_enabled": False,
         "fuyao_configured": bool(str(get_setting("secrets.fuyao_api_key")).strip()),
         "llm_configured": bool(str(get_setting("secrets.llm_api_key")).strip()),
+        "bark_enabled": bool(get_setting("notifications.bark.enabled")),
+        "bark_configured": bool(
+            str(get_setting("notifications.bark.device_key")).strip()),
         "llm_enabled_count": llm_n,
         "ensemble_enabled_count": ens_n,
         "official_strategy_count": official_count,
@@ -746,12 +759,23 @@ def datasources_list():
 
 @router.post("/datasources/probe")
 def datasources_probe(source_id: str | None = None):
-    """立即探测数据源健康（可选 source_id=fuyao|sina|tencent|tushare|rss）。"""
+    """立即探测数据源健康（可选 source_id=fuyao|sina|tushare|rss）。"""
     from ..data.datasources import SOURCE_META, probe_all
 
     if source_id and source_id not in {m["id"] for m in SOURCE_META}:
         raise HTTPException(400, f"未知数据源: {source_id}")
     return {"results": probe_all(source_id)}
+
+
+@router.post("/notifications/bark/test")
+def bark_test_notification():
+    """Send a real setup test; allowed while the enabled switch is still off."""
+    from ..notifications.bark import BarkError, send_test
+
+    try:
+        return send_test()
+    except BarkError as error:
+        raise HTTPException(400, str(error)) from error
 
 
 @router.get("/logs")

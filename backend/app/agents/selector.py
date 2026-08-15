@@ -196,6 +196,12 @@ def run_selector(trigger: str = "schedule") -> int | None:
     finally:
         run.finished_at = datetime.now()
         db.commit()
+        if run.status == "failed":
+            try:
+                from ..notifications import notify_selector_failure
+                notify_selector_failure(run_id, run.error)
+            except Exception:  # noqa: BLE001
+                logger.exception("选股失败通知调度异常（不影响 Run）")
         db.close()
         _select_lock = False
     return run_id

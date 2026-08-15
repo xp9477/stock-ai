@@ -1,6 +1,6 @@
 """Tushare Pro 数据客户端。
 
-无 token 或调用失败时返回空/None，由上层降级到 AKShare/腾讯。
+无 token 或调用失败时返回空/None，由上层按能力选择是否降级。
 所有财务字段按公告日(ann_date)做 point-in-time 对齐，禁止用 end_date 偷看。
 """
 from __future__ import annotations

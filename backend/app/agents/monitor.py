@@ -75,6 +75,8 @@ def review_position(db: Session, pos: Position, price: float, pct_change: float,
                              action="alert", detail=detail)
         db.add(event)
         db.commit()
+        from ..notifications import notify_monitor_event
+        notify_monitor_event(event)
         return event
 
     model_id = _review_model_id(db, pos.model_pk)
@@ -119,6 +121,8 @@ def review_position(db: Session, pos: Position, price: float, pct_change: float,
                          action=action, detail=detail)
     db.add(event)
     db.commit()
+    from ..notifications import notify_monitor_event
+    notify_monitor_event(event)
     return event
 
 
@@ -163,10 +167,8 @@ def run_monitor() -> int:
             # read-only historical evidence and must not trigger new advice.
             if model.type != "ensemble" or not model.is_official_strategy:
                 continue
-            # 交易级行情：扶摇优先 + 腾讯交叉 + 成本/日K校验，失败会写 ERROR 审计日志
-            quote = market.get_trade_quote(
-                pos.code, avg_cost=pos.avg_cost or None, require_cross_check=True,
-            )
+            # 交易级行情：扶摇快照 + 同源日 K/成本校验，失败会写审计日志
+            quote = market.get_trade_quote(pos.code, avg_cost=pos.avg_cost or None)
             if quote is None or not pos.avg_cost:
                 continue
             price, pct_change = quote["price"], quote["pct_change"]
@@ -199,6 +201,8 @@ def run_monitor() -> int:
                         )
                         db.add(event)
                         db.commit()
+                        from ..notifications import notify_monitor_event
+                        notify_monitor_event(event)
                         count += 1
                         continue
             logger.info(

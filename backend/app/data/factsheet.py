@@ -12,8 +12,9 @@ from typing import Any
 from ..factors.definitions import FACTOR_NAMES
 from ..factors.panel import latest_factor_snapshot
 from . import fuyao_client as fuyao
+from . import market
 from . import news_rss
-from .indicators import indicators_text
+from .indicators import indicators_text, latest_indicator_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +25,7 @@ def build_factsheet(
     asof: date | None = None,
     peer_codes: list[str] | None = None,
     use_tushare: bool = False,
+    factor_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """构建单票事实底稿：扶摇行情/因子 + RSS 资讯。"""
     del use_tushare
@@ -39,6 +41,7 @@ def build_factsheet(
         "factors": {},
         "quote": {},
         "valuation": {},
+        "technical": {},
         "technical_summary": "",
         "news": [],
         "missing": missing,
@@ -51,22 +54,20 @@ def build_factsheet(
 
     # 行情 + 估值（扶摇）
     try:
-        snaps = fuyao.prices_snapshot([code])
-        if snaps:
-            it = snaps[0]
-            # 扶摇 snapshot 实测字段
-            price = it.get("last_price") or it.get("close_price") or it.get("price")
-            pct = it.get("price_change_ratio_pct")
-            if pct is None:
-                pct = it.get("change_ratio") or it.get("pct_change")
+        quote = market.get_quote(code)
+        if quote:
+            price = quote.get("price")
+            pct = quote.get("pct_change")
             sheet["quote"] = {
                 "price": price,
                 "pct_change": pct,
-                "turnover": it.get("turnover") or it.get("amount"),
-                "volume": it.get("volume"),
+                "turnover": quote.get("turnover"),
+                "volume": quote.get("volume"),
+                "quote_asof": quote.get("quote_asof"),
+                "source": quote.get("source"),
             }
-            if it.get("name") and not name:
-                sheet["name"] = it["name"]
+            if quote.get("name") and not name:
+                sheet["name"] = quote["name"]
                 name = sheet["name"]
         else:
             missing.append("quote")
@@ -74,18 +75,29 @@ def build_factsheet(
         missing.append(f"quote:{err}")
 
     try:
-        val = fuyao.valuation_snapshot([code])
-        if not val.empty:
-            r = val.iloc[0]
+        if factor_data is not None:
+            ep = factor_data.get("ep")
+            bp = factor_data.get("bp")
             sheet["valuation"] = {
-                "pe": r.get("pe_ttm"),
-                "pb": r.get("pb"),
-                "ps": r.get("ps_ttm"),
+                "pe": (1.0 / float(ep)) if ep is not None and float(ep) > 0 else None,
+                "pb": (1.0 / float(bp)) if bp is not None and float(bp) > 0 else None,
+                "ps": None,
             }
-            if r.get("name") and not sheet.get("name"):
-                sheet["name"] = r["name"]
+            if not sheet["valuation"]["pe"] and not sheet["valuation"]["pb"]:
+                missing.append("valuation")
         else:
-            missing.append("valuation")
+            val = fuyao.valuation_snapshot([code])
+            if not val.empty:
+                r = val.iloc[0]
+                sheet["valuation"] = {
+                    "pe": r.get("pe_ttm"),
+                    "pb": r.get("pb"),
+                    "ps": r.get("ps_ttm"),
+                }
+                if r.get("name") and not sheet.get("name"):
+                    sheet["name"] = r["name"]
+            else:
+                missing.append("valuation")
     except Exception as err:  # noqa: BLE001
         missing.append(f"valuation:{err}")
 
@@ -102,6 +114,7 @@ def build_factsheet(
             })
             close = kline["收盘"].astype(float)
             kline["涨跌幅"] = (close.pct_change() * 100).round(2)
+            sheet["technical"] = latest_indicator_snapshot(kline)
             sheet["technical_summary"] = indicators_text(kline, days=40)
     except Exception as err:  # noqa: BLE001
         missing.append(f"technical:{err}")
@@ -111,7 +124,10 @@ def build_factsheet(
 
     # 新闻：Vibe 式 RSS
     try:
-        sheet["news"] = news_rss.news_for_stock(code, sheet.get("name") or name, limit=10)
+        # 大盘背景已在独立的 market_overview 中提供；这里仅允许个股直达新闻，
+        # 避免陈旧宏观头条被模型误当成该公司的催化或反证。
+        sheet["news"] = news_rss.news_for_stock(
+            code, sheet.get("name") or name, limit=10, include_general=False)
         if not sheet["news"]:
             missing.append("news")
     except Exception as err:  # noqa: BLE001
@@ -119,37 +135,51 @@ def build_factsheet(
         sheet["news"] = []
 
     # S2 因子截面
-    codes = list(dict.fromkeys([code] + (peer_codes or [])))
     try:
-        snap = latest_factor_snapshot(codes, asof=asof)
-        if snap.empty:
-            missing.append("factors")
-            for f in FACTOR_NAMES:
-                sheet["factors"][f] = None
-            sheet["factors"]["score"] = None
-            sheet["factors"]["rank"] = None
-        else:
-            row = snap[snap["code"] == code]
-            if row.empty:
+        if factor_data is not None:
+            if not factor_data:
                 missing.append("factors_self")
                 for f in FACTOR_NAMES:
                     sheet["factors"][f] = None
                 sheet["factors"]["score"] = None
                 sheet["factors"]["rank"] = None
             else:
-                r = row.iloc[0]
                 for f in FACTOR_NAMES:
-                    val = r.get(f)
-                    sheet["factors"][f] = (
-                        None if val is None or (isinstance(val, float) and val != val)
-                        else float(val)
-                    )
-                score = r.get("score")
-                sheet["factors"]["score"] = None if score != score else float(score)
-                ranked = snap.dropna(subset=["score"]).sort_values("score", ascending=False)
-                ranks = {c: i + 1 for i, c in enumerate(ranked["code"].astype(str).tolist())}
-                sheet["factors"]["rank"] = ranks.get(code)
-                sheet["factors"]["universe_size"] = int(len(ranked))
+                    sheet["factors"][f] = factor_data.get(f)
+                sheet["factors"]["score"] = factor_data.get("score")
+                sheet["factors"]["rank"] = factor_data.get("rank")
+                sheet["factors"]["universe_size"] = factor_data.get("universe_size")
+        else:
+            codes = list(dict.fromkeys([code] + (peer_codes or [])))
+            snap = latest_factor_snapshot(codes, asof=asof)
+            if snap.empty:
+                missing.append("factors")
+                for f in FACTOR_NAMES:
+                    sheet["factors"][f] = None
+                sheet["factors"]["score"] = None
+                sheet["factors"]["rank"] = None
+            else:
+                row = snap[snap["code"] == code]
+                if row.empty:
+                    missing.append("factors_self")
+                    for f in FACTOR_NAMES:
+                        sheet["factors"][f] = None
+                    sheet["factors"]["score"] = None
+                    sheet["factors"]["rank"] = None
+                else:
+                    r = row.iloc[0]
+                    for f in FACTOR_NAMES:
+                        val = r.get(f)
+                        sheet["factors"][f] = (
+                            None if val is None or (isinstance(val, float) and val != val)
+                            else float(val)
+                        )
+                    score = r.get("score")
+                    sheet["factors"]["score"] = None if score != score else float(score)
+                    ranked = snap.dropna(subset=["score"]).sort_values("score", ascending=False)
+                    ranks = {c: i + 1 for i, c in enumerate(ranked["code"].astype(str).tolist())}
+                    sheet["factors"]["rank"] = ranks.get(code)
+                    sheet["factors"]["universe_size"] = int(len(ranked))
     except Exception as err:  # noqa: BLE001
         logger.warning("factsheet factors %s: %s", code, err)
         missing.append(f"factors:{err}")
@@ -168,6 +198,7 @@ def factsheet_text(sheet: dict[str, Any]) -> str:
         "行情: " + json.dumps(sheet.get("quote") or {}, ensure_ascii=False),
         "估值: " + json.dumps(sheet.get("valuation") or {}, ensure_ascii=False),
         "S2因子: " + json.dumps(sheet.get("factors") or {}, ensure_ascii=False),
+        "结构化技术指标: " + json.dumps(sheet.get("technical") or {}, ensure_ascii=False),
         "",
         "技术摘要:",
         sheet.get("technical_summary") or "(无)",

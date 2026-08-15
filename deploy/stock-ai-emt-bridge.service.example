@@ -7,7 +7,9 @@ Wants=network-online.target
 Type=simple
 User=stock-ai
 Group=stock-ai
-WorkingDirectory=/opt/stock-ai/backend
+WorkingDirectory=/run/stock-ai-emt/backend
+RuntimeDirectory=stock-ai-emt
+BindReadOnlyPaths=/home/parker/code/stock-ai/backend:/run/stock-ai-emt/backend
 EnvironmentFile=/etc/stock-ai/emt-bridge.env
 Environment=PYTHONUNBUFFERED=1
 Environment=LD_LIBRARY_PATH=/opt/emt-api/python/lib/linux
@@ -18,7 +20,7 @@ UMask=0077
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/var/lib/stock-ai/broker
+ReadWritePaths=/var/lib/stock-ai/broker /var/lib/stock-ai/data/emt-orders
 
 [Install]
 WantedBy=multi-user.target

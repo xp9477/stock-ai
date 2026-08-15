@@ -1,6 +1,10 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from app.agents import llm
+from app.models import Position
 from app.runtime_settings import get_setting
 from app.trading import broker, portfolio
 
@@ -65,3 +69,73 @@ def test_decide_with_fallback_uses_extractor():
 def test_decide_with_fallback_gives_up_gracefully():
     with patch("app.agents.llm.chat", side_effect=RuntimeError("LLM down")):
         assert llm.decide_with_fallback("没有 JSON", "test-model") is None
+
+
+def test_retired_grok_45_is_rewritten_to_46():
+    assert llm.resolve_model_id("grok-4.5") == "grok-4.6"
+    assert llm.resolve_model_id("Grok-4-5") == "grok-4.6"
+    assert llm.resolve_model_id("grok-4.6") == "grok-4.6"
+    assert llm.resolve_model_id("gpt-5.6-sol-high") == "gpt-5.6-sol"
+    assert llm.resolve_model_id("gpt-5.6-sol") == "gpt-5.6-sol"
+
+
+def test_reasoning_effort_is_high_only_for_grok():
+    assert llm.reasoning_effort_for("grok-4.6") == "high"
+    assert llm.reasoning_effort_for("Grok-4.6") == "high"
+    assert llm.reasoning_effort_for("grok-4.5") == "high"
+    assert llm.reasoning_effort_for("gpt-5.6-sol-high") is None
+    assert llm.resolve_model_id("gemini-3.6-flash-high") == "gemini-3.7-flash-high"
+    assert llm.reasoning_effort_for("gemini-3.7-flash-high") is None
+
+
+def test_chat_sends_reasoning_effort_for_grok_only():
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+        )
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    with patch("app.agents.llm.get_client", return_value=client):
+        assert llm.chat("system", "user", "grok-4.5", retries=0) == "ok"
+    assert captured["model"] == "grok-4.6"
+    assert captured["extra_body"] == {"reasoning_effort": "high"}
+
+    captured.clear()
+    with patch("app.agents.llm.get_client", return_value=client):
+        assert llm.chat("system", "user", "gpt-5.6-sol", retries=0) == "ok"
+    assert captured["model"] == "gpt-5.6-sol"
+    assert "extra_body" not in captured
+
+
+def test_chat_rejects_empty_model_response():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=""))]
+    )
+    client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=lambda **_kwargs: response)
+        )
+    )
+    with patch("app.agents.llm.get_client", return_value=client):
+        with pytest.raises(RuntimeError, match="空内容"):
+            llm.chat("system", "user", "model", retries=0)
+
+
+def test_total_equity_ignores_zero_quantity_placeholders(db, model_a):
+    account = broker.get_account(db, model_a.id)
+    db.add(Position(
+        model_pk=model_a.id, code="018003", name="not_ready",
+        total_qty=0, available_qty=0, avg_cost=0.0,
+    ))
+    db.commit()
+
+    with patch("app.trading.portfolio.market.get_trade_quote") as quote:
+        equity = portfolio.total_equity(db, model_a.id)
+
+    quote.assert_not_called()
+    assert equity["total_equity"] == account.cash

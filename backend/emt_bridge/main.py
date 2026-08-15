@@ -9,6 +9,7 @@ import threading
 from pathlib import Path
 
 from .config import BridgeConfig, BridgeConfigError
+from .orders import process_inbox
 from .state import BridgeState
 
 
@@ -128,9 +129,25 @@ def run(config: BridgeConfig) -> None:
         while not stop.is_set() and not disconnected.is_set():
             if state.generation_in_flight():
                 state.fail_in_flight("previous reconciliation did not complete")
+            if config.sim_orders:
+                try:
+                    process_inbox(
+                        api=api, session=session,
+                        inbox=config.order_inbox, outbox=config.order_outbox,
+                    )
+                except Exception:  # noqa: BLE001
+                    LOG.exception("EMT sim inbox processing failed")
             issue_reconciliation(api, state, session, generation)
             generation += 1
             for _ in range(config.refresh_seconds):
+                if config.sim_orders:
+                    try:
+                        process_inbox(
+                            api=api, session=session,
+                            inbox=config.order_inbox, outbox=config.order_outbox,
+                        )
+                    except Exception:  # noqa: BLE001
+                        LOG.exception("EMT sim inbox processing failed")
                 if stop.wait(1) or disconnected.is_set():
                     break
         if disconnected.is_set() and not stop.is_set():
