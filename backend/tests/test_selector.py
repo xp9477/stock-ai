@@ -178,3 +178,29 @@ def test_run_selector_ignores_hallucinated_code(db, model_a):
     reply = json.dumps({"picks": [{"code": "999999", "reason": "臆造"}], "keep": []})
     run_selector_with(db, lambda *a, **k: reply)
     assert db.query(Watchlist).count() == 0
+def test_strategy_universe_rejects_untradable_st_and_unaffordable_lot():
+    with patch("app.data.market.get_quote", return_value={
+        "name": "正常股", "price": 10.0, "tradable": False,
+    }):
+        quote, reason = market.strategy_eligible_quote("600000")
+    assert quote is None and reason == "not_tradable"
+
+    with patch("app.data.market.get_quote", return_value={
+        "name": "*ST测试", "price": 10.0, "tradable": True,
+    }):
+        quote, reason = market.strategy_eligible_quote("600000")
+    assert quote is None and reason == "special_treatment_or_delisting"
+
+    # 默认单票上限为授权 10 万的 30%，301 元股票买一手需要 30,100 元。
+    with patch("app.data.market.get_quote", return_value={
+        "name": "高价股", "price": 301.0, "tradable": True,
+    }):
+        quote, reason = market.strategy_eligible_quote("600000")
+    assert quote is None and reason == "one_lot_exceeds_single_position_cap"
+
+
+def test_strategy_universe_accepts_affordable_regular_a_share():
+    expected = {"name": "普通股", "price": 100.0, "tradable": True}
+    with patch("app.data.market.get_quote", return_value=expected):
+        quote, reason = market.strategy_eligible_quote("600000")
+    assert quote == expected and reason == "eligible"

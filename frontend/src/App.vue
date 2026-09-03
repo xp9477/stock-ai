@@ -6,7 +6,7 @@
         <img class="brand-mark-img" src="/favicon.png" width="36" height="36" alt="" />
         <div>
           <div class="brand-name">Stock AI</div>
-          <div class="brand-tag">多模型赛马台</div>
+          <div class="brand-tag">决策与执行控制台</div>
         </div>
       </div>
       <nav class="nav">
@@ -65,19 +65,11 @@
           >停止</el-button>
           <el-button
             size="small"
-            type="warning"
-            plain
-            :loading="rebalancing"
-            :disabled="status.running || status.selecting"
-            @click="rebalance"
-          >规则调仓</el-button>
-          <el-button
-            size="small"
             type="primary"
             :loading="triggering"
             :disabled="status.running || status.selecting"
             @click="trigger"
-          >{{ isMobile ? 'AI 决策' : '立即 AI 决策' }}</el-button>
+          >{{ isMobile ? '生成计划' : '生成候选计划' }}</el-button>
         </div>
       </header>
 
@@ -85,7 +77,7 @@
         <span class="setup-label">待办</span>
         <router-link
           v-for="h in setupHints"
-          :key="h.to"
+          :key="`${h.to}:${h.text}`"
           class="setup-chip"
           :to="h.to"
         >{{ h.text }}</router-link>
@@ -101,7 +93,7 @@
         <img class="brand-mark-img" src="/favicon.png" width="36" height="36" alt="" />
         <div>
           <div class="brand-name">Stock AI</div>
-          <div class="brand-tag">多模型赛马台</div>
+          <div class="brand-tag">决策与执行控制台</div>
         </div>
       </div>
       <nav class="nav">
@@ -124,7 +116,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import api from './api/index.js'
 import { useIsMobile } from './composables/useIsMobile.js'
 
@@ -134,8 +126,8 @@ const NAV = [
   { path: '/research', label: '研究', icon: '✎' },
   { path: '/watchlist', label: '股池', icon: '▣' },
   { path: '/runs', label: '决策', icon: '☰' },
-  { path: '/orders', label: '成交', icon: '⇄' },
-  { path: '/models', label: '参赛账户', icon: '◇' },
+  { path: '/orders', label: '计划与票据', icon: '⇄' },
+  { path: '/models', label: '模型与策略', icon: '◇' },
   { path: '/settings', label: '设置', icon: '⚙' },
 ]
 
@@ -145,7 +137,6 @@ const { isMobile } = useIsMobile()
 const drawer = ref(false)
 const status = ref({})
 const triggering = ref(false)
-const rebalancing = ref(false)
 const cancelling = ref(false)
 let timer = null
 
@@ -169,7 +160,7 @@ const progressShort = computed(() => {
   return '决策中'
 })
 
-/** 关键就绪检查：密钥 / 股池 / 选手 / 规则尚未调仓 */
+/** 关键就绪检查：密钥 / 股池 / 判断模型。 */
 const setupHints = computed(() => {
   const s = status.value || {}
   const hints = []
@@ -183,10 +174,7 @@ const setupHints = computed(() => {
     hints.push({ to: '/watchlist', text: '添加股池' })
   }
   if ((s.llm_enabled_count ?? 0) === 0 && s.llm_configured !== false) {
-    hints.push({ to: '/models', text: '启用 AI 账户' })
-  }
-  if ((s.rule_enabled_count ?? 0) > 0 && s.rule_has_positions === false && s.fuyao_configured) {
-    hints.push({ to: '/strategies', text: '规则尚未调仓' })
+    hints.push({ to: '/models', text: '启用判断模型' })
   }
   return hints.slice(0, 4)
 })
@@ -240,7 +228,7 @@ async function trigger() {
   triggering.value = true
   try {
     await api.triggerRun()
-    ElMessage.success('AI 决策已启动，可点「查看过程」跟随流水线')
+    ElMessage.success('候选计划生成已启动，可点「查看过程」跟随决策证据链')
     await refreshStatus()
     setTimeout(async () => {
       await refreshStatus()
@@ -252,35 +240,6 @@ async function trigger() {
     ElMessage.error(err.message)
   } finally {
     triggering.value = false
-  }
-}
-
-async function rebalance() {
-  try {
-    await ElMessageBox.confirm(
-      '将对全部启用的规则策略（S2 / 池内等权 / 研究晋升臂）立即按当前股池调仓。非周一也可手动执行，会真实买卖模拟盘。',
-      '确认规则调仓',
-      { type: 'warning', confirmButtonText: '开始调仓', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  rebalancing.value = true
-  try {
-    const res = await api.rulesRebalance()
-    const results = res.results || []
-    const ok = results.filter((r) => r.ok).length
-    const fail = results.filter((r) => r.ok === false)
-    if (fail.length) {
-      const msg = fail.map((r) => `${r.model_id}: ${r.error || '失败'}`).join('；')
-      ElMessage.warning(`调仓完成 ${ok}/${results.length}。失败：${msg}`)
-    } else {
-      ElMessage.success(`规则调仓完成（${ok} 个策略）`)
-    }
-  } catch (err) {
-    ElMessage.error(err.message)
-  } finally {
-    rebalancing.value = false
   }
 }
 

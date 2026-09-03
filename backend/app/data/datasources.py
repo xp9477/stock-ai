@@ -3,7 +3,6 @@
 角色写死（不可拖拽重排）：
   fuyao   — 主行情/财务、选股截面主源
   sina    — 选股全市场兜底 + 指数/交易日历（AKShare，无 Key）
-  tencent — 实时行情与日 K
   tushare — 可选备份
   rss     — 公开新闻 RSS
 """
@@ -33,13 +32,6 @@ SOURCE_META: list[dict[str, str]] = [
         "id": "sina",
         "label": "新浪",
         "role": "选股全市场兜底 + 指数/交易日历（AKShare，无 Key）",
-        "needs_key": "false",
-        "key_setting": "",
-    },
-    {
-        "id": "tencent",
-        "label": "腾讯",
-        "role": "实时行情与日 K",
         "needs_key": "false",
         "key_setting": "",
     },
@@ -115,27 +107,6 @@ def _probe_sina() -> dict[str, Any]:
         return {"ok": False, "detail": str(err)[:200]}
 
 
-def _probe_tencent() -> dict[str, Any]:
-    if not is_enabled("tencent"):
-        return {"ok": False, "detail": "已禁用"}
-    import requests
-
-    t0 = time.perf_counter()
-    try:
-        to = timeout_sec("tencent", 10)
-        resp = requests.get("https://qt.gtimg.cn/q=sh600519", timeout=to)
-        resp.encoding = "gbk"
-        ok = '="' in (resp.text or "") and "贵州茅台" in resp.text
-        ms = int((time.perf_counter() - t0) * 1000)
-        return {
-            "ok": ok,
-            "detail": f"行情探测{'成功' if ok else '异常'} ({ms}ms)",
-            "latency_ms": ms,
-        }
-    except Exception as err:  # noqa: BLE001
-        return {"ok": False, "detail": str(err)[:200]}
-
-
 def _probe_tushare() -> dict[str, Any]:
     token = str(get_setting("secrets.tushare_token") or "").strip()
     if not is_enabled("tushare"):
@@ -175,7 +146,6 @@ def _probe_rss() -> dict[str, Any]:
 _PROBES: dict[str, Callable[[], dict[str, Any]]] = {
     "fuyao": _probe_fuyao,
     "sina": _probe_sina,
-    "tencent": _probe_tencent,
     "tushare": _probe_tushare,
     "rss": _probe_rss,
 }

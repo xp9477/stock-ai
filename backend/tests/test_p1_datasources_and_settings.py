@@ -48,6 +48,23 @@ def test_list_settings_exposes_danger(db):
     assert row["danger"] == "confirm"
 
 
+def test_trading_rate_settings_keep_wan1_precision(db):
+    items = {i["key"]: i for i in list_settings(group="trading", db=db)}
+    commission = items["trading.commission_rate"]
+    assert commission["default"] == 0.00025
+    assert commission["value"] == 0.00025
+    assert commission["precision"] == 6
+    assert commission["step"] == 0.00001
+
+    set_settings({"trading.commission_rate": 0.0001}, db)
+    assert get_setting("trading.commission_rate", db) == 0.0001
+    saved = next(
+        i for i in list_settings(group="trading", db=db)
+        if i["key"] == "trading.commission_rate"
+    )
+    assert saved["value"] == 0.0001
+
+
 def test_broker_fees_use_runtime_settings(monkeypatch):
     vals = {
         "trading.commission_rate": 0.001,

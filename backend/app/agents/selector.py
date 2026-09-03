@@ -137,9 +137,15 @@ def run_selector(trigger: str = "schedule") -> int | None:
             output2 = llm.chat(selector_prompt, user_input, model.model_id, retries=0)
             parsed = parse_selector_json(output2)
             output = output + "\n\n[重试输出]\n" + output2
-        db.add(AgentOutput(run_id=run_id, model_pk=model.id, code="SELECT",
-                           agent="selector", input_summary=user_input[:2000],
-                           output=output))
+        db.add(AgentOutput(
+            run_id=run_id,
+            model_pk=model.id,
+            code="SELECT",
+            agent="selector",
+            input_summary=user_input,
+            output=output,
+            **llm.audit_metadata(selector_prompt, user_input, output, model.model_id),
+        ))
         db.commit()
         if parsed is None:
             run.status = "failed"
@@ -190,6 +196,12 @@ def run_selector(trigger: str = "schedule") -> int | None:
     finally:
         run.finished_at = datetime.now()
         db.commit()
+        if run.status == "failed":
+            try:
+                from ..notifications import notify_selector_failure
+                notify_selector_failure(run_id, run.error)
+            except Exception:  # noqa: BLE001
+                logger.exception("选股失败通知调度异常（不影响 Run）")
         db.close()
         _select_lock = False
     return run_id

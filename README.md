@@ -1,135 +1,130 @@
-# Stock AI — A 股 AI 多智能体模拟交易系统
+# Stock AI
 
-参考 [TradingAgents](https://github.com/TauricResearch/TradingAgents) / [TradingAgents-CN](https://github.com/hsliuping/TradingAgents-CN) 架构的多 Agent 辩论式 LLM 决策引擎 + A 股模拟盘自动交易。
+面向 A 股的本地研究与人工确认交易工作台。系统的目标是检验 LLM 是否能在可复现的确定性框架上增加决策价值，而不是用“多角色辩论”制造确定感，也不承诺盈利。
 
-- **数据源**: [AKShare](https://github.com/akfamily/akshare)(免费、无 Token)
-- **LLM**: 任意 OpenAI 兼容接口(DeepSeek / 通义 / Kimi / GPT 等)
-- **模拟盘**: 虚拟资金 ¥1,000,000,遵守 A 股 T+1 / 整手 / 涨跌停 / 佣金印花税规则
-- **技术栈**: FastAPI + SQLite + APScheduler / Vue 3 + Element Plus + ECharts
+> 当前不是实盘自动交易系统。它没有真实券商执行适配器、API 身份认证或可靠的交易所/公司正式公告数据源，shadow 与至少半个月的前瞻验证也尚未形成自动证据链；`/api/status` 会据此报告 `live_funds_ready: false`。任何候选买卖都只能走人工确认票据，票据不等于成交。
 
-> ⚠️ 本项目仅供学习研究,不构成任何投资建议。模拟盘成交为理想化撮合,与实盘存在差异。
+## 核心设计
 
-## 多模型锦标赛
-
-每个 LLM 模型拥有**独立虚拟账户**,同一股池各自决策,收益曲线同屏对比;还可自定义**合议组合**(如 A+B、A+B+C):组合决策由成员模型当日最终决策多数票合成(过半才动手,仓位取获胜方均值),零额外 LLM 调用,同样挂独立账户参赛。
-
-## 决策流程
-
-**每交易日一次全量深度决策**(默认 14:35),每个模型对股池 + 持仓中的每只股票执行:
-
-```
-市场环境分析师 (大盘) ─────────────────┐
-技术分析师 ─┐                        ↓
-基本面分析师 ─┼→ 多空辩论 (2轮) → 交易员(注入大盘+历史反思) → 风控经理 → 硬性风控 → 模拟撮合
-新闻情绪分析师 ─┘                                                    ↓
-                                                    反思环节: 复盘近期交易 → 经验教训入库
-```
-
-**每日自动选股**(默认 14:05,决策前 30 分钟):新浪全市场快照规则初筛(排除 ST/北交所、价格 3-100 元、成交额 ≥2 亿、当日涨跌 -3%~+7%,按成交额取前 30)→ 一次 LLM 调用结合大盘环境精选入**共享股池**(上限 8 只,含手动股)。AI 自动入池的股票若无任何账户持仓且连续 3 个选股日未被继续看好则自动移除;手动添加的永不自动移除。选股推理全文可在「决策记录」回放,股池页也可手动触发「AI 选股」。
-
-**盘中监控**(每 15 分钟,纯规则零 LLM):持仓浮盈 ≥+15% 或浮亏 ≤-8% 时触发单次 LLM 复审(AI 自主决定卖出/持有,每股每日 1 次);浮亏 ≤-15% 为深亏,复审频率提升(至少间隔 1 小时),**无任何无条件强制清仓**,决定权始终在 AI。
-
-代码层硬性风控(不依赖 LLM):单票 ≤30% 总资产、单次买入 ≤50% 可用资金、总仓位 ≤90%。
-
-## 快速开始 (Docker,推荐)
-
-```bash
-mkdir stock-ai && cd stock-ai
-curl -O https://raw.githubusercontent.com/xp9477/stock-ai/main/docker-compose.yml
-curl -o .env https://raw.githubusercontent.com/xp9477/stock-ai/main/.env.example
-# 编辑 .env 填入你的 LLM_API_KEY
-docker compose up -d       # http://localhost:8000
+```text
+确定性可交易股池
+        ↓
+同一份冻结、账户盲的事实快照
+        ↓
+多个独立 LLM 判断（互相不可见）
+        ↓
+最终交易员（可见持仓、成本和盈亏）
+        ↓
+风险复核（可见高水位、回撤和剩余亏损预算）
+        ↓
+收盘后条件计划
+        ↓
+盘前增量信息门禁 → 盘中最新价格门禁 → 资金/Canary 重算 → 人工强确认
+        ↓
+待执行票据（尚未成交）
 ```
 
-- 数据(SQLite)持久化在 `./data/stock_ai.db`
-- **更新版本**: `docker compose pull && docker compose up -d`
-- 镜像由 GitHub Actions 在每次 push 到 main 后自动构建: `ghcr.io/xp9477/stock-ai:latest`(amd64/arm64)
+- LLM 只能在代码筛出的合格标的内决策；停牌、ST/退市风险、板块限制、无可靠报价以及一手成本超过边界的标的会先被排除。
+- 独立判断模型看不到账户、成本和盈亏，避免损失厌恶或盈利锚定污染研究判断。
+- 最终交易员拥有实质决策权，但不能绕过资金边界、信息门禁、报价门禁或人工确认。
+- 只有数据库唯一标记且已启用的官方 ensemble 能拥有资金账户和生成票据；旧库多 ensemble 无法唯一迁移时全部失败关闭，不能靠名称或创建接口猜测官方身份。
+- 分析输出是条件计划，包含目标仓位、最高买价、有效期、论点和失效条件；`BUY` 文本本身没有执行权限。
+- 盘中监控只产生告警或复审任务，不自动卖出，也不存在 `-15%` 强制清仓。
+
+## 资金契约
+
+Canary 阶段只授权策略管理 `¥100,000`，股票总敞口硬上限 `¥80,000`。系统不会把个人其他资金告诉 LLM，也不会因为 LLM 建议而提高授权。
+
+- 最大持仓数默认 3，只是待历史验证的候选参数。
+- 单票仓位默认不超过授权资产的 30%；单次买入默认不超过策略可用现金的 50%。
+- 账户回撤 `¥5,000`、`¥10,000` 只告警，不会自动降仓。
+- 回撤达到 `¥15,000` 后 Canary 状态永久锁止新增买入；已有持仓不会被自动卖出，人工确认卖出仍允许。
+- 所有会影响收益的非资金参数必须带证据角色，并通过确定性历史验证；资金契约不是为了优化回测收益而调参。
+
+## 隔夜与盘中变化
+
+收盘后的 LLM 只生成下一交易日候选计划；代码从可证明的交易日历计算下一交易日 `09:30` 起始窗口，在此之前即使有报价也不能批准。执行前服务端会重新检查：
+
+1. 分析截止后是否出现新的个股新闻；RSS 只作补充。正式公告源尚未接入时，用户必须明确确认已在交易所或公司渠道核对公告。
+2. 当前报价是否新鲜、可交易，是否超过 LLM 给出的最高买价或计划有效期。
+3. 相对分析参考价的绝对偏离是否达到暂定 5% 失效线。
+4. 开盘缺口是否超过该股票近 60 个交易日的 95% 历史分位；样本不足时门禁失败关闭。
+5. 当前全部持仓、尚未过期的买入票据、可用现金、整手数量、持仓名额、总敞口和 Canary 是否仍允许新增风险。
+
+审批时信息、价格和资金三道门禁会在服务端重跑；持仓估值缺少执行级新鲜报价时禁止新买。并发请求受锁版本和幂等键约束，同一计划最多生成一张待执行票据；系统会把最终允许的股数、金额、估算费用和风险快照冻结在票据中，未过期票据也会预占后续票据的资金与持仓名额。
+
+## 回测与前瞻证据
+
+- 传统回测只验证确定性的选股、仓位、费用、价格门禁和风险参数；LLM 不伪装成可回放的历史模型。
+- 实验冻结规范、代码字节、运行配置、完整数据面板、点时股池和知识截止时间，并以内容哈希标识。
+- development 与 holdout 分离；一场冻结 campaign 只能原子选择一个候选打开 holdout，结果只追加、不可覆盖。
+- 晋升必须精确绑定同一 experiment 的规范哈希及 development/holdout 结果，不能使用可编辑假说上的旧结果。
+- 每个生产 Run 会在 LLM 判断前冻结唯一、不可变的 `RunMarketArtifact`，绑定统一 cutoff、分析股池、确定性合格股池以及带来源/时间戳的参考报价；候选若与该 artifact 分叉会在调用 LLM 前失败关闭。
+- 零资本 shadow 的不可变模型与服务只能从该 artifact 派生同一 Run/cutoff/合格股池的等权基准，不接受调用者自报的股池或哈希，不创建账户、现金、订单或持仓，也不调用 broker；snapshot/未来 mark 尚未自动调度，因此不能冒充已有前瞻结果。
+
+SQLite 连接强制启用外键。交易判断、门禁、票据授权字段、实验结果和 shadow 证据均按审计记录保留；票据状态和成交引用可以按生命周期推进，但批准时的价格、数量、金额与风险快照不可改写。“重置全部账户”接口已禁用，不会用清库掩盖结果。
+
+## 调度
+
+默认时刻（Asia/Shanghai）：
+
+- `15:30`：收盘后更新候选股池。
+- `16:00`：运行冻结事实快照和条件计划流水线。
+- 交易时段每 `5` 分钟：检查异常价格和持仓告警；只创建复审事件。
+
+交易日历或交易报价不可证明时会失败关闭，不按普通工作日或缓存价格猜测可交易状态。
 
 ## 本地开发
 
-### 1. 后端
+### 后端（Windows PowerShell）
+
+```powershell
+cd backend
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+Copy-Item .env.example .env
+# 编辑 .env，至少填写 LLM_API_KEY；需要行情/财务数据时填写 FUYAO_API_KEY
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --port 8000
+```
+
+### 后端（Linux/macOS）
 
 ```bash
 cd backend
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
-cp .env.example .env   # 编辑填入你的 LLM_API_KEY
-uvicorn app.main:app --port 8000
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+cp .env.example .env
+.venv/bin/python -m uvicorn app.main:app --port 8000
 ```
 
-### 2. 前端
+### 前端
 
 ```bash
 cd frontend
-npm install
-npm run dev            # http://localhost:5173
+npm ci
+npm run dev
 ```
 
-### 3. 使用
+前端开发地址为 `http://localhost:5173`，后端为 `http://localhost:8000`。Docker 默认仅绑定 `127.0.0.1:8000`；若显式开放到局域网，请自行增加认证和反向代理保护。
 
-1. 打开前端 → 「股池管理」添加自选股(如 `600519`、`300750`,不支持 ST/北交所),或点「AI 选股」让 AI 自动挑选
-2. 「模型管理」调整参赛模型与合议组合(默认三模型 + 三模合议)
-3. 点击右上角「立即运行一轮」,或等待每日定时决策(默认交易日 14:35)
-4. 「决策记录」按模型查看各 Agent 报告、辩论、大盘环境与反思;「仪表盘」看排行榜与多曲线对比
+## 验证
 
-## 赛马底座（已落地）
-
-北极星：**可验证 edge**（夏普/回撤/超额），不是胜率。规则因子组 vs AI 同场；AI 吃同一 X1 事实底稿（含 S2 因子）。
-
-| 模块 | 说明 |
-|---|---|
-| S2 因子 | 短动量 / 中动量 / 低波动 / EP / BP / 质量(ROE)，截面 z 分等权合成，周频前 10 等权 |
-| 回测 | `POST /api/backtest/run`：池内等权锚 + 因子周频；指标含夏普、最大回撤、样本门槛标记 |
-| 事实底稿 | `GET /api/factsheet/{code}`；决策流水线注入全部 AI 臂 |
-| 账本 | `trade_ledger` + `GET /api/ledger/stats`（100 笔平仓门槛） |
-| 规则组前瞻 | `S2周频前10` + `池内等权` 独立模拟账户；`POST /api/rules/rebalance`；周一 14:50 自动调仓 |
-| 盘中分层 | 深亏强制砍；浅止损/止盈仅告警 |
-
-数据分层：
-
-- **主源**：同花顺[扶摇](https://fuyao.aicubes.cn/)（`FUYAO_API_KEY`）— 日 K / 估值 / 财务指标 / 后续 ETF  
-- **新闻**：Vibe 路线公开 RSS（零 Key，本地抓取）  
-- **不做**免费源降级/交叉校验；不够用再上 Tushare
-
-## 配置(backend/.env)
-
-| 变量 | 说明 | 默认 |
-|---|---|---|
-| `LLM_BASE_URL` | OpenAI 兼容接口地址(所有模型共用) | `https://api.deepseek.com` |
-| `LLM_API_KEY` | API Key | - |
-| `FUYAO_API_KEY` | 同花顺扶摇 API Key（主数据源） | - |
-| `INITIAL_CASH` | 每个模型账户初始虚拟资金 | `1000000` |
-| `SCHEDULE_ENABLED` | 开启定时调度 | `true` |
-| `STOCK_SELECT_ENABLED` | 开启每日自动选股 | `true` |
-| `STOCK_SELECT_TIME` | 自动选股时刻 | `14:05` |
-| `POOL_MAX` | 共享股池上限 | `30` |
-| `FACTOR_TOP_N` | 因子组合持仓只数 | `10` |
-| `DAILY_DECISION_TIME` | 每日全量决策时刻 | `14:35` |
-| `MONITOR_INTERVAL_MINUTES` | 盘中监控间隔(分钟) | `15` |
-| `TAKE_PROFIT_REVIEW_PCT` | 止盈警戒线（仅告警） | `0.15` |
-| `STOP_LOSS_REVIEW_PCT` | 止损警戒线（仅告警） | `-0.08` |
-| `DEEP_LOSS_PCT` | 深亏强制砍仓阈值 | `-0.15` |
-| `RACE_MIN_TRADE_DAYS` | 样本门槛：交易日 | `60` |
-| `RACE_MIN_CLOSED_TRADES` | 样本门槛：平仓笔数 | `100` |
-| `DB_PATH` | SQLite 路径(Docker 内为 `/data/stock_ai.db`) | `stock_ai.db` |
-
-模型名单不在 `.env` 配置,在前端「模型管理」页维护(默认种子: Grok 4.5 / Opus 5 / Fable 5 + 三模合议)。
-
-## 测试
-
-```bash
-cd backend && .venv/bin/pytest tests/ -v
+```powershell
+backend\.venv\Scripts\python.exe -m pytest backend\tests -q
+cd frontend
+npm test -- --run
+npm run build
 ```
 
-覆盖:撮合规则(T+1/整手/涨跌停/费用)、风控硬规则、技术指标计算、Agent 流水线编排与 JSON 解析容错(mock LLM)。
+重点覆盖：严格 JSON 决策契约、账户信息隔离、资金与 Canary 边界、A 股报价安全、候选计划门禁与幂等审批、无自动成交、证据不可删除、可复现实验以及零资本 shadow 不产生资金副作用。
 
-## 说明
+## 实盘前的硬阻断
 
-- 非交易时段手动触发仍可运行,以最近价格撮合,便于调试。
-- 每只股票每模型一轮约 9 次 LLM 调用(另每模型每轮 1 次大盘 + 1 次反思),合议组合零调用,注意 token 成本。
-- **从 v1 升级**: 数据库 schema 有破坏式变更,请删除旧 `data/stock_ai.db` 后重启。
-- 数据库为 SQLite 单文件(本地开发 `backend/stock_ai.db`,Docker 部署 `./data/stock_ai.db`),删除即全部重置。
+即使模拟期表现良好，在以下条件完成前也不应投入真实资金：
 
-## 维护者说明
+- 接入并验证交易所/公司正式公告源，取消对人工“已核对”的弱证明依赖。
+- 实现与真实券商隔离的显式执行适配器、成交回报核对、撤单和故障恢复；默认仍须逐笔人工确认。
+- 把生产 Run 已冻结的可信 artifact 自动转成 shadow snapshot、由可信 point-in-time 行情追加未来 mark，并积累至少半个月及后续足量未见样本；不能只看回测或几天模拟结果。
+- 对部署版本执行完整后端、前端和浏览器端到端验证，并保留对应代码/配置/数据指纹。
 
-- CI: `.github/workflows/docker.yml`,push 到 main 自动构建 amd64 镜像并推送 `latest` 与 `sha-<commit>` 双 tag 到 GHCR(包已继承仓库公开可见性,可匿名拉取)。
+本项目仅用于研究和个人决策辅助，不构成投资建议。市场损失可能超过历史样本所展示的范围。

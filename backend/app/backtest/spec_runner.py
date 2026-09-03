@@ -6,13 +6,19 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from ..factors.score import composite_scores, select_top_n
 from ..runtime_settings import get_setting
+from .execution import (
+    ExecutionCostModel,
+    rebalance_equal_weight,
+    sell_position,
+)
 from .engine import (
     BacktestResult,
-    _is_week_start,
+    _mark_to_market,
     _pivot_close,
-    _roundtrip_fee_rate,
+    _rebalance_dates,
+    _select_factor_codes,
+    _valuation_closes,
     run_equal_weight_buyhold,
 )
 from .metrics import compute_metrics, mark_sample_ok
@@ -58,31 +64,21 @@ def _run_factor_spec(
     if closes.empty:
         eq = pd.Series(dtype=float)
         return BacktestResult(name=name, equity=eq, metrics=compute_metrics(eq))
+    valuation_closes = _valuation_closes(closes)
 
     dates = sorted(df["date"].unique())
     score_by_date: dict[Any, list[str]] = {}
+    if factors:
+        declared_factors = factors
+    else:
+        from ..factors.definitions import FACTOR_NAMES
+        declared_factors = list(FACTOR_NAMES)
     for dt in dates:
         snap = df[df["date"] == dt].copy()
-        if factors:
-            scored = composite_scores(snap, factors)
-        else:
-            from ..factors.definitions import FACTOR_NAMES
-            scored = composite_scores(snap, FACTOR_NAMES)
-        score_by_date[dt] = select_top_n(scored, n=top_n)
+        score_by_date[dt] = _select_factor_codes(
+            snap, declared_factors, top_n)
 
-    if rebalance.startswith("W"):
-        rebal_set = {d for d in closes.index if _is_week_start(d, closes.index)}
-    else:
-        # 月频：每月第一个交易日
-        rebal_set = set()
-        seen_months: set[str] = set()
-        for d in closes.index:
-            key = pd.Timestamp(d).strftime("%Y-%m")
-            if key not in seen_months:
-                seen_months.add(key)
-                rebal_set.add(d)
-    rebal_set.add(closes.index[0])
-
+    rebal_set = _rebalance_dates(closes.index, rebalance)
     cash = float(initial_cash)
     holdings: dict[str, float] = {}
     cost: dict[str, float] = {}  # 成本价
@@ -90,7 +86,7 @@ def _run_factor_spec(
     equity_vals = []
     holdings_log = []
     closed_trades = 0
-    fee_rt = _roundtrip_fee_rate()
+    cost_model = ExecutionCostModel.from_settings()
 
     stop = None
     take = None
@@ -113,15 +109,22 @@ def _run_factor_spec(
             ma[c] = closes[c].rolling(ma_win, min_periods=max(2, ma_win // 2)).mean()
 
     day_i = 0
+    previous_dt = None
+    previous_row = None
     for dt, row in closes.iterrows():
-        # 事件：止损/止盈/均线/持有天数
+        valuation_row = valuation_closes.loc[dt]
+        # 事件信号基于上一交易日收盘，在当前交易日价格执行。
         for c in list(holdings.keys()):
-            px = row.get(c)
-            if px is None or not np.isfinite(px) or float(px) <= 0:
+            signal_px = previous_row.get(c) if previous_row is not None else None
+            execution_px = row.get(c)
+            if (signal_px is None or execution_px is None
+                    or not np.isfinite(signal_px) or not np.isfinite(execution_px)
+                    or float(execution_px) <= 0):
                 continue
-            px = float(px)
-            basis = cost.get(c) or px
-            pnl = px / basis - 1 if basis else 0
+            signal_px = float(signal_px)
+            execution_px = float(execution_px)
+            basis = cost.get(c) or signal_px
+            pnl = signal_px / basis - 1 if basis else 0
             exit_pos = False
             if stop is not None and pnl <= stop:
                 exit_pos = True
@@ -129,71 +132,83 @@ def _run_factor_spec(
                 exit_pos = True
             if hold_max is not None and c in entry_i and (day_i - entry_i[c]) >= hold_max:
                 exit_pos = True
-            if ma_win and c in ma:
-                mv = ma[c].get(dt) if hasattr(ma[c], "get") else ma[c].loc[dt] if dt in ma[c].index else None
+            if ma_win and c in ma and previous_dt is not None:
+                mv = (
+                    ma[c].get(previous_dt)
+                    if hasattr(ma[c], "get")
+                    else ma[c].loc[previous_dt] if previous_dt in ma[c].index else None
+                )
                 try:
-                    if mv is not None and np.isfinite(mv) and px < float(mv):
+                    if mv is not None and np.isfinite(mv) and signal_px < float(mv):
                         exit_pos = True
                 except Exception:  # noqa: BLE001
                     pass
             if exit_pos:
-                cash += holdings[c] * px * (1 - fee_rt * 0.25)
+                sale = sell_position(
+                    cash=cash,
+                    code=c,
+                    quantity=holdings[c],
+                    midpoint=execution_px,
+                    cost_model=cost_model,
+                )
+                if sale is None:
+                    continue
+                cash = sale[0]
                 del holdings[c]
                 cost.pop(c, None)
                 entry_i.pop(c, None)
                 closed_trades += 1
 
-        if dt in rebal_set or (not holdings and dt == closes.index[0]):
-            target_codes = score_by_date.get(dt) or []
-            # 找最近截面
-            if not target_codes:
-                prev = [d for d in score_by_date if d <= dt]
-                if prev:
-                    target_codes = score_by_date[max(prev)]
-
-            port_val = cash
-            for c, q in holdings.items():
-                px = row.get(c)
-                if px is not None and np.isfinite(px):
-                    port_val += q * float(px)
-
-            new_set = set(target_codes)
-            for c in list(holdings.keys()):
-                if c not in new_set:
-                    closed_trades += 1
-
-            port_val *= (1 - fee_rt * 0.5)
-            holdings = {}
+        if previous_dt is not None and dt in rebal_set:
+            target_codes = score_by_date.get(previous_dt) or []
+            previous_holdings = dict(holdings)
+            previous_cost = dict(cost)
+            previous_entry = dict(entry_i)
+            rebalanced = rebalance_equal_weight(
+                cash=cash,
+                holdings=holdings,
+                execution_prices=row,
+                valuation_prices=valuation_row,
+                target_codes=target_codes,
+                cost_model=cost_model,
+            )
+            cash = rebalanced.cash
+            holdings = rebalanced.holdings
+            closed_trades += rebalanced.closed_positions
             cost = {}
             entry_i = {}
-            cash = 0.0
-            buyable = []
-            for c in target_codes:
-                px = row.get(c)
-                if px is not None and np.isfinite(px) and float(px) > 0:
-                    buyable.append(c)
-            if buyable:
-                w = port_val / len(buyable)
-                for c in buyable:
-                    px = float(row[c])
-                    holdings[c] = w / px
-                    cost[c] = px
+            for c, quantity in holdings.items():
+                old_quantity = previous_holdings.get(c, 0.0)
+                if old_quantity > 0:
+                    old_cost = previous_cost.get(c, float(row.get(c) or 0.0))
+                    if quantity > old_quantity:
+                        added = quantity - old_quantity
+                        fill = cost_model.fill_price(float(row[c]), "buy")
+                        cost[c] = (
+                            old_quantity * old_cost + added * fill
+                        ) / quantity
+                    else:
+                        cost[c] = old_cost
+                    entry_i[c] = previous_entry.get(c, day_i)
+                else:
+                    midpoint = float(row[c])
+                    cost[c] = cost_model.fill_price(midpoint, "buy")
                     entry_i[c] = day_i
-            else:
-                cash = port_val
             holdings_log.append({
                 "date": str(dt)[:10],
-                "codes": buyable,
-                "n": len(buyable),
+                "signal_date": str(previous_dt)[:10],
+                "codes": sorted(holdings),
+                "target_codes": target_codes,
+                "n": len(holdings),
+                "fees": rebalanced.fees,
+                "turnover": rebalanced.turnover,
+                "untradeable_codes": list(rebalanced.untradeable_codes),
             })
         day_i += 1
 
-        val = cash
-        for c, q in holdings.items():
-            px = row.get(c)
-            if px is not None and np.isfinite(px):
-                val += q * float(px)
-        equity_vals.append(val)
+        equity_vals.append(_mark_to_market(cash, holdings, valuation_row))
+        previous_dt = dt
+        previous_row = row
 
     eq = pd.Series(equity_vals, index=closes.index)
     bench = run_equal_weight_buyhold(panel, initial_cash=initial_cash)
@@ -246,6 +261,7 @@ def _run_equal_with_events(
     if closes.empty:
         eq = pd.Series(dtype=float)
         return BacktestResult(name=name, equity=eq, metrics=compute_metrics(eq))
+    valuation_closes = _valuation_closes(closes)
 
     events = list(spec.get("events") or [])
     stop = take = None
@@ -263,50 +279,66 @@ def _run_equal_with_events(
         for c in closes.columns:
             ma[c] = closes[c].rolling(ma_win, min_periods=max(2, ma_win // 2)).mean()
 
-    from .engine import _fee_rate
-    fee = _fee_rate()
-    fee_rt = _roundtrip_fee_rate()
-    first = closes.iloc[0]
+    cost_model = ExecutionCostModel.from_settings()
+    first = valuation_closes.iloc[0]
     valid = first.dropna()
     if valid.empty:
         eq = pd.Series(dtype=float)
         return BacktestResult(name=name, equity=eq, metrics=compute_metrics(eq))
 
-    cash_deployed = initial_cash * (1 - fee)
-    w = cash_deployed / len(valid)
-    holdings = {c: w / float(first[c]) for c in valid.index}
-    cost = {c: float(first[c]) for c in valid.index}
-    cash = 0.0
+    opening = rebalance_equal_weight(
+        cash=float(initial_cash), holdings={},
+        execution_prices=first, valuation_prices=first,
+        target_codes=[str(code) for code in valid.index],
+        cost_model=cost_model,
+    )
+    holdings = opening.holdings
+    cost = {
+        c: cost_model.fill_price(float(first[c]), "buy") for c in holdings
+    }
+    cash = opening.cash
     closed = 0
     equity_vals = []
+    previous_dt = None
+    previous_row = None
     for dt, row in closes.iterrows():
+        valuation_row = valuation_closes.loc[dt]
         for c in list(holdings.keys()):
-            px = row.get(c)
-            if px is None or not np.isfinite(px):
+            signal_px = previous_row.get(c) if previous_row is not None else None
+            execution_px = row.get(c)
+            if (signal_px is None or execution_px is None
+                    or not np.isfinite(signal_px) or not np.isfinite(execution_px)):
                 continue
-            px = float(px)
-            basis = cost.get(c) or px
-            pnl = px / basis - 1
+            signal_px = float(signal_px)
+            execution_px = float(execution_px)
+            basis = cost.get(c) or signal_px
+            pnl = signal_px / basis - 1
             exit_pos = False
             if stop is not None and pnl <= stop:
                 exit_pos = True
             if take is not None and pnl >= take:
                 exit_pos = True
-            if ma_win and c in ma and dt in ma[c].index:
-                mv = ma[c].loc[dt]
-                if np.isfinite(mv) and px < float(mv):
+            if ma_win and c in ma and previous_dt in ma[c].index:
+                mv = ma[c].loc[previous_dt]
+                if np.isfinite(mv) and signal_px < float(mv):
                     exit_pos = True
             if exit_pos:
-                cash += holdings[c] * px * (1 - fee_rt * 0.25)
+                sale = sell_position(
+                    cash=cash,
+                    code=c,
+                    quantity=holdings[c],
+                    midpoint=execution_px,
+                    cost_model=cost_model,
+                )
+                if sale is None:
+                    continue
+                cash = sale[0]
                 del holdings[c]
                 cost.pop(c, None)
                 closed += 1
-        val = cash
-        for c, q in holdings.items():
-            px = row.get(c)
-            if px is not None and np.isfinite(px):
-                val += q * float(px)
-        equity_vals.append(val)
+        equity_vals.append(_mark_to_market(cash, holdings, valuation_row))
+        previous_dt = dt
+        previous_row = row
 
     eq = pd.Series(equity_vals, index=closes.index)
     metrics = mark_sample_ok(

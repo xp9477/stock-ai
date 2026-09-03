@@ -48,7 +48,7 @@ def test_list_sources_status_shape(db):
     invalidate_cache()
     sources = list_sources_status()
     ids = {s["id"] for s in sources}
-    assert {"fuyao", "sina", "tencent", "tushare", "rss"}.issubset(ids)
+    assert ids == {"fuyao", "sina", "tushare", "rss"}
     sina = next(s for s in sources if s["id"] == "sina")
     assert sina["needs_key"] is False
     assert sina["enabled"] is True

@@ -3,7 +3,9 @@ services:
     image: ghcr.io/xp9477/stock-ai:latest
     container_name: stock-ai
     ports:
-      - "8000:8000"
+      # 默认仅本机可访问；确需局域网访问时显式设置 BIND_ADDRESS=0.0.0.0，
+      # 并在反向代理层增加认证。
+      - "${BIND_ADDRESS:-127.0.0.1}:${HOST_PORT:-8000}:8000"
     volumes:
       - ./data:/data
     env_file:

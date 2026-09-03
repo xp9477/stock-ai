@@ -1,31 +1,28 @@
-"""多模型决策引擎:每个 LLM 模型独立跑 分析师->辩论->交易员->风控 流水线,
-之后合议组合按成员决策纯代码合成;含市场环境分析师与反思记忆。
+"""多模型条件交易计划引擎。
 
-P0：进程内进度快照 + 协作式取消（当前 Agent 结束后不再开新票/新 Agent）。
-LLM 模型之间线程池并发（各自独立 Session），合议在全部 LLM 完成后串行合成。
+所有独立模型只读取同一份冻结且账户盲化的事实快照；最终交易员与风险复核
+使用不同模型。流水线只生成可审计的 ``TradePlan``，绝不在分析阶段成交。
 """
 import json
+import hashlib
 import logging
+import math
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy.orm import Session
 
 from ..data import market
-from ..data.indicators import indicators_text
-from ..models import (AgentOutput, Decision, Model, Order, Position,
-                      Reflection, Run, Watchlist)
+from ..models import (AgentOutput, Decision, Model, Position, Run, RunMarketArtifact,
+                      TradeLedger, Watchlist)
 from ..runtime_settings import get_setting
 from ..trading import broker, portfolio
 from . import llm
 
 logger = logging.getLogger(__name__)
-
-MARKET_CODE = "MARKET"
-REFLECT_CODE = "REFLECT"
 
 # ---------- 运行锁 / 进度 / 取消 ----------
 
@@ -91,27 +88,29 @@ def _check_cancel() -> None:
         raise PipelineCancelled("用户取消")
 
 
-def _verbose() -> bool:
-    try:
-        return bool(get_setting("debug.pipeline_verbose"))
-    except Exception:  # noqa: BLE001
-        return False
-
-
 def _save_output(db: Session, run_id: int, model_pk: int, code: str, agent: str,
-                 input_summary: str, output: str):
+                 input_summary: str, output: str, *, system_prompt: str,
+                 model_id: str):
+    audit = llm.audit_metadata(system_prompt, input_summary, output, model_id)
     db.add(AgentOutput(run_id=run_id, model_pk=model_pk, code=code, agent=agent,
-                       input_summary=input_summary[:2000], output=output))
+                       input_summary=input_summary, output=output, **audit))
     db.commit()
 
 
 def _position_context(db: Session, model_pk: int, code: str) -> str:
     eq = portfolio.total_equity(db, model_pk)
+    from ..trading import risk_contract
+    contract = risk_contract.load_capital_contract()
+    state = risk_contract.refresh_canary_state(
+        db, model_pk, actual_total_equity=eq["total_equity"],
+        account_initial_cash=eq["initial_cash"], contract=contract)
     pos = broker.get_position(db, model_pk, code)
+    authorized_cash = max(state.risk_equity - eq["market_value"], 0.0)
     lines = [
-        f"总资产: {eq['total_equity']:.0f} 元",
-        f"可用资金: {eq['cash']:.0f} 元",
-        f"总仓位: {eq['market_value'] / eq['total_equity']:.1%}" if eq['total_equity'] else "总仓位: 0%",
+        f"授权资金: {contract.authorized_capital:.0f} 元",
+        f"策略风险权益: {state.risk_equity:.0f} 元",
+        f"授权范围内可用资金: {authorized_cash:.0f} 元",
+        f"股票敞口: {eq['market_value']:.0f}/{contract.max_stock_exposure:.0f} 元",
     ]
     if pos:
         quote = market.get_quote(code)
@@ -120,7 +119,7 @@ def _position_context(db: Session, model_pk: int, code: str) -> str:
         lines += [
             f"当前持有 {pos.total_qty} 股 (今日可卖 {pos.available_qty} 股)",
             f"持仓成本 {pos.avg_cost:.2f} 元, 现价 {price:.2f} 元, 浮动盈亏 {pnl_pct:.1%}",
-            f"该股仓位占总资产 {pos.total_qty * price / eq['total_equity']:.1%}" if eq['total_equity'] else "",
+            f"该股仓位占授权资金 {pos.total_qty * price / contract.authorized_capital:.1%}",
         ]
         if pnl_pct <= float(get_setting("risk.stop_loss_alert_pct")):
             lines.append("⚠️ 警告: 该持仓浮亏已超过止损提示线,必须评估是否止损!")
@@ -129,27 +128,58 @@ def _position_context(db: Session, model_pk: int, code: str) -> str:
     return "\n".join(filter(None, lines))
 
 
-def recent_reflections(db: Session, model_pk: int, limit: int = 5) -> str:
-    rows = (db.query(Reflection).filter(Reflection.model_pk == model_pk)
-            .order_by(Reflection.id.desc()).limit(limit).all())
-    if not rows:
-        return "(暂无历史经验)"
-    return "\n".join(f"- {r.content}" for r in reversed(rows))
+def _risk_context(db: Session, model_pk: int) -> str:
+    """风险模型专用上下文；独立判断模型绝不能调用。"""
+    from ..trading import risk_contract
+
+    eq = portfolio.total_equity(db, model_pk)
+    contract = risk_contract.load_capital_contract()
+    state = risk_contract.refresh_canary_state(
+        db, model_pk, actual_total_equity=eq["total_equity"],
+        account_initial_cash=eq["initial_cash"], contract=contract)
+    realized = sum(
+        float(row.pnl or 0.0)
+        for row in db.query(TradeLedger).filter(
+            TradeLedger.model_pk == model_pk,
+            TradeLedger.is_closed.is_(True),
+        ).all()
+    )
+    unrealized = 0.0
+    for pos in db.query(Position).filter(Position.model_pk == model_pk).all():
+        value = portfolio.position_value(pos)
+        unrealized += value - pos.avg_cost * pos.total_qty
+    remaining = max(contract.canary_stop_drawdown - state.drawdown, 0.0)
+    return "\n".join([
+        f"Canary状态: {state.status}",
+        f"授权资金: {contract.authorized_capital:.0f} 元",
+        f"股票敞口: {eq['market_value']:.0f}/{contract.max_stock_exposure:.0f} 元",
+        f"已实现盈亏: {realized:+.2f} 元",
+        f"未实现盈亏: {unrealized:+.2f} 元",
+        f"策略风险权益: {state.risk_equity:.2f} 元",
+        f"高水位: {state.high_water:.2f} 元",
+        f"当前回撤: {state.drawdown:.2f} 元",
+        f"告警级别: {state.alert_level}（5000/10000 只告警）",
+        f"距 15000 停止线剩余: {remaining:.2f} 元",
+        "停止线只禁止新增风险，不会自动减仓或清仓。",
+    ])
 
 
 # ---------- 共享数据准备(每轮一次,与模型无关) ----------
 
-def prepare_stock_inputs(code: str, name: str, peer_codes: list[str] | None = None) -> dict:
+def prepare_stock_inputs(
+    code: str,
+    name: str,
+    peer_codes: list[str] | None = None,
+    factor_data: dict[str, Any] | None = None,
+) -> dict:
     """采集个股数据 + X1 事实底稿,同一轮内所有模型共享。"""
     from ..data.factsheet import build_factsheet, factsheet_text
     from ..ledger import factsheet_hash
 
-    try:
-        kline = market.get_daily_kline(code)
-        tech_input = f"股票: {name}({code})\n\n{indicators_text(kline)}"
-    except Exception as err:  # noqa: BLE001
-        tech_input = f"股票: {name}({code})\n\n(K线数据获取失败: {err})"
+    # 技术数据由 factsheet 统一采集；不要在同一只股票上重复请求日 K。
+    tech_input = f"股票: {name}({code})\n\n(技术事实待统一底稿生成)"
 
+    quote: dict[str, Any] = {}
     try:
         info = market.get_stock_info(code)
         quote = market.get_quote(code) or {}
@@ -162,8 +192,20 @@ def prepare_stock_inputs(code: str, name: str, peer_codes: list[str] | None = No
     except Exception as err:  # noqa: BLE001
         fund_input = f"股票: {name}({code})\n\n(基本面数据获取失败: {err})"
 
+    stock_news_items: list[dict[str, Any]] = []
+    news_item_ids: list[str] = []
+    news_fingerprint = ""
     try:
         news_items = market.get_news(code, name=name)
+        stock_news_items = list(news_items)
+        news_item_ids = sorted({
+            str(item.get("content_hash") or item.get("url") or item.get("title") or "")
+            for item in stock_news_items
+            if item.get("content_hash") or item.get("url") or item.get("title")
+        })
+        news_fingerprint = hashlib.sha256(
+            "\n".join(news_item_ids).encode("utf-8")
+        ).hexdigest()
         if news_items:
             news_input = f"股票: {name}({code})\n近期新闻(RSS):\n" + "\n".join(
                 f"- [{item.get('time', '')}] {item.get('title', '')}: {item.get('content', '')}"
@@ -179,8 +221,13 @@ def prepare_stock_inputs(code: str, name: str, peer_codes: list[str] | None = No
     sheet = {}
     sheet_text = ""
     try:
-        sheet = build_factsheet(code, name, peer_codes=peer_codes or [])
+        sheet = build_factsheet(
+            code, name, peer_codes=peer_codes or [], factor_data=factor_data)
         sheet_text = factsheet_text(sheet)
+        tech_input = (
+            f"股票: {name}({code})\n\n"
+            f"{sheet.get('technical_summary') or '(技术数据缺失)'}"
+        )
         factors = sheet.get("factors") or {}
         if factors:
             fund_input += (
@@ -193,6 +240,9 @@ def prepare_stock_inputs(code: str, name: str, peer_codes: list[str] | None = No
     except Exception as err:  # noqa: BLE001
         logger.warning("factsheet %s: %s", code, err)
         sheet_text = f"(事实底稿构建失败: {err})"
+
+    from ..strategies.entry_setup import assess_entry_setup
+    entry_setup = assess_entry_setup(sheet)
 
     research_block = ""
     try:
@@ -208,341 +258,492 @@ def prepare_stock_inputs(code: str, name: str, peer_codes: list[str] | None = No
         "fund": fund_input,
         "news": news_input,
         "factsheet": sheet,
+        "entry_setup": entry_setup,
         "factsheet_text": sheet_text,
         "factsheet_hash": factsheet_hash(sheet) if sheet else "",
         "research_context": research_block,
+        "stock_news_items": stock_news_items,
+        "news_item_ids": news_item_ids,
+        "news_scope": "direct_stock_only_v1",
+        "news_fingerprint": news_fingerprint,
+        "reference_price": quote.get("price"),
+        "reference_price_at": quote.get("quote_asof") or datetime.now().isoformat(),
+        "data_cutoff_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
-def _promoted_research_context() -> str:
-    """已晋升研究策略摘要（只读提示，不强制跟单）。"""
-    from ..database import SessionLocal
-    from ..models import Model
-    import json
+def _promoted_research_context(db: Session | None = None) -> str:
+    """Inject only promotions that still verify against immutable evidence.
 
-    db = SessionLocal()
+    Historical ``rule`` models and their mutable ``members`` JSON are never a
+    source of decision context.  A promoted hypothesis is shown only if its
+    exact experiment, holdout reservation/access and result fingerprints pass
+    the same validation used by the promotion endpoint.
+    """
+    from ..backtest import evidence
+    from ..database import SessionLocal
+    from ..models import ResearchHypothesis
+    from ..research.service import _validated_promotion_experiment
+    from ..research.spec import loads
+
+    owns_session = db is None
+    db = db or SessionLocal()
     try:
         rows = (
-            db.query(Model)
-            .filter(Model.type == "rule", Model.enabled.is_(True),
-                    Model.model_id.like("res_%"))
-            .order_by(Model.id)
+            db.query(ResearchHypothesis)
+            .filter(ResearchHypothesis.status == "promoted")
+            .order_by(ResearchHypothesis.id)
             .limit(8)
             .all()
         )
         if not rows:
             return ""
-        lines = ["【已验证研究策略（可选参考，非强制）】"]
-        for m in rows:
+        lines = ["【不可变回测证据（可选参考，非强制）】"]
+        for hypothesis in rows:
             try:
-                meta = json.loads(m.members or "{}")
-            except json.JSONDecodeError:
-                meta = {}
-            spec = meta.get("spec") if isinstance(meta, dict) else {}
-            if not isinstance(spec, dict):
-                spec = {}
+                spec = loads(hypothesis.spec_json)
+                experiment = _validated_promotion_experiment(
+                    db, hypothesis, spec)
+                holdout = evidence.result_dict(evidence.get_result(
+                    db, experiment.id, "holdout"))
+                metrics = holdout["strategy"].get("metrics") or {}
+            except Exception as error:  # noqa: BLE001 - unverified rows are omitted
+                logger.warning(
+                    "跳过无法复验的研究晋升 hypothesis=%s: %s",
+                    hypothesis.id, error,
+                )
+                continue
             lines.append(
-                f"- {m.name}({m.model_id}): mode={spec.get('mode')} "
+                f"- {hypothesis.title or spec.get('name') or hypothesis.id} "
+                f"[experiment={experiment.id}, spec={experiment.spec_fingerprint[:12]}]: "
+                f"mode={spec.get('mode')} "
                 f"factors={spec.get('factors')} top_n={spec.get('top_n')} "
-                f"rebalance={spec.get('rebalance')} events={spec.get('events')}"
+                f"rebalance={spec.get('rebalance')}；"
+                f"holdout_sharpe={metrics.get('sharpe')} "
+                f"holdout_max_drawdown={metrics.get('max_drawdown')}"
             )
-        return "\n".join(lines)
+        return "\n".join(lines) if len(lines) > 1 else ""
     finally:
-        db.close()
+        if owns_session:
+            db.close()
 
 
-# ---------- 单模型流水线 ----------
+# ---------- 新流水线：同一冻结事实 -> 独立判断 -> 单一条件计划 ----------
 
-def _step_agent(db: Session, run_id: int, model: Model, code: str, name: str,
-                agent: str, system_key: str, user_content: str) -> str:
-    """单 Agent：进度 → 取消检查 → LLM → 落库。"""
-    _check_cancel()
-    _set_progress(
-        agent=agent,
-        code=code,
-        stock_name=name,
-        message=f"{model.name} · {name or code} · {agent}",
-        phase="agent",
+
+def _frozen_snapshot(
+    code: str, name: str, inputs: dict[str, Any], market_overview: str,
+) -> tuple[str, str]:
+    """Build the exact account-blind payload shared by every judgment model."""
+    payload = {
+        "schema_version": "decision_snapshot_v2",
+        "data_cutoff_at": inputs.get("data_cutoff_at"),
+        "code": code,
+        "name": name,
+        "reference_price": inputs.get("reference_price"),
+        "market_overview": market_overview,
+        "technical_data": inputs.get("tech"),
+        "fundamental_data": inputs.get("fund"),
+        "direct_stock_news": inputs.get("stock_news_items") or [],
+        "factsheet": inputs.get("factsheet") or {},
+        "entry_setup": inputs.get("entry_setup") or {},
+        "factsheet_hash": inputs.get("factsheet_hash") or "",
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        default=str,
     )
-    if _verbose():
-        logger.info("pipeline agent=%s model=%s code=%s", agent, model.name, code)
-    t0 = time.perf_counter()
-    report = llm.chat(str(get_setting(system_key)), user_content, model.model_id)
-    elapsed = time.perf_counter() - t0
-    _save_output(db, run_id, model.id, code, agent, user_content, report)
-    if _verbose():
-        logger.info("pipeline agent=%s done in %.1fs", agent, elapsed)
-    _check_cancel()
-    return report
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    wrapped = f"snapshot_sha256={digest}\n{canonical}"
+    return wrapped, digest
 
 
-def market_report(db: Session, run_id: int, model: Model) -> str:
-    _check_cancel()
-    _set_progress(
-        phase="market", agent="market", code=MARKET_CODE, stock_name="大盘",
-        message=f"{model.name} · 大盘环境",
-    )
-    try:
-        overview = market.market_overview_text()
-    except Exception as err:  # noqa: BLE001
-        overview = f"(大盘数据获取失败: {err})"
-    report = llm.chat(str(get_setting("prompt.market")), overview, model.model_id)
-    _save_output(db, run_id, model.id, MARKET_CODE, "market", overview, report)
-    _check_cancel()
-    return report
-
-
-def analyze_stock(db: Session, run_id: int, model: Model, code: str, name: str,
-                  inputs: dict, market_ctx: str, reflections: str) -> Decision:
-    """对单只股票执行完整流水线(指定模型),返回落库后的最终决策。"""
-    _check_cancel()
-    p = lambda k: f"prompt.{k}"  # noqa: E731
-
-    tech_report = _step_agent(
-        db, run_id, model, code, name, "technical", p("technical"), inputs["tech"])
-    fund_report = _step_agent(
-        db, run_id, model, code, name, "fundamental", p("fundamental"), inputs["fund"])
-    news_report = _step_agent(
-        db, run_id, model, code, name, "news", p("news"), inputs["news"])
-
-    reports = (
-        f"【技术面报告】\n{tech_report}\n\n"
-        f"【基本面报告】\n{fund_report}\n\n"
-        f"【新闻情绪报告】\n{news_report}"
-    )
-
-    debate_log = ""
-    for round_no in (1, 2):
-        bull_input = f"{reports}\n\n【辩论记录】\n{debate_log or '(辩论开始,你先发言)'}"
-        bull_view = _step_agent(
-            db, run_id, model, code, name, f"bull_{round_no}", p("bull"), bull_input)
-        debate_log += f"\n多头(第{round_no}轮): {bull_view}\n"
-
-        bear_input = f"{reports}\n\n【辩论记录】\n{debate_log}"
-        bear_view = _step_agent(
-            db, run_id, model, code, name, f"bear_{round_no}", p("bear"), bear_input)
-        debate_log += f"\n空头(第{round_no}轮): {bear_view}\n"
-
-    position_ctx = _position_context(db, model.id, code)
-    factsheet_block = inputs.get("factsheet_text") or ""
-    trader_input = (
-        f"股票: {name}({code})\n\n【大盘环境】\n{market_ctx}\n\n"
-        f"{factsheet_block}\n\n{reports}\n\n"
-        f"【多空辩论】\n{debate_log}\n\n【账户状态】\n{position_ctx}\n\n"
-        f"【历史经验教训】\n{reflections}"
-    )
-    trader_output = _step_agent(
-        db, run_id, model, code, name, "trader", p("trader"), trader_input)
-    trader_decision = llm.decide_with_fallback(trader_output, model.model_id)
-    if trader_decision is None:
-        trader_decision = {"action": "hold", "target_position_pct": 0.0,
-                           "confidence": 0.0, "reason": "交易员输出解析失败,降级为持有"}
-
-    risk_input = (
-        f"股票: {name}({code})\n\n【大盘环境】\n{market_ctx}\n\n【分析师报告】\n{reports}\n\n"
-        f"【交易员决策】\n{trader_output}\n\n【账户状态】\n{position_ctx}"
-    )
-    risk_output = _step_agent(
-        db, run_id, model, code, name, "risk", p("risk"), risk_input)
-    final = llm.decide_with_fallback(risk_output, model.model_id)
-    if final is None:
-        final = trader_decision
-
-    # 取消点：撮合前再检查，避免半票乱下单
-    _check_cancel()
-    return finalize_decision(db, run_id, model.id, code, name, final)
-
-
-def finalize_decision(db: Session, run_id: int, model_pk: int, code: str,
-                      name: str, final: dict) -> Decision:
-    """硬性风控 + 落库 + 执行,LLM 模型与合议组合共用。"""
-    action, target_pct, risk_note = portfolio.apply_risk_limits(
-        db, model_pk, code, final["action"], final["target_position_pct"])
-    reason = final["reason"]
-    if risk_note:
-        reason = f"{reason} [系统风控: {risk_note}]"
-
-    decision = Decision(run_id=run_id, model_pk=model_pk, code=code, name=name,
-                        action=action, target_position_pct=target_pct,
-                        confidence=final["confidence"], reason=reason)
-    db.add(decision)
-    db.commit()
-
-    portfolio.execute_decision(db, model_pk, run_id, code, name, action,
-                               target_pct, reason=final["reason"])
-    return decision
-
-
-# ---------- 反思 ----------
-
-def reflect(db: Session, run_id: int, model: Model):
-    """回顾该模型近 5 笔成交的决策理由 vs 实际盈亏,生成经验教训。"""
-    orders = (db.query(Order)
-              .filter(Order.model_pk == model.id, Order.status == "filled")
-              .order_by(Order.id.desc()).limit(5).all())
-    if not orders:
-        return
-    lines = []
-    for order in reversed(orders):
-        pos = broker.get_position(db, model.id, order.code)
-        if pos:
-            quote = market.get_quote(order.code)
-            price = quote["price"] if quote else pos.avg_cost
-            pnl = (price - pos.avg_cost) / pos.avg_cost if pos.avg_cost else 0
-            outcome = f"仍持有,现浮动盈亏 {pnl:+.1%}"
-        else:
-            outcome = "已清仓"
-        dec = (db.query(Decision)
-               .filter(Decision.model_pk == model.id, Decision.code == order.code,
-                       Decision.created_at <= order.created_at)
-               .order_by(Decision.id.desc()).first())
-        reason = dec.reason if dec else "(未记录)"
-        lines.append(
-            f"- {order.created_at:%m-%d} {'买入' if order.side == 'buy' else '卖出'} "
-            f"{order.name} {order.qty}股 @{order.price},理由: {reason[:80]};结果: {outcome}")
-    review_input = "近期交易记录:\n" + "\n".join(lines)
-    try:
-        output = llm.chat(str(get_setting("prompt.reflect")), review_input, model.model_id)
-    except Exception as err:  # noqa: BLE001
-        logger.warning("模型 %s 反思失败: %s", model.name, err)
-        return
-    _save_output(db, run_id, model.id, REFLECT_CODE, "reflect", review_input, output)
-    if "样本不足" not in output:
-        db.add(Reflection(model_pk=model.id, run_id=run_id, content=output.strip()[:1000]))
-        db.commit()
-
-
-# ---------- 合议合成 ----------
-
-def synthesize_ensemble(db: Session, run_id: int, ensemble: Model,
-                        targets: dict[str, str]):
-    """按成员模型当轮最终决策合成合议决策(零 LLM 调用)。"""
-    member_pks = json.loads(ensemble.members or "[]")
-    if not member_pks:
-        return
-    for code, name in targets.items():
-        votes = []
-        for pk in member_pks:
-            dec = (db.query(Decision)
-                   .filter(Decision.run_id == run_id, Decision.model_pk == pk,
-                           Decision.code == code, Decision.error == "")
-                   .order_by(Decision.id.desc()).first())
-            if dec:
-                member = db.get(Model, pk)
-                votes.append((member.name if member else str(pk), dec))
-        if not votes:
-            continue
-
-        counts: dict[str, list] = {}
-        for member_name, dec in votes:
-            counts.setdefault(dec.action, []).append((member_name, dec))
-        best_action, best_votes = max(counts.items(), key=lambda kv: len(kv[1]))
-        # 多数票需过半,否则 hold(含 2 成员分歧/三方平票)
-        if len(best_votes) * 2 <= len(votes):
-            best_action, best_votes = "hold", []
-
-        stance = ";".join(f"{name}:{dec.action}" for name, dec in votes)
-        if best_action == "hold":
-            # 多数 hold：保留目标仓位均值，便于 UI 区分「继续持有」与「观望」
-            # 无多数共识时 best_votes 为空 → 观望 0
-            if best_votes:
-                avg_pct = sum(d.target_position_pct for _, d in best_votes) / len(best_votes)
-                avg_conf = sum(d.confidence for _, d in best_votes) / len(best_votes)
-                final = {
-                    "action": "hold",
-                    "target_position_pct": avg_pct,
-                    "confidence": avg_conf,
-                    "reason": f"合议多数决 hold [{stance}]",
-                }
-            else:
-                final = {
-                    "action": "hold",
-                    "target_position_pct": 0.0,
-                    "confidence": 0.0,
-                    "reason": f"合议无多数共识,观望 [{stance}]",
-                }
-        else:
-            avg_pct = sum(d.target_position_pct for _, d in best_votes) / len(best_votes)
-            avg_conf = sum(d.confidence for _, d in best_votes) / len(best_votes)
-            final = {"action": best_action, "target_position_pct": avg_pct,
-                     "confidence": avg_conf,
-                     "reason": f"合议多数决 {best_action} [{stance}]"}
-        finalize_decision(db, run_id, ensemble.id, code, name, final)
-
-
-# ---------- 单模型任务（供线程池调用，自建 Session） ----------
-
-
-def _run_one_llm_model(
-    *,
-    run_id: int,
-    model_pk: int,
-    model_index: int,
-    model_total: int,
-    targets: dict[str, str],
-    stock_inputs: dict[str, dict],
-) -> None:
-    """在独立线程/Session 中跑完一个 LLM 模型的全股池流水线。"""
+def _run_independent_judgment(
+    *, run_id: int, model_pk: int, code: str, name: str,
+    frozen_snapshot: str,
+) -> dict[str, Any]:
+    """One model, one call, one strict judgment; no account context or trading."""
     from ..database import SessionLocal
 
     db = SessionLocal()
     try:
         _check_cancel()
         model = db.get(Model, model_pk)
-        if model is None or not model.enabled:
-            return
+        if model is None or not model.enabled or model.type != "llm":
+            return {"model_pk": model_pk, "judgment": None, "error": "模型不可用"}
         _set_progress(
-            phase="model", model_name=model.name, model_pk=model.id,
-            model_index=model_index, model_total=model_total,
-            message=f"模型 {model_index}/{model_total} · {model.name}",
+            phase="judgment", model_name=model.name, model_pk=model.id,
+            code=code, stock_name=name, agent="independent_judgment",
+            message=f"独立判断 · {model.name} · {name}",
         )
-        try:
-            market_ctx = market_report(db, run_id, model)
-        except PipelineCancelled:
-            raise
-        except Exception as err:  # noqa: BLE001
-            logger.exception("模型 %s 大盘分析失败", model.name)
-            market_ctx = f"(大盘分析失败: {err})"
-        reflections = recent_reflections(db, model.id)
-        stock_total = len(targets)
-        for si, (code, name) in enumerate(targets.items(), start=1):
-            _check_cancel()
-            _set_progress(
-                phase="stock", model_name=model.name, model_pk=model.id,
-                model_index=model_index, model_total=model_total,
-                code=code, stock_name=name,
-                stock_index=si, stock_total=stock_total,
-                message=f"{model.name} · 股票 {si}/{stock_total} · {name}",
-            )
-            try:
-                analyze_stock(db, run_id, model, code, name,
-                              stock_inputs[code], market_ctx, reflections)
-            except PipelineCancelled:
-                raise
-            except Exception as err:  # noqa: BLE001
-                logger.exception("模型 %s 分析 %s 失败", model.name, code)
-                db.add(Decision(run_id=run_id, model_pk=model.id, code=code,
-                                name=name, action="hold", reason="",
-                                error=str(err)))
-                db.commit()
-        _check_cancel()
-        try:
-            _set_progress(phase="reflect", agent="reflect",
-                          message=f"{model.name} · 反思")
-            reflect(db, run_id, model)
-        except PipelineCancelled:
-            raise
-        except Exception:  # noqa: BLE001
-            logger.exception("模型 %s 反思失败", model.name)
+        system_prompt = str(get_setting("prompt.independent_judgment"))
+        raw = llm.chat(system_prompt, frozen_snapshot, model.model_id)
+        _save_output(
+            db, run_id, model.id, code, "independent_judgment",
+            frozen_snapshot, raw,
+            system_prompt=system_prompt, model_id=model.model_id,
+        )
+        judgment = llm.parse_independent_judgment(raw)
+        return {
+            "model_pk": model.id,
+            "model_name": model.name,
+            "model_id": model.model_id,
+            "judgment": judgment,
+            "raw": raw,
+            "error": "" if judgment else "独立判断不符合严格 JSON 契约",
+        }
+    except PipelineCancelled:
+        raise
+    except Exception as err:  # noqa: BLE001
+        logger.exception("独立判断失败 model=%s code=%s", model_pk, code)
+        return {"model_pk": model_pk, "judgment": None, "error": str(err)}
     finally:
         db.close()
+
+
+def _member_ids(ensemble: Model) -> list[int]:
+    try:
+        raw = json.loads(ensemble.members or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return list(dict.fromkeys(int(value) for value in raw if isinstance(value, int)))
+
+
+def _next_plan_window(now_utc: datetime) -> tuple[datetime, datetime]:
+    """Return the next proven trade-day continuous-auction window."""
+    local = now_utc.astimezone(ZoneInfo("Asia/Shanghai"))
+    candidate = local.date() + timedelta(days=1)
+    trade_day = None
+    for _ in range(14):
+        if market.is_trade_date(candidate):
+            trade_day = candidate
+            break
+        candidate += timedelta(days=1)
+    if trade_day is None:
+        raise RuntimeError("未来 14 日内无法证明下一个交易日")
+    hour, minute = str(get_setting("signal.default_valid_until")).split(":")
+    valid_from = datetime(
+        trade_day.year, trade_day.month, trade_day.day,
+        9, 30, tzinfo=ZoneInfo("Asia/Shanghai"),
+    ).astimezone(timezone.utc)
+    deadline = datetime(
+        trade_day.year, trade_day.month, trade_day.day,
+        int(hour), int(minute), tzinfo=ZoneInfo("Asia/Shanghai"),
+    ).astimezone(timezone.utc)
+    if deadline <= valid_from:
+        raise ValueError("signal.default_valid_until must be after 09:30")
+    return valid_from, deadline
+
+
+def _next_plan_deadline(now_utc: datetime) -> datetime:
+    """Compatibility helper for callers that only need the deadline."""
+    return _next_plan_window(now_utc)[1]
+
+
+def _aware_datetime(value: Any, *, assume_shanghai: bool = False) -> datetime | None:
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(
+            tzinfo=ZoneInfo("Asia/Shanghai") if assume_shanghai else timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _risk_did_not_escalate(trader: dict[str, Any], risk: dict[str, Any]) -> bool:
+    """Risk review may preserve/reduce risk, never manufacture or enlarge a buy."""
+    if risk["action"] == "buy" and trader["action"] != "buy":
+        return False
+    if risk["action"] == trader["action"] == "buy":
+        if risk["target_position_pct"] > trader["target_position_pct"] + 1e-12:
+            return False
+        if risk["max_buy_price"] > trader["max_buy_price"] + 1e-12:
+            return False
+        trader_expiry = _aware_datetime(trader.get("valid_until"))
+        risk_expiry = _aware_datetime(risk.get("valid_until"))
+        if trader_expiry is None or risk_expiry is None or risk_expiry > trader_expiry:
+            return False
+    return True
+
+
+def _save_hold_decision(
+    db: Session, run_id: int, ensemble: Model, code: str, name: str,
+    reason: str, *, error: str = "",
+) -> Decision:
+    decision = Decision(
+        run_id=run_id, model_pk=ensemble.id, code=code, name=name,
+        action="hold", target_position_pct=0.0, confidence=0.0,
+        reason=reason, error=error,
+    )
+    db.add(decision)
+    db.commit()
+    return decision
+
+
+def _create_ensemble_candidate(
+    db: Session,
+    *,
+    run_id: int,
+    ensemble: Model,
+    code: str,
+    name: str,
+    inputs: dict[str, Any],
+    frozen_snapshot: str,
+    snapshot_hash: str,
+    judgments_by_model: dict[int, dict[str, Any]],
+    broker_reference: dict[str, Any] | None = None,
+) -> tuple[Decision, Any | None]:
+    """Use two distinct member models for final trading and risk review."""
+    from ..backtest.shadow import verify_run_market_artifact
+
+    if (
+        ensemble.type != "ensemble"
+        or not ensemble.enabled
+        or not ensemble.is_official_strategy
+    ):
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name,
+            "Model is not the enabled unique official strategy",
+            error="not_official_strategy",
+        ), None
+
+    artifact = (
+        db.query(RunMarketArtifact)
+        .filter(RunMarketArtifact.run_id == run_id)
+        .first()
+    )
+    if artifact is None:
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name,
+            "Run is missing its shared frozen market artifact",
+            error="missing_run_market_artifact",
+        ), None
+    try:
+        artifact_payload = verify_run_market_artifact(artifact)
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name,
+            "Run market evidence is invalid; candidate creation failed closed",
+            error=f"invalid_run_market_artifact:{error}",
+        ), None
+    input_cutoff = _aware_datetime(inputs.get("data_cutoff_at"))
+    artifact_cutoff = _aware_datetime(artifact.data_cutoff_at)
+    if (
+        input_cutoff is None
+        or artifact_cutoff is None
+        or input_cutoff != artifact_cutoff
+        or code not in artifact_payload["analysis_universe"]
+    ):
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name,
+            "Candidate input does not match the Run cutoff/universe",
+            error="run_market_artifact_binding_mismatch",
+        ), None
+
+    # New entries must first pass a deterministic, versioned setup contract.
+    # Existing positions always continue to the ensemble so sell/hold review is
+    # never suppressed by an entry-only gate.
+    position = (
+        db.query(Position)
+        .filter(
+            Position.model_pk == ensemble.id,
+            Position.code == code,
+            Position.total_qty > 0,
+        )
+        .first()
+    )
+    entry_setup = inputs.get("entry_setup") or {}
+    if entry_setup and position is None and not entry_setup.get("actionable"):
+        reasons = entry_setup.get("reasons") or []
+        blockers = entry_setup.get("hard_blockers") or []
+        detail = "；".join(str(item) for item in [*reasons, *blockers] if item)
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name,
+            f"{entry_setup.get('version') or 'entry_setup'} 未通过：{detail}",
+        ), None
+
+    member_ids = _member_ids(ensemble)
+    valid = [judgments_by_model[mid] for mid in member_ids
+             if mid in judgments_by_model and judgments_by_model[mid].get("judgment")]
+    quorum = max(2, math.ceil(len(member_ids) * 2 / 3))
+    if len(valid) < quorum:
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name,
+            f"独立判断有效票不足 {len(valid)}/{quorum}，fail closed",
+            error="independent_judgment_quorum_failed",
+        ), None
+
+    final_model = db.get(Model, valid[0]["model_pk"])
+    risk_model = db.get(Model, valid[1]["model_pk"])
+    if final_model is None or risk_model is None:
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name, "最终/风险模型不可用",
+            error="decision_models_unavailable",
+        ), None
+
+    now_utc = datetime.now(timezone.utc)
+    valid_from, system_deadline = _next_plan_window(now_utc)
+    compact_judgments = [{
+        "model": row["model_name"],
+        "model_id": row["model_id"],
+        "judgment": row["judgment"],
+    } for row in valid]
+    trader_input = (
+        f"【冻结事实】\n{frozen_snapshot}\n\n"
+        f"【独立判断】\n{json.dumps(compact_judgments, ensure_ascii=False, sort_keys=True)}\n\n"
+        f"【授权账户状态】\n{_position_context(db, ensemble.id, code)}\n\n"
+        f"【券商事实来源】\n{json.dumps(broker_reference or {'required': False}, ensure_ascii=False, sort_keys=True)}\n\n"
+        f"【系统允许的最晚有效期】\n{system_deadline.isoformat()}"
+    )
+    trader_prompt = str(get_setting("prompt.final_trader"))
+    trader_raw = llm.chat(trader_prompt, trader_input, final_model.model_id)
+    _save_output(
+        db, run_id, ensemble.id, code, "final_trader", trader_input, trader_raw,
+        system_prompt=trader_prompt, model_id=final_model.model_id)
+    trader = llm.parse_trade_decision(trader_raw)
+    if trader is None:
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name,
+            "最终交易员输出不符合条件计划契约",
+            error="final_trader_contract_invalid",
+        ), None
+
+    risk_input = (
+        f"【冻结事实哈希】\n{snapshot_hash}\n\n"
+        f"【确定性入场门禁】\n{json.dumps(entry_setup, ensure_ascii=False, sort_keys=True)}\n\n"
+        f"【独立判断】\n{json.dumps(compact_judgments, ensure_ascii=False, sort_keys=True)}\n\n"
+        f"【交易员条件计划】\n{json.dumps(trader, ensure_ascii=False, sort_keys=True)}\n\n"
+        f"【完整账户风险状态】\n{_risk_context(db, ensemble.id)}"
+    )
+    risk_prompt = str(get_setting("prompt.risk_review"))
+    risk_raw = llm.chat(risk_prompt, risk_input, risk_model.model_id)
+    _save_output(
+        db, run_id, ensemble.id, code, "risk_review", risk_input, risk_raw,
+        system_prompt=risk_prompt, model_id=risk_model.model_id)
+    reviewed = llm.parse_trade_decision(risk_raw)
+    if reviewed is None or not _risk_did_not_escalate(trader, reviewed):
+        return _save_hold_decision(
+            db, run_id, ensemble, code, name,
+            "风险审查输出无效或扩大了风险，fail closed",
+            error="risk_review_contract_invalid",
+        ), None
+
+    action, target_pct, risk_note = portfolio.apply_risk_limits(
+        db, ensemble.id, code, reviewed["action"], reviewed["target_position_pct"])
+    thesis = reviewed["thesis"]
+    if risk_note:
+        thesis = f"{thesis} [代码边界: {risk_note}]"
+    reference_price = inputs.get("reference_price")
+    try:
+        reference_price = float(reference_price)
+    except (TypeError, ValueError):
+        reference_price = 0.0
+    expiry = None
+    decision_error = ""
+    if action in {"buy", "sell"} and reference_price <= 0:
+        action = "hold"
+        target_pct = 0.0
+        decision_error = "missing_reference_price"
+        thesis += " [参考价格缺失，未生成计划]"
+    elif action in {"buy", "sell"}:
+        expiry = (_aware_datetime(reviewed.get("valid_until"))
+                  if action == "buy" else system_deadline)
+        if expiry is None or expiry <= now_utc:
+            action = "hold"
+            target_pct = 0.0
+            decision_error = "invalid_plan_expiry"
+            thesis += " [有效期无效，未生成计划]"
+        else:
+            expiry = min(expiry, system_deadline)
+
+    # Decisions are immutable audit evidence. Validate and normalize every
+    # field before the first flush so fail-closed paths never update a row.
+    decision = Decision(
+        run_id=run_id,
+        model_pk=ensemble.id,
+        code=code,
+        name=name,
+        action=action,
+        target_position_pct=target_pct,
+        confidence=reviewed["confidence"],
+        reason=thesis,
+        error=decision_error,
+    )
+    db.add(decision)
+    db.flush()
+    if action not in {"buy", "sell"}:
+        db.commit()
+        return decision, None
+    assert expiry is not None
+
+    from ..trading.trade_plans import create_plan_from_decision
+    policy_snapshot = {
+        "classification": "provisional",
+        "snapshot_hash": snapshot_hash,
+        "entry_setup": entry_setup,
+        "news_scope": inputs.get("news_scope") or "",
+        "news_item_ids": inputs.get("news_item_ids") or [],
+        "news_fingerprint": inputs.get("news_fingerprint") or "",
+        "gap_lookback_days": int(get_setting("signal.gap_lookback_days")),
+        "gap_percentile": float(get_setting("signal.gap_percentile")),
+        "gap_min_samples": int(get_setting("signal.gap_min_samples")),
+        "hard_price_deviation_pct": float(
+            get_setting("signal.hard_price_deviation_pct")),
+        "max_positions": int(get_setting("signal.max_positions")),
+        "final_model_id": final_model.model_id,
+        "risk_model_id": risk_model.model_id,
+        "independent_model_ids": [row["model_id"] for row in valid],
+        "broker_reference": broker_reference or {"required": False},
+        "prompt_hashes": {
+            key: hashlib.sha256(str(get_setting(key)).encode("utf-8")).hexdigest()
+            for key in (
+                "prompt.independent_judgment", "prompt.final_trader",
+                "prompt.risk_review",
+            )
+        },
+    }
+    data_cutoff = artifact_cutoff
+    assert data_cutoff is not None
+    ref_at = _aware_datetime(
+        inputs.get("reference_price_at"), assume_shanghai=True) or data_cutoff
+    plan = create_plan_from_decision(
+        db,
+        decision,
+        reference_price=reference_price,
+        reference_price_at=ref_at,
+        reference_price_kind="analysis_quote",
+        max_buy_price=reviewed.get("max_buy_price") if action == "buy" else None,
+        data_cutoff_at=data_cutoff,
+        valid_from_at=valid_from,
+        expires_at=expiry,
+        invalidation_conditions={
+            "conditions": reviewed["invalidation_conditions"],
+            "material_news": "review_required",
+            "dynamic_opening_gap": "review_required",
+        },
+        policy_snapshot=policy_snapshot,
+        factsheet_hash=inputs.get("factsheet_hash") or "",
+        idempotency_key=f"run:{run_id}:ensemble:{ensemble.id}:code:{code}",
+        commit=False,
+    )
+    # Analysis and execution are separate state machines.  A newly-created
+    # plan is for the next proven trading window and must never be ticketed or
+    # submitted from the analysis pipeline that created it.
+    db.commit()
+    return decision, plan
 
 
 # ---------- 总入口 ----------
 
 
 def run_pipeline(trigger: str = "manual") -> int | None:
-    """执行一轮全量决策(所有启用模型)。返回 run_id;若上一轮未结束返回 None。"""
+    """生成一轮前瞻候选计划；绝不在分析阶段成交。"""
     global _run_lock, _cancel_requested
     if _run_lock:
         logger.warning("上一轮决策仍在运行,跳过本轮")
@@ -564,17 +765,77 @@ def run_pipeline(trigger: str = "manual") -> int | None:
     )
     cancelled = False
     try:
-        broker.settle_t1(db)
+        official_model_pks = broker.enabled_official_strategy_ids(db)
+        broker.settle_t1(db, model_pks=official_model_pks)
+        from ..trading.broker_snapshot import reconcile_configured_broker_portfolio
+        broker_reference = reconcile_configured_broker_portfolio(
+            db, official_model_pks,
+        )
+        if broker_reference is not None:
+            db.commit()
         _check_cancel()
 
-        # 股池 + 所有账户持仓合并去重
-        targets: dict[str, str] = {}
+        # Watchlist 只是观察列表。新标的必须先通过确定性的可交易/板块/
+        # ST/一手可负担性检查；已有持仓无论是否仍合格都要保留，以便分析卖出。
+        held_positions = (db.query(Position)
+                          .join(Model, Model.id == Position.model_pk)
+                          .filter(
+                              Model.type == "ensemble",
+                              Model.is_official_strategy.is_(True),
+                          ).all())
+        targets: dict[str, str] = {
+            pos.code: pos.name for pos in held_positions if pos.total_qty > 0
+        }
+        excluded_ineligible: list[dict[str, str]] = []
+        eligible_quotes: dict[str, dict[str, Any]] = {}
+        # Existing positions remain in the analysis universe so they can be
+        # sold, but only those that independently pass the same deterministic
+        # eligibility gate enter the mechanical shadow universe.
+        for code in list(targets):
+            eligible_quote, _reason = market.strategy_eligible_quote(code)
+            if eligible_quote is not None:
+                eligible_quotes[code] = dict(eligible_quote)
         for item in db.query(Watchlist).all():
-            targets[item.code] = item.name
-        for pos in db.query(Position).all():
-            targets.setdefault(pos.code, pos.name)
+            if item.code in targets:
+                continue
+            eligible_quote, reason = market.strategy_eligible_quote(item.code)
+            if eligible_quote is None:
+                excluded_ineligible.append({"code": item.code, "reason": reason})
+                continue
+            eligible_quotes[item.code] = dict(eligible_quote)
+            targets[item.code] = str(eligible_quote.get("name") or item.name)
 
         peer_codes = list(targets.keys())
+        # A cross-sectional rank is a property of the whole universe.  Compute
+        # it exactly once per Run and share immutable per-code rows; rebuilding
+        # the same 30-stock panel inside every factsheet caused quadratic Fuyao
+        # traffic and avoidable rate limiting.
+        from ..factors.definitions import FACTOR_NAMES
+        from ..factors.panel import latest_factor_snapshot
+        shared_factor_rows: dict[str, dict[str, Any]] = {}
+        factor_snapshot_error = ""
+        try:
+            shared_snapshot = latest_factor_snapshot(peer_codes)
+            ranked = (
+                shared_snapshot.dropna(subset=["score"])
+                .sort_values("score", ascending=False)
+            )
+            universe_size = int(len(ranked))
+            for rank, (_, row) in enumerate(ranked.iterrows(), start=1):
+                data: dict[str, Any] = {
+                    "rank": rank,
+                    "universe_size": universe_size,
+                    "score": float(row["score"]),
+                }
+                for factor_name in FACTOR_NAMES:
+                    value = row.get(factor_name)
+                    data[factor_name] = (
+                        None if value is None or value != value else float(value)
+                    )
+                shared_factor_rows[str(row["code"])] = data
+        except Exception as err:  # noqa: BLE001
+            logger.exception("共享因子截面构建失败")
+            factor_snapshot_error = f"共享因子截面失败: {err}"[:300]
         stock_total = len(targets)
         _set_progress(
             phase="prepare", stock_total=stock_total,
@@ -589,81 +850,158 @@ def run_pipeline(trigger: str = "manual") -> int | None:
                 message=f"事实底稿 {i}/{stock_total} · {name}({code})",
             )
             stock_inputs[code] = prepare_stock_inputs(
-                code, name, peer_codes=peer_codes)
+                code, name, peer_codes=peer_codes,
+                factor_data=shared_factor_rows.get(code, {}))
+
+        try:
+            market_overview = market.market_overview_text()
+        except Exception as err:  # noqa: BLE001
+            market_overview = f"(市场概览不可用: {err})"
+
+        # One Run has one upper information boundary.  Per-stock collection
+        # completion times must never become different candidate cutoffs.
+        run_cutoff = datetime.now(timezone.utc)
+        for inputs in stock_inputs.values():
+            inputs["data_cutoff_at"] = run_cutoff.isoformat()
+        from ..backtest.shadow import freeze_engine_run_artifact
+        freeze_engine_run_artifact(
+            db,
+            run_id=run_id,
+            data_cutoff_at=run_cutoff,
+            analysis_codes=list(targets),
+            eligible_quotes=eligible_quotes,
+        )
 
         llm_models = (db.query(Model)
-                      .filter(Model.enabled.is_(True), Model.type == "llm").all())
+                      .filter(Model.enabled.is_(True), Model.type == "llm")
+                      .order_by(Model.id).all())
         ensembles = (db.query(Model)
-                     .filter(Model.enabled.is_(True), Model.type == "ensemble").all())
+                     .filter(
+                         Model.enabled.is_(True),
+                         Model.type == "ensemble",
+                         Model.is_official_strategy.is_(True),
+                     )
+                     .order_by(Model.id).all())
         model_total = len(llm_models)
-        if not llm_models:
+        if len(llm_models) < 2:
             run.status = "failed"
-            run.error = "无启用的 LLM 模型，无法决策（合议依赖成员 LLM）"
+            run.error = "至少需要 2 个启用的独立 LLM，单模型不能形成候选计划"
+            _set_progress(phase="failed", message=run.error, agent="")
+            return run_id
+        if not ensembles:
+            run.status = "failed"
+            run.error = "没有启用的合议策略账户；独立判断模型不能直接持仓或成交"
             _set_progress(phase="failed", message=run.error, agent="")
             return run_id
 
-        # 模型级并发：各 LLM 独立 Session，互不影响；合议等全部完成后再合成
+        frozen: dict[str, tuple[str, str]] = {
+            code: _frozen_snapshot(code, targets[code], stock_inputs[code], market_overview)
+            for code in targets
+        }
+
+        # 每个模型对同一快照只调用一次；不再扮演九个角色或注入反思记忆。
         llm_ids = [m.id for m in llm_models]
         llm_names = {m.id: m.name for m in llm_models}
-        max_workers = min(len(llm_ids), 4)
+        task_total = len(llm_ids) * max(len(targets), 1)
+        max_workers = min(task_total, 4)
         _set_progress(
             phase="model", model_total=model_total,
-            message=f"并发决策 {model_total} 个 LLM（workers={max_workers}）",
+            message=f"独立判断 {model_total} 模型 × {len(targets)} 股票",
         )
         errors: list[str] = []
+        judgments: dict[str, dict[int, dict[str, Any]]] = {
+            code: {} for code in targets
+        }
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = {
                 pool.submit(
-                    _run_one_llm_model,
+                    _run_independent_judgment,
                     run_id=run_id,
                     model_pk=mid,
-                    model_index=i,
-                    model_total=model_total,
-                    targets=targets,
-                    stock_inputs=stock_inputs,
-                ): mid
-                for i, mid in enumerate(llm_ids, start=1)
+                    code=code,
+                    name=targets[code],
+                    frozen_snapshot=frozen[code][0],
+                ): (mid, code)
+                for mid in llm_ids
+                for code in targets
             }
             for fut in as_completed(futures):
-                mid = futures[fut]
+                mid, code = futures[fut]
                 try:
-                    fut.result()
+                    row = fut.result()
+                    judgments[code][mid] = row
+                    if row.get("error"):
+                        errors.append(f"{llm_names.get(mid)}({code}): {row['error']}")
                 except PipelineCancelled:
-                    # 取消：尽量取消其余任务
                     for f in futures:
                         f.cancel()
                     raise
                 except Exception as err:  # noqa: BLE001
-                    logger.exception("模型并发任务失败 %s", llm_names.get(mid))
-                    errors.append(f"{llm_names.get(mid)}: {err}")
+                    logger.exception("独立判断任务失败 %s %s", llm_names.get(mid), code)
+                    errors.append(f"{llm_names.get(mid)}({code}): {err}")
 
-        if errors and len(errors) == len(llm_ids):
+        valid_count = sum(
+            1 for by_model in judgments.values() for row in by_model.values()
+            if row.get("judgment")
+        )
+        if targets and valid_count == 0:
             run.status = "failed"
-            run.error = "全部 LLM 失败: " + "; ".join(errors)[:500]
+            run.error = "全部独立判断失败: " + "; ".join(errors)[:500]
             _set_progress(phase="failed", message=run.error[:200], agent="")
             return run_id
 
         _check_cancel()
         for ensemble in ensembles:
-            _check_cancel()
-            _set_progress(
-                phase="ensemble", model_name=ensemble.name, model_pk=ensemble.id,
-                message=f"合议合成 · {ensemble.name}",
-            )
-            try:
-                synthesize_ensemble(db, run_id, ensemble, targets)
-            except PipelineCancelled:
-                raise
-            except Exception:  # noqa: BLE001
-                logger.exception("合议 %s 合成失败", ensemble.name)
+            for code, name in targets.items():
+                _check_cancel()
+                _set_progress(
+                    phase="ensemble", model_name=ensemble.name,
+                    model_pk=ensemble.id, code=code, stock_name=name,
+                    agent="final_trader", message=f"条件计划 · {ensemble.name} · {name}",
+                )
+                try:
+                    _create_ensemble_candidate(
+                        db,
+                        run_id=run_id,
+                        ensemble=ensemble,
+                        code=code,
+                        name=name,
+                        inputs=stock_inputs[code],
+                        frozen_snapshot=frozen[code][0],
+                        snapshot_hash=frozen[code][1],
+                        judgments_by_model=judgments[code],
+                        broker_reference=broker_reference,
+                    )
+                except PipelineCancelled:
+                    raise
+                except Exception as err:  # noqa: BLE001
+                    logger.exception("条件计划生成失败 ensemble=%s code=%s",
+                                     ensemble.name, code)
+                    db.rollback()
+                    _save_hold_decision(
+                        db, run_id, ensemble, code, name,
+                        "条件计划生成失败，fail closed", error=str(err))
 
-        for model in db.query(Model).filter(Model.enabled.is_(True)).all():
-            portfolio.snapshot_equity(db, model.id)
-        # 汇总买卖计数，供决策列表一眼可读
+        for ensemble in ensembles:
+            portfolio.snapshot_equity(db, ensemble.id)
+
         from collections import Counter
+        from ..models import TradePlan
         decs = db.query(Decision).filter(Decision.run_id == run_id).all()
         action_counts = Counter(d.action for d in decs)
-        trade_n = action_counts.get("buy", 0) + action_counts.get("sell", 0)
+        decision_error_counts = Counter(d.error for d in decs if d.error)
+        plans = db.query(TradePlan).filter(TradePlan.run_id == run_id).all()
+        plan_counts = Counter(p.side for p in plans)
+        entry_setup_counts = Counter(
+            str((item.get("entry_setup") or {}).get("status") or "missing")
+            for item in stock_inputs.values()
+        )
+        judgment_expected = len(llm_models) * stock_total
+        degraded = (
+            valid_count < judgment_expected
+            or bool(decision_error_counts)
+            or bool(factor_snapshot_error)
+        )
         run.result_json = json.dumps({
             "kind": "pipeline",
             "trigger": trigger,
@@ -673,8 +1011,36 @@ def run_pipeline(trigger: str = "manual") -> int | None:
             "buy": action_counts.get("buy", 0),
             "sell": action_counts.get("sell", 0),
             "hold": action_counts.get("hold", 0),
-            "trade_n": trade_n,
+            # Analysis no longer executes.  Keep an explicit, honest count
+            # instead of a value that could silently disagree with a broker.
+            "trade_n": 0,
             "decision_n": len(decs),
+            "degraded": degraded,
+            "independent_judgment_expected": judgment_expected,
+            "independent_judgment_valid": valid_count,
+            "independent_judgment_failed": judgment_expected - valid_count,
+            "decision_error_counts": dict(decision_error_counts),
+            "factor_snapshot_error": factor_snapshot_error,
+            "entry_setup_version": "entry_setup_v1",
+            "entry_setup_counts": dict(entry_setup_counts),
+            "entry_setup_actionable_codes": [
+                code for code, item in stock_inputs.items()
+                if (item.get("entry_setup") or {}).get("actionable")
+            ],
+            "candidate_n": len(plans),
+            "candidate_buy": plan_counts.get("buy", 0),
+            "candidate_sell": plan_counts.get("sell", 0),
+            "excluded_ineligible": excluded_ineligible,
+            "signal_buy": plan_counts.get("buy", 0),
+            "signal_sell": plan_counts.get("sell", 0),
+            "execution_mode": (
+                "human_confirmation"
+                if bool(get_setting("execution.require_manual_confirmation"))
+                else "auto_fill"
+                if bool(get_setting("execution.auto_fill_tickets"))
+                else "auto_ticket"
+            ),
+            "broker_reference": broker_reference or {"required": False},
         }, ensure_ascii=False)
         run.status = "done"
         _set_progress(phase="done", message="完成", agent="")
@@ -686,12 +1052,55 @@ def run_pipeline(trigger: str = "manual") -> int | None:
         _set_progress(phase="cancelled", message="已取消", agent="")
     except Exception as err:  # noqa: BLE001
         logger.exception("决策流程失败")
+        db.rollback()
+        run = db.get(Run, run_id)
+        if run is None:
+            raise
         run.status = "failed"
         run.error = str(err)
         _set_progress(phase="failed", message=str(err)[:200], agent="")
     finally:
+        # A failed flush leaves SQLAlchemy in PendingRollbackError state.
+        # Always recover the session before persisting terminal run status.
+        if not db.is_active:
+            db.rollback()
+            run = db.get(Run, run_id)
+            if run is None:
+                db.close()
+                _run_lock = False
+                raise RuntimeError(f"run {run_id} disappeared during rollback")
         run.finished_at = datetime.now()
         db.commit()
+        try:
+            from ..notifications import notify_pipeline_result
+            from ..models import TradePlan
+
+            try:
+                notification_result = json.loads(run.result_json or "{}")
+            except json.JSONDecodeError:
+                notification_result = {}
+            notification_plans = [
+                {
+                    "id": plan.id,
+                    "code": plan.code,
+                    "name": plan.name,
+                    "side": plan.side,
+                    "max_buy_price": plan.max_buy_price,
+                }
+                for plan in db.query(TradePlan).filter(
+                    TradePlan.run_id == run_id,
+                    TradePlan.status == "candidate",
+                ).all()
+            ]
+            notify_pipeline_result(
+                run_id=run_id,
+                status=run.status,
+                result=notification_result,
+                error=run.error,
+                plans=notification_plans,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("流水线通知调度失败（不影响 Run）")
         db.close()
         _run_lock = False
         _cancel_requested = False

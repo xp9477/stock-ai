@@ -1,7 +1,7 @@
 """事件回测：池内等权买入持有 + S2 周频前 N 等权。
 
-简化假设（第一季可接受）：
-- 调仓日按收盘价成交
+简化假设：
+- 前一交易日收盘生成信号，下一交易日收盘成交
 - 不考虑涨跌停无法成交（历史回测后续可加）
 - 费用按 settings 佣金/印花税近似（双边）
 - 整手忽略，用金额权重（便于向量化）；与实盘模拟撮合分开记账
@@ -17,6 +17,11 @@ import pandas as pd
 from ..config import settings
 from ..factors.definitions import FACTOR_NAMES
 from ..factors.score import composite_scores, select_top_n
+from .execution import (
+    ExecutionCostModel,
+    portfolio_value,
+    rebalance_equal_weight,
+)
 from .metrics import compute_metrics, mark_sample_ok
 
 
@@ -45,11 +50,18 @@ class BacktestResult:
 
 def _fee_rate() -> float:
     # 近似单边：佣金 + 过户；卖出再加印花税 → 换手时用往返
-    return settings.commission_rate + settings.transfer_fee_rate
+    from ..runtime_settings import get_setting
+
+    return (
+        float(get_setting("trading.commission_rate"))
+        + float(get_setting("trading.transfer_fee_rate"))
+    )
 
 
 def _roundtrip_fee_rate() -> float:
-    return 2 * _fee_rate() + settings.stamp_tax_rate
+    from ..runtime_settings import get_setting
+
+    return 2 * _fee_rate() + float(get_setting("trading.stamp_tax_rate"))
 
 
 def _pivot_close(panel: pd.DataFrame) -> pd.DataFrame:
@@ -59,47 +71,146 @@ def _pivot_close(panel: pd.DataFrame) -> pd.DataFrame:
     return df.pivot_table(index="date", columns="code", values="close", aggfunc="last").sort_index()
 
 
+def _valuation_closes(closes: pd.DataFrame) -> pd.DataFrame:
+    """Return point-in-time close prices suitable for valuation.
+
+    A held security can legitimately have no row/quote on a portfolio date
+    (suspension, data-source gap, or an asynchronous universe).  Valuation must
+    use only information available on or before that date, so invalid prices
+    are replaced by the security's last positive finite close.  ``ffill`` is
+    deliberately column-wise and never looks into the future.
+    """
+    numeric = closes.apply(pd.to_numeric, errors="coerce")
+    valid = np.isfinite(numeric) & numeric.gt(0)
+    return numeric.where(valid).ffill()
+
+
+def _mark_to_market(
+    cash: float,
+    holdings: dict[str, float],
+    prices: pd.Series,
+) -> float:
+    """Value holdings from current-or-last-valid prices, failing on no basis."""
+    return portfolio_value(cash, holdings, prices)
+
+
+def _select_factor_codes(
+    snapshot: pd.DataFrame,
+    factor_names: tuple[str, ...] | list[str],
+    top_n: int,
+) -> list[str]:
+    """Select only rows with finite values for every declared factor."""
+    factors = tuple(dict.fromkeys(str(name) for name in factor_names if str(name)))
+    if snapshot is None or snapshot.empty or not factors:
+        return []
+
+    numeric = pd.DataFrame(index=snapshot.index)
+    for factor in factors:
+        if factor in snapshot.columns:
+            numeric[factor] = pd.to_numeric(snapshot[factor], errors="coerce")
+        else:
+            numeric[factor] = np.nan
+    eligible_mask = np.isfinite(numeric.to_numpy(dtype=float)).all(axis=1)
+    if not eligible_mask.any():
+        return []
+
+    eligible = snapshot.loc[eligible_mask].copy()
+    for factor in factors:
+        eligible[factor] = numeric.loc[eligible_mask, factor]
+    scored = composite_scores(
+        eligible,
+        factors,
+        # A one-factor experiment is valid; for multiple factors eligibility
+        # above already guarantees that every declared input is present.
+        min_factors=len(factors),
+    )
+    return select_top_n(scored, n=top_n)
+
+
+def _rebalance_dates(all_index, rebalance: str) -> set[pd.Timestamp]:
+    """Map a calendar frequency to real observed trading dates.
+
+    ``W-MON``/``W-FRI`` mean the first/last observed session of each
+    Monday-to-Sunday week.  ``MS``/``ME`` mean the first/last observed session
+    of each calendar month.  No synthetic resample labels are returned.
+    """
+    index = pd.DatetimeIndex(pd.to_datetime(all_index, errors="coerce"))
+    index = index[~index.isna()].unique().sort_values()
+    if index.empty:
+        return set()
+
+    frequency = str(rebalance or "").upper()
+    if frequency in {"W-MON", "W-FRI"}:
+        grouping_index = index.tz_localize(None) if index.tz is not None else index
+        periods = grouping_index.to_period("W-SUN")
+        keep = "first" if frequency == "W-MON" else "last"
+    elif frequency in {"MS", "ME"}:
+        grouping_index = index.tz_localize(None) if index.tz is not None else index
+        periods = grouping_index.to_period("M")
+        keep = "first" if frequency == "MS" else "last"
+    else:
+        raise ValueError(f"unsupported rebalance frequency: {rebalance}")
+
+    grouped = pd.DataFrame({"date": index, "period": periods})
+    selected = grouped.drop_duplicates("period", keep=keep)["date"]
+    return {pd.Timestamp(value) for value in selected}
+
+
 def run_equal_weight_buyhold(
     panel: pd.DataFrame,
     initial_cash: float | None = None,
     name: str = "pool_equal_weight",
 ) -> BacktestResult:
     """池内所有股票等权买入持有（锚）。"""
-    initial_cash = initial_cash or settings.initial_cash
+    from ..runtime_settings import get_setting
+
+    initial_cash = (
+        initial_cash if initial_cash is not None
+        else float(get_setting("account.initial_cash"))
+    )
     closes = _pivot_close(panel)
     if closes.empty or len(closes) < 2:
         eq = pd.Series(dtype=float)
         return BacktestResult(name=name, equity=eq, metrics=compute_metrics(eq))
+    valuation_closes = _valuation_closes(closes)
 
     # 第一日等权建仓，之后漂移
-    first = closes.iloc[0]
+    first = valuation_closes.iloc[0]
     valid = first.dropna()
     if valid.empty:
         eq = pd.Series(dtype=float)
         return BacktestResult(name=name, equity=eq, metrics=compute_metrics(eq))
 
-    w = 1.0 / len(valid)
-    # 建仓费
-    cash_deployed = initial_cash * (1 - _fee_rate())
-    shares = {c: cash_deployed * w / float(first[c]) for c in valid.index}
+    cost_model = ExecutionCostModel.from_settings()
+    opening = rebalance_equal_weight(
+        cash=float(initial_cash),
+        holdings={},
+        execution_prices=first,
+        valuation_prices=first,
+        target_codes=[str(code) for code in valid.index],
+        cost_model=cost_model,
+    )
+    cash = opening.cash
+    shares = opening.holdings
     equity = []
     idx = []
-    for dt, row in closes.iterrows():
-        val = 0.0
-        for c, q in shares.items():
-            px = row.get(c)
-            if px is not None and np.isfinite(px):
-                val += q * float(px)
-        equity.append(val)
+    for dt, row in valuation_closes.iterrows():
+        equity.append(_mark_to_market(cash, shares, row))
         idx.append(dt)
     eq = pd.Series(equity, index=idx)
     metrics = mark_sample_ok(
         compute_metrics(eq, closed_trades=0),
-        settings.race_min_trade_days,
-        settings.race_min_closed_trades,
+        int(get_setting("race.min_trade_days")),
+        int(get_setting("race.min_closed_trades")),
     )
     return BacktestResult(name=name, equity=eq, closed_trades=0, metrics=metrics,
-                          holdings_log=[{"date": str(idx[0])[:10], "codes": list(shares)}])
+                          holdings_log=[{
+                              "date": str(idx[0])[:10],
+                              "codes": list(shares),
+                              "fees": opening.fees,
+                              "turnover": opening.turnover,
+                              "untradeable_codes": list(opening.untradeable_codes),
+                          }])
 
 
 def run_factor_weekly(
@@ -110,8 +221,13 @@ def run_factor_weekly(
     rebalance: str | None = None,
 ) -> BacktestResult:
     """每周按截面综合分选前 top_n 等权再平衡。"""
-    top_n = top_n or settings.factor_top_n
-    initial_cash = initial_cash or settings.initial_cash
+    from ..runtime_settings import get_setting
+
+    top_n = top_n if top_n is not None else int(get_setting("factor.top_n"))
+    initial_cash = (
+        initial_cash if initial_cash is not None
+        else float(get_setting("account.initial_cash"))
+    )
     rebalance = rebalance or settings.factor_rebalance
 
     if panel is None or panel.empty:
@@ -124,88 +240,65 @@ def run_factor_weekly(
     if closes.empty:
         eq = pd.Series(dtype=float)
         return BacktestResult(name=name, equity=eq, metrics=compute_metrics(eq))
+    valuation_closes = _valuation_closes(closes)
 
     # 每个交易日截面打分
     dates = sorted(df["date"].unique())
     score_by_date: dict[Any, list[str]] = {}
     for dt in dates:
         snap = df[df["date"] == dt].copy()
-        scored = composite_scores(snap, FACTOR_NAMES)
-        score_by_date[dt] = select_top_n(scored, n=top_n)
+        score_by_date[dt] = _select_factor_codes(snap, FACTOR_NAMES, top_n)
 
-    # 再平衡日：周频
-    rebal_dates = set(pd.Series(closes.index).sort_values())
-    # 用 resample 标记每周第一个交易日
-    week_first = closes.resample(rebalance).first().dropna(how="all")
-    rebal_set = set(week_first.index)
-    # 对齐到 closes 索引中真实存在的日期
-    rebal_set = {d for d in closes.index if d in rebal_set or _is_week_start(d, closes.index)}
+    rebal_set = _rebalance_dates(closes.index, rebalance)
     if not rebal_set:
         rebal_set = {closes.index[0]}
-    # 确保首日调仓
-    rebal_set.add(closes.index[0])
-
     cash = float(initial_cash)
     holdings: dict[str, float] = {}  # code -> shares
     equity_vals = []
     holdings_log = []
     closed_trades = 0
-    fee_rt = _roundtrip_fee_rate()
+    cost_model = ExecutionCostModel.from_settings()
 
+    previous_dt = None
     for dt, row in closes.iterrows():
-        if dt in rebal_set or (not holdings and dt == closes.index[0]):
-            target_codes = score_by_date.get(dt) or score_by_date.get(
-                max((d for d in score_by_date if d <= dt), default=dt), []
+        valuation_row = valuation_closes.loc[dt]
+        # T 日收盘生成信号，只允许在下一个交易日价格执行。
+        if previous_dt is not None and dt in rebal_set:
+            target_codes = score_by_date.get(previous_dt, [])
+            rebalanced = rebalance_equal_weight(
+                cash=cash,
+                holdings=holdings,
+                execution_prices=row,
+                valuation_prices=valuation_row,
+                target_codes=target_codes,
+                cost_model=cost_model,
             )
-            # 当前市值
-            port_val = cash
-            for c, q in holdings.items():
-                px = row.get(c)
-                if px is not None and np.isfinite(px):
-                    port_val += q * float(px)
-
-            # 统计平仓：旧持仓不在新目标中
-            new_set = set(target_codes)
-            for c in list(holdings.keys()):
-                if c not in new_set:
-                    closed_trades += 1
-
-            # 清仓为现金后等权买入（扣近似换手费）
-            port_val *= (1 - fee_rt * 0.5)  # 半程摩擦近似
-            holdings = {}
-            cash = 0.0
-            buyable = []
-            for c in target_codes:
-                px = row.get(c)
-                if px is not None and np.isfinite(px) and float(px) > 0:
-                    buyable.append(c)
-            if buyable:
-                w = port_val / len(buyable)
-                for c in buyable:
-                    px = float(row[c])
-                    holdings[c] = w / px
-            else:
-                cash = port_val
+            cash = rebalanced.cash
+            holdings = rebalanced.holdings
+            closed_trades += rebalanced.closed_positions
             holdings_log.append({
                 "date": str(dt)[:10],
-                "codes": buyable,
-                "n": len(buyable),
+                "signal_date": str(previous_dt)[:10],
+                "codes": sorted(holdings),
+                "target_codes": target_codes,
+                "n": len(holdings),
+                "fees": rebalanced.fees,
+                "turnover": rebalanced.turnover,
+                "untradeable_codes": list(rebalanced.untradeable_codes),
             })
 
         # 盯市
-        val = cash
-        for c, q in holdings.items():
-            px = row.get(c)
-            if px is not None and np.isfinite(px):
-                val += q * float(px)
-        equity_vals.append(val)
+        equity_vals.append(_mark_to_market(cash, holdings, valuation_row))
+        previous_dt = dt
 
     eq = pd.Series(equity_vals, index=closes.index)
     # 基准超额：池内等权
     bench = run_equal_weight_buyhold(panel, initial_cash=initial_cash)
     metrics = compute_metrics(eq, closed_trades=closed_trades, benchmark=bench.equity)
     metrics = mark_sample_ok(
-        metrics, settings.race_min_trade_days, settings.race_min_closed_trades
+        metrics,
+        int(get_setting("race.min_trade_days")),
+        int(get_setting("race.min_closed_trades")),
     )
     return BacktestResult(
         name=name,
@@ -218,6 +311,4 @@ def run_factor_weekly(
 
 def _is_week_start(dt, all_index) -> bool:
     """若该日是 all_index 中当周第一个交易日。"""
-    week = pd.Timestamp(dt).to_period("W-SUN")
-    same = [d for d in all_index if pd.Timestamp(d).to_period("W-SUN") == week]
-    return bool(same) and same[0] == dt
+    return pd.Timestamp(dt) in _rebalance_dates(all_index, "W-MON")

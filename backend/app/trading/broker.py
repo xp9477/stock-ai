@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 from sqlalchemy.orm import Session
 
-from ..models import Account, Order, Position
+from ..models import Account, Model, Order, Position
 from ..runtime_settings import get_setting
 
 LIMIT_PCT = 9.8  # 涨跌停近似阈值(%)
@@ -53,10 +53,27 @@ def calc_sell_fee(amount: float) -> float:
     return round(commission + stamp + transfer, 2)
 
 
-def settle_t1(db: Session):
+def enabled_official_strategy_ids(db: Session) -> list[int]:
+    """Return the only model identities production settlement may mutate."""
+    return [
+        row[0]
+        for row in db.query(Model.id).filter(
+            Model.type == "ensemble",
+            Model.is_official_strategy.is_(True),
+            Model.enabled.is_(True),
+        ).all()
+    ]
+
+
+def settle_t1(db: Session, *, model_pks: list[int] | None = None):
     """每轮运行前调用:所有账户可卖数量 = 总数量 - 当日已买入数量(T+1)。"""
     today_start = datetime.combine(date.today(), datetime.min.time())
-    for pos in db.query(Position).all():
+    query = db.query(Position)
+    if model_pks is not None:
+        if not model_pks:
+            return
+        query = query.filter(Position.model_pk.in_(model_pks))
+    for pos in query.all():
         bought_today = (
             db.query(Order)
             .filter(Order.model_pk == pos.model_pk, Order.code == pos.code,
@@ -71,7 +88,7 @@ def settle_t1(db: Session):
 
 def buy(db: Session, model_pk: int, run_id: int | None, code: str, name: str,
         price: float, pct_change: float, target_amount: float,
-        reason: str = "") -> FillResult:
+        reason: str = "", *, autocommit: bool = True) -> FillResult:
     """按目标金额买入,向下取整为 100 股整手。"""
 
     def reject(why: str) -> FillResult:
@@ -79,7 +96,10 @@ def buy(db: Session, model_pk: int, run_id: int | None, code: str, name: str,
                       side="buy", price=price, qty=0, amount=0, fee=0,
                       status="rejected", reject_reason=why)
         db.add(order)
-        db.commit()
+        if autocommit:
+            db.commit()
+        else:
+            db.flush()
         return FillResult(False, order, why)
 
     if pct_change >= LIMIT_PCT:
@@ -119,12 +139,15 @@ def buy(db: Session, model_pk: int, run_id: int | None, code: str, name: str,
     order = Order(model_pk=model_pk, run_id=run_id, code=code, name=name,
                   side="buy", price=price, qty=qty, amount=round(amount, 2), fee=fee)
     db.add(order)
-    db.commit()
+    if autocommit:
+        db.commit()
+    else:
+        db.flush()
     return FillResult(True, order)
 
 
 def sell(db: Session, model_pk: int, run_id: int | None, code: str, name: str,
-         price: float, pct_change: float, qty: int) -> FillResult:
+         price: float, pct_change: float, qty: int, *, autocommit: bool = True) -> FillResult:
     """卖出指定数量(受 T+1 可卖数量限制,自动取整手;清仓时允许零股)。"""
 
     def reject(why: str) -> FillResult:
@@ -132,7 +155,10 @@ def sell(db: Session, model_pk: int, run_id: int | None, code: str, name: str,
                       side="sell", price=price, qty=0, amount=0, fee=0,
                       status="rejected", reject_reason=why)
         db.add(order)
-        db.commit()
+        if autocommit:
+            db.commit()
+        else:
+            db.flush()
         return FillResult(False, order, why)
 
     if pct_change <= -LIMIT_PCT:
@@ -163,5 +189,8 @@ def sell(db: Session, model_pk: int, run_id: int | None, code: str, name: str,
     order = Order(model_pk=model_pk, run_id=run_id, code=code, name=name,
                   side="sell", price=price, qty=qty, amount=round(amount, 2), fee=fee)
     db.add(order)
-    db.commit()
+    if autocommit:
+        db.commit()
+    else:
+        db.flush()
     return FillResult(True, order)

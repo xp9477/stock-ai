@@ -7,7 +7,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session
 
-from .models import Order, TradeLedger
+from .models import Order, Position, TradeLedger
 
 
 def factsheet_hash(sheet: dict) -> str:
@@ -29,6 +29,7 @@ def record_open(
     reason: str = "",
     fs_hash: str = "",
     order_id: int | None = None,
+    autocommit: bool = True,
 ) -> TradeLedger:
     row = TradeLedger(
         strategy_key=strategy_key,
@@ -47,7 +48,10 @@ def record_open(
         opened_at=datetime.now(),
     )
     db.add(row)
-    db.commit()
+    if autocommit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(row)
     return row
 
@@ -64,13 +68,59 @@ def record_close_from_sell(
     signal_source: str,
     order_id: int | None = None,
     avg_cost: float | None = None,
+    autocommit: bool = True,
 ) -> TradeLedger:
-    """记录一笔平仓事件；若有成本则计算实现盈亏。"""
+    """记录卖出事件；只有仓位真正归零时才算一笔完整平仓。"""
     pnl = 0.0
     pnl_pct = 0.0
     if avg_cost and avg_cost > 0:
         pnl = (price - avg_cost) * qty
         pnl_pct = price / avg_cost - 1
+    still_open = db.query(Position.id).filter(
+        Position.model_pk == model_pk,
+        Position.code == code,
+        Position.total_qty > 0,
+    ).first()
+    position_closed = still_open is None
+    opened_at = None
+    hold_days = 0
+    if position_closed:
+        open_rows = (
+            db.query(TradeLedger)
+            .filter(
+                TradeLedger.strategy_key == strategy_key,
+                TradeLedger.model_pk == model_pk,
+                TradeLedger.code == code,
+                TradeLedger.side == "open",
+                TradeLedger.is_closed.is_(False),
+            )
+            .order_by(TradeLedger.opened_at, TradeLedger.id)
+            .all()
+        )
+        dates = [r.opened_at for r in open_rows if r.opened_at]
+        opened_at = min(dates) if dates else None
+        hold_days = max((datetime.now().date() - opened_at.date()).days, 0) if opened_at else 0
+        partial_closes_query = db.query(TradeLedger).filter(
+            TradeLedger.strategy_key == strategy_key,
+            TradeLedger.model_pk == model_pk,
+            TradeLedger.code == code,
+            TradeLedger.side == "close",
+            TradeLedger.is_closed.is_(False),
+        )
+        if opened_at:
+            partial_closes_query = partial_closes_query.filter(
+                TradeLedger.created_at >= opened_at)
+        pnl += sum(float(r.pnl or 0.0) for r in partial_closes_query.all())
+        open_cost = sum(float(r.qty or 0) * float(r.price or 0.0) for r in open_rows)
+        if open_cost > 0:
+            pnl_pct = pnl / open_cost
+        for open_row in open_rows:
+            open_row.is_closed = True
+            open_row.closed_at = datetime.now()
+            open_row.hold_days = max(
+                (open_row.closed_at.date() - open_row.opened_at.date()).days, 0
+            ) if open_row.opened_at else 0
+
     row = TradeLedger(
         strategy_key=strategy_key,
         model_pk=model_pk,
@@ -81,14 +131,18 @@ def record_close_from_sell(
         price=price,
         signal_source=signal_source,
         order_id=order_id,
-        is_closed=True,
+        is_closed=position_closed,
         pnl=round(pnl, 2),
         pnl_pct=round(pnl_pct, 6),
         closed_at=datetime.now(),
-        opened_at=None,
+        opened_at=opened_at,
+        hold_days=hold_days,
     )
     db.add(row)
-    db.commit()
+    if autocommit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(row)
     return row
 

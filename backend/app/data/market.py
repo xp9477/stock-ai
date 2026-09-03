@@ -1,93 +1,19 @@
-"""数据层:实时行情/日K 用腾讯,指数/交易日历用新浪(AKShare),新闻用公开 RSS。
-
-东财 push2 行情在部分网络不可用,故行情主路径为腾讯 qt.gtimg.cn。
-新闻以 news_rss（设置 → 数据源 · 新闻 RSS）为准，不再默认东财。
-"""
+"""数据层：扶摇提供个股行情/日 K，新浪提供指数/交易日历，RSS 提供新闻。"""
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import akshare as ak
 import pandas as pd
-import requests
 
 from .cache import ttl_cache
 
 logger = logging.getLogger(__name__)
 
-_TX_QUOTE_URL = "https://qt.gtimg.cn/q={symbols}"
-
-
-def _tx_symbol(code: str) -> str:
-    if code.startswith(("60", "68")):
-        return f"sh{code}"
-    return f"sz{code}"
-
 
 @ttl_cache(30)
-def _tx_quote_raw(code: str) -> list[str] | None:
-    """腾讯单股实时行情原始字段列表。"""
-    from . import datasources as ds
-
-    if not ds.is_enabled("tencent"):
-        return None
-    to = ds.timeout_sec("tencent", 10)
-    resp = requests.get(_TX_QUOTE_URL.format(symbols=_tx_symbol(code)), timeout=to)
-    resp.encoding = "gbk"
-    text = resp.text.strip()
-    if '="' not in text:
-        # 审计：无标准行情体时留下片段，便于事后追查脏价
-        logger.warning(
-            "腾讯行情无有效体 code=%s http=%s body_head=%r",
-            code, resp.status_code, text[:180],
-        )
-        return None
-    fields = text.split('="', 1)[1].rstrip('";\n').split("~")
-    if len(fields) < 47 or not fields[3]:
-        logger.warning(
-            "腾讯行情字段异常 code=%s nfields=%s f3=%r body_head=%r",
-            code, len(fields), fields[3] if len(fields) > 3 else None, text[:180],
-        )
-        return None
-    return fields
-
-
 def get_quote(code: str) -> dict | None:
-    """单只股票实时行情（腾讯）。找不到或停牌无价格返回 None。
-
-    展示/选股可用；**强平/撮合请优先 get_trade_quote**（双源校验）。
-    """
-    fields = _tx_quote_raw(code)
-    if fields is None:
-        return None
-
-    def to_float(value: str) -> float | None:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    price = to_float(fields[3])
-    if not price or price <= 0:
-        price = to_float(fields[4])  # 停牌用昨收
-    if not price:
-        return None
-    return {
-        "code": code,
-        "name": fields[1],
-        "price": price,
-        "pct_change": to_float(fields[32]) or 0.0,
-        "volume": to_float(fields[36]) or 0.0,       # 成交量(手)
-        "turnover": (to_float(fields[37]) or 0.0) * 1e4,  # 成交额(元)
-        "pe": to_float(fields[39]),
-        "pb": to_float(fields[46]),
-        "market_cap": (to_float(fields[45]) or 0.0) * 1e8 or None,  # 总市值(元)
-        "source": "tencent",
-        "prev_close": to_float(fields[4]),
-    }
-
-
-def _fuyao_quote(code: str) -> dict | None:
-    """扶摇快照 → 与 get_quote 同形。"""
+    """扶摇单股行情快照。找不到或价格无效时返回 ``None``。"""
     from . import fuyao_client as fuyao
 
     if not fuyao.available():
@@ -116,18 +42,30 @@ def _fuyao_quote(code: str) -> dict | None:
         pct = float(pct)
     except (TypeError, ValueError):
         pct = 0.0
+    received_at = datetime.now(timezone.utc).isoformat()
+    prev_close = it.get("prev_price") or it.get("prev_close")
+    open_price = it.get("open_price") or it.get("open")
+    volume = float(it.get("volume") or 0)
     return {
         "code": code,
-        "name": it.get("name") or code,
+        "name": it.get("name") or "",
         "price": price,
         "pct_change": pct,
-        "volume": float(it.get("volume") or 0),
+        "volume": volume,
         "turnover": float(it.get("turnover") or it.get("amount") or 0),
         "pe": None,
         "pb": None,
         "market_cap": None,
         "source": "fuyao",
-        "prev_close": None,
+        "prev_close": float(prev_close) if prev_close is not None else None,
+        "open": float(open_price) if open_price is not None else None,
+        # 扶摇 snapshot 当前不返回交易所时间；明确标记为客户端接收时间，
+        # 避免把它误称为交易所时间戳。
+        "quote_asof": received_at,
+        "quote_asof_source": "client_received_at",
+        "received_at": received_at,
+        "tradable": volume > 0,
+        "trade_status": "tradable" if volume > 0 else "suspended_or_unavailable",
     }
 
 
@@ -135,43 +73,24 @@ def get_trade_quote(
     code: str,
     *,
     avg_cost: float | None = None,
-    require_cross_check: bool = True,
 ) -> dict | None:
-    """交易/强平用行情：优先扶摇，腾讯交叉验证；写审计日志。
-
-    require_cross_check=True 时：两源都有则价差须 <3%，否则拒绝（防单源脏价）。
-    """
-    fuyao_q = _fuyao_quote(code)
-    tx_q = get_quote(code)
-
-    primary = fuyao_q or tx_q
-    secondary = tx_q if fuyao_q else None
+    """交易/强平行情：仅使用扶摇，并用同源日 K 与成本做确定性校验。"""
+    primary = get_quote(code)
     if primary is None:
-        logger.warning("交易行情不可用 code=%s fuyao=%s tencent=%s",
-                       code, bool(fuyao_q), bool(tx_q))
+        logger.warning("交易行情不可用 code=%s source=fuyao", code)
         return None
 
-    if require_cross_check and fuyao_q and tx_q:
-        p1, p2 = float(fuyao_q["price"]), float(tx_q["price"])
-        mid = (p1 + p2) / 2.0
-        dev = abs(p1 - p2) / mid if mid > 0 else 1.0
-        if dev > 0.03:
-            logger.error(
-                "双源报价不一致，拒绝交易 code=%s fuyao=%.4f tencent=%.4f dev=%.2f%%",
-                code, p1, p2, dev * 100,
-            )
-            return None
-        # 用两源均值更稳
-        primary = {**fuyao_q, "price": round(mid, 4),
-                   "source": "fuyao+tencent", "tencent_price": p2, "fuyao_price": p1}
+    if not bool(primary.get("tradable")):
+        logger.warning("交易行情不可交易/疑似停牌 code=%s status=%s",
+                       code, primary.get("trade_status"))
+        return None
 
     cleaned = sanitize_quote(primary, code=code, avg_cost=avg_cost)
     if cleaned is None:
         logger.error(
-            "交易行情未通过校验 code=%s primary=%s secondary_tx=%s avg_cost=%s",
+            "交易行情未通过校验 code=%s primary=%s avg_cost=%s",
             code,
             {k: primary.get(k) for k in ("price", "source", "pct_change")},
-            {k: (tx_q or {}).get(k) for k in ("price", "pct_change")} if tx_q else None,
             avg_cost,
         )
         return None
@@ -184,26 +103,60 @@ def get_trade_quote(
     return cleaned
 
 
+def get_execution_quote(
+    code: str,
+    *,
+    avg_cost: float | None = None,
+    force_refresh: bool = True,
+    require_session: bool = True,
+) -> dict | None:
+    """审批/执行瞬间使用的报价快照。
+
+    与展示行情不同：默认绕过 30 秒缓存、要求连续竞价时段，并要求可交易、
+    开盘价、昨收价和供应商时间戳齐全。任何缺失都 fail closed。
+    """
+    if require_session and not is_trading_session():
+        logger.warning("非连续竞价时段，拒绝生成执行报价 code=%s", code)
+        return None
+    if force_refresh and hasattr(get_quote, "cache_clear"):
+        get_quote.cache_clear()
+    quote = get_trade_quote(code, avg_cost=avg_cost)
+    if quote is None or not bool(quote.get("tradable", True)):
+        return None
+    required = ("price", "open", "prev_close", "quote_asof", "received_at")
+    if any(quote.get(key) in (None, "") for key in required):
+        logger.warning(
+            "执行报价字段不完整 code=%s missing=%s source=%s",
+            code, [key for key in required if quote.get(key) in (None, "")],
+            quote.get("source"),
+        )
+        return None
+    try:
+        price = float(quote["price"])
+        open_price = float(quote["open"])
+        prev_close = float(quote["prev_close"])
+    except (TypeError, ValueError):
+        return None
+    if min(price, open_price, prev_close) <= 0:
+        return None
+    return {
+        **quote,
+        "opening_gap_pct": open_price / prev_close - 1.0,
+    }
+
+
 @ttl_cache(1800)
 def get_daily_kline(code: str) -> pd.DataFrame:
-    """近 120 个交易日日 K(腾讯),列名对齐东财风格。受 datasources.tencent 控制。"""
-    from . import datasources as ds
-    from .http_timeout import call_with_timeout
+    """近 120 个交易日日 K（扶摇），列名对齐既有指标代码。"""
+    from . import fuyao_client as fuyao
 
-    if not ds.is_enabled("tencent"):
-        if ds.fail_policy("tencent", "hard") == "skip":
-            return pd.DataFrame(columns=["日期", "开盘", "收盘", "最高", "最低", "成交量", "涨跌幅"])
-        raise RuntimeError("腾讯数据源已禁用（设置 → 数据源），无法拉取日 K")
-
-    start = (date.today() - timedelta(days=240)).strftime("%Y%m%d")
-    end = date.today().strftime("%Y%m%d")
-    to = ds.timeout_sec("tencent", 10)
-
-    def _fetch():
-        return ak.stock_zh_a_hist_tx(
-            symbol=_tx_symbol(code), start_date=start, end_date=end)
-
-    df = call_with_timeout(_fetch, to)
+    if not fuyao.available():
+        raise RuntimeError("扶摇未配置或已禁用，无法拉取日 K")
+    start = date.today() - timedelta(days=240)
+    df = fuyao.daily_bars(code, start, date.today())
+    if df is None or df.empty:
+        return pd.DataFrame(
+            columns=["日期", "开盘", "收盘", "最高", "最低", "成交量", "涨跌幅"])
     df = df.rename(columns={"date": "日期", "open": "开盘", "close": "收盘",
                             "high": "最高", "low": "最低", "volume": "成交量"})
     close = df["收盘"].astype(float)
@@ -213,7 +166,7 @@ def get_daily_kline(code: str) -> pd.DataFrame:
 
 @ttl_cache(3600)
 def get_stock_info(code: str) -> dict:
-    """个股基本信息。东财接口不可用时降级为腾讯行情推导。"""
+    """个股基本信息。东财接口不可用时降级为扶摇行情摘要。"""
     try:
         df = ak.stock_individual_info_em(symbol=code, timeout=10)
         return {str(row["item"]): str(row["value"]) for _, row in df.iterrows()}
@@ -230,9 +183,13 @@ def get_stock_info(code: str) -> dict:
 
 @ttl_cache(600)
 def get_news(code: str, name: str = "") -> list[dict]:
-    """个股相关新闻（公开 RSS，与 factsheet 同源）。
+    """个股直接相关新闻（公开 RSS，与 factsheet 同源）。
 
     受 datasources.rss.* 控制：禁用时按 fail_policy 返回空或抛错。
+
+    通用宏观头条不得混入这里。这个返回值会冻结进交易计划的信息
+    基线，若把 general fallback 当作个股新闻，盘前门禁就会把空的直接
+    新闻集合误报成“新增个股新闻”。
     """
     from . import datasources as ds
     from . import news_rss
@@ -241,7 +198,8 @@ def get_news(code: str, name: str = "") -> list[dict]:
         if ds.fail_policy("rss", "skip") == "hard":
             raise RuntimeError("新闻 RSS 已禁用（设置 → 数据源）")
         return []
-    return news_rss.news_for_stock(code, name=name, limit=10)
+    return news_rss.news_for_stock(
+        code, name=name, limit=10, include_general=False)
 
 
 @ttl_cache(1800)
@@ -307,21 +265,27 @@ def _trade_dates() -> set:
 
 
 def is_trade_date(day: date | None = None) -> bool:
-    day = day or date.today()
+    day = day or datetime.now(ZoneInfo("Asia/Shanghai")).date()
     try:
         return day.strftime("%Y-%m-%d") in _trade_dates()
-    except Exception:  # noqa: BLE001
-        return day.weekday() < 5  # 日历获取失败退化为工作日判断
+    except Exception as err:  # noqa: BLE001
+        # 工作日不等于交易日。节假日日历不可验证时，交易安全边界必须
+        # fail closed，不能把普通周一误当作可成交日。
+        logger.error("交易日日历不可用，拒绝按工作日猜测: %s", err)
+        return False
 
 
 def is_trading_session(now: datetime | None = None) -> bool:
     """A 股连续竞价大致时段。非交易日 / 夜盘一律 False。"""
     from datetime import time as dtime
 
-    now = now or datetime.now()
+    shanghai = ZoneInfo("Asia/Shanghai")
+    now = now or datetime.now(shanghai)
+    if now.tzinfo is not None:
+        now = now.astimezone(shanghai).replace(tzinfo=None)
     if not is_trade_date(now.date()):
         return False
-    t = now.time()
+    t = now.time().replace(tzinfo=None)
     return (
         dtime(9, 30) <= t <= dtime(11, 30)
         or dtime(13, 0) <= t <= dtime(15, 0)
@@ -402,6 +366,45 @@ def validate_code(code: str) -> dict | None:
     if "ST" in quote["name"].upper():
         return None
     return quote
+
+
+def strategy_eligible_quote(code: str) -> tuple[dict | None, str]:
+    """Return a quote only when a new position can satisfy hard eligibility.
+
+    The watchlist is an observation list, not an execution universe.  Before
+    an LLM is allowed to consider a *new* position, code class, live quote
+    validity, ST/delisting labels and one-board-lot affordability are enforced
+    by deterministic code.  Existing positions are added separately by the
+    engine so an ineligible stock can still be reviewed and sold.
+    """
+    if not (len(code) == 6 and code.isdigit()):
+        return None, "invalid_code"
+    if not code.startswith(("60", "00", "30", "68")):
+        return None, "unsupported_board"
+    quote = get_quote(code)
+    if quote is None:
+        return None, "quote_unavailable"
+    if not bool(quote.get("tradable", True)):
+        return None, "not_tradable"
+    name = str(quote.get("name") or "")
+    if "ST" in name.upper() or "退" in name:
+        return None, "special_treatment_or_delisting"
+    try:
+        price = float(quote.get("price") or 0.0)
+    except (TypeError, ValueError):
+        return None, "invalid_price"
+    if price <= 0:
+        return None, "invalid_price"
+
+    from ..runtime_settings import get_setting
+
+    authorized = float(get_setting("capital.authorized_capital"))
+    absolute_cap = float(get_setting("capital.max_stock_exposure"))
+    single_cap = authorized * float(get_setting("risk.max_position_pct"))
+    lot_budget = min(authorized, absolute_cap, single_cap)
+    if price * 100 > lot_budget + 1e-9:
+        return None, "one_lot_exceeds_single_position_cap"
+    return quote, "eligible"
 
 
 # ---------- 自动选股 ----------

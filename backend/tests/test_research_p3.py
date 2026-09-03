@@ -8,6 +8,7 @@ from app.models import Account, Model, ResearchHypothesis, Watchlist
 from app.research import service as research
 from app.research.spec import heuristic_from_theory, validate_spec
 from app.backtest.spec_runner import run_spec_backtest
+from app.backtest.validation import split_development_holdout
 
 
 def test_heuristic_parses_theory():
@@ -63,7 +64,13 @@ def test_spec_runner_produces_equity():
     assert "sharpe" in res.metrics
 
 
-def test_promote_creates_rule_model(db, monkeypatch):
+def test_holdout_split_is_strictly_later():
+    development, holdout = split_development_holdout(_synthetic_panel(n_days=80))
+    assert not development.empty and not holdout.empty
+    assert pd.to_datetime(development["date"]).max() < pd.to_datetime(holdout["date"]).min()
+
+
+def test_legacy_mutable_projection_cannot_promote_or_create_capital(db):
     db.add(Watchlist(code="600519", name="茅台", source="manual"))
     db.add(Watchlist(code="000001", name="平安", source="manual"))
     db.commit()
@@ -81,27 +88,26 @@ def test_promote_creates_rule_model(db, monkeypatch):
     row.suggestion = "promote"
     db.commit()
 
-    monkeypatch.setattr(research, "max_live_arms", lambda: 10)
-    monkeypatch.setattr(research, "count_competitive_live", lambda db: 0)
-    out = research.promote(db, hid)
-    assert out["status"] == "promoted"
-    assert out["promoted_model_id"].startswith("res_")
-    m = db.query(Model).filter(Model.model_id == out["promoted_model_id"]).first()
-    assert m is not None and m.type == "rule" and m.enabled
-    acc = db.query(Account).filter(Account.model_pk == m.id).first()
-    assert acc is not None
+    before = (
+        db.query(Model).count(),
+        db.query(Account).count(),
+    )
+    try:
+        research.promote(db, hid)
+        assert False, "legacy mutable projection must not promote"
+    except ValueError as err:
+        assert "不可变 experiment" in str(err)
+    assert (db.query(Model).count(), db.query(Account).count()) == before
 
 
-def test_promote_cap(db, monkeypatch):
-    h = research.create_hypothesis(db, "x", title="满额")
+def test_empty_projection_cannot_promote(db):
+    h = research.create_hypothesis(db, "x", title="无证据")
     row = db.get(ResearchHypothesis, h["id"])
     row.backtest_json = "{}"
     row.status = "backtested"
     db.commit()
-    monkeypatch.setattr(research, "max_live_arms", lambda: 2)
-    monkeypatch.setattr(research, "count_competitive_live", lambda db: 2)
     try:
         research.promote(db, h["id"])
         assert False, "should fail"
     except ValueError as err:
-        assert "满" in str(err)
+        assert "不可变 experiment" in str(err)

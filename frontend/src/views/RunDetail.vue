@@ -9,7 +9,7 @@
             {{ statusText(detail.status) }}
           </el-tag>
           <span v-if="liveProgress?.message" class="dim">{{ liveProgress.message }}</span>
-          <span v-else class="dim">各 Agent 报告与最终动作 · 观望默认折叠</span>
+          <span v-else class="dim">独立判断、最终交易员与风险复核 · 买卖结论只生成候选计划</span>
         </p>
       </div>
       <div class="head-actions">
@@ -18,7 +18,7 @@
           size="small"
           inline-prompt
           active-text="调试"
-          inactive-text="流水线"
+          inactive-text="证据链"
         />
         <el-button
           v-if="isLive"
@@ -56,7 +56,7 @@
     <el-alert
       v-if="detail.status === 'cancelled'"
       type="warning"
-      title="本轮已协作取消：当前 Agent 结束后停止，已落库报告保留，未完成票不会撮合。"
+      title="本轮已协作取消：当前步骤结束后停止，已落库判断保留，未完成判断不会生成候选计划。"
       class="mb"
       show-icon
       :closable="false"
@@ -93,20 +93,37 @@
     <section v-if="detail.result?.kind === 'pipeline'" class="panel mb">
       <div class="panel-h">
         <div class="panel-title">本轮汇总</div>
-        <router-link class="flow-link" to="/orders">看成交 →</router-link>
+        <router-link class="flow-link" to="/orders">查看候选计划 →</router-link>
       </div>
       <div class="sel-stats mono">
-        <span>买 <b class="up">{{ detail.result.buy || 0 }}</b></span>
-        <span>卖 <b class="down">{{ detail.result.sell || 0 }}</b></span>
+        <span>候选买入 <b class="up">{{ detail.result.signal_buy ?? detail.result.buy ?? 0 }}</b></span>
+        <span>候选卖出 <b class="down">{{ detail.result.signal_sell ?? detail.result.sell ?? 0 }}</b></span>
         <span>观望 {{ detail.result.hold || 0 }}</span>
-        <span>模型 {{ detail.result.llm_models || 0 }}+合议 {{ detail.result.ensembles || 0 }}</span>
+        <span>独立模型 {{ detail.result.llm_models || 0 }} · 最终汇总 {{ detail.result.ensembles || 0 }}</span>
       </div>
+      <div v-if="detail.result.entry_setup_counts" class="sel-stats mono" style="margin-top:10px">
+        <span>门禁通过 <b class="up">{{ detail.result.entry_setup_counts.actionable || 0 }}</b></span>
+        <span>观察 {{ detail.result.entry_setup_counts.watch || 0 }}</span>
+        <span>拒绝 {{ detail.result.entry_setup_counts.rejected || 0 }}</span>
+        <span>数据不足 {{ detail.result.entry_setup_counts.data_insufficient || 0 }}</span>
+        <span>{{ detail.result.entry_setup_version }}</span>
+      </div>
+      <div v-if="(detail.result.entry_setup_actionable_codes || []).length" class="sel-tags" style="margin-top:10px">
+        <span class="dim" style="margin-right:8px">进入合议</span>
+        <el-tag
+          v-for="code in detail.result.entry_setup_actionable_codes"
+          :key="code" size="small" type="danger" effect="plain" class="mr"
+        >{{ code }}</el-tag>
+      </div>
+      <p v-if="detail.result.degraded" class="down" style="margin:10px 0 0">
+        本轮存在数据或模型降级；请查看判断失败数与具体决策错误后再审批。
+      </p>
     </section>
 
     <!-- 时间线（当前模型） -->
     <section v-if="timelineSteps.length" class="panel mb">
       <div class="panel-h">
-        <div class="panel-title">Agent 时间线</div>
+        <div class="panel-title">决策证据时间线</div>
         <span class="dim" style="font-size:12px">完成即可见 · 运行中自动刷新</span>
       </div>
       <ol class="timeline">
@@ -143,20 +160,20 @@
             <div class="markdown" v-html="render(slot.selector_report)" />
           </el-collapse-item>
           <el-collapse-item v-if="slot.market_report" name="market">
-            <template #title><b>大盘环境</b></template>
+            <template #title><b>冻结市场事实</b></template>
             <div class="markdown" v-html="render(slot.market_report)" />
             <div v-if="debugMode" class="input-block">
               <div class="input-label">调试 · 已落库全文见上</div>
             </div>
           </el-collapse-item>
           <el-collapse-item v-if="slot.reflection" name="reflect">
-            <template #title><b>本轮反思</b></template>
+            <template #title><b>历史复盘（不参与当前判断）</b></template>
             <div class="markdown" v-html="render(slot.reflection)" />
           </el-collapse-item>
         </el-collapse>
 
         <div v-if="!activeStocks(slot).length && holdStocks(slot).length" class="idle-banner mb">
-          本轮该模型无买卖指令，以下均为观望 / 不操作。
+          本轮该模型未生成候选买卖计划，以下均为观望 / 不操作。
         </div>
 
         <!-- 买卖 / 进行中 / 失败：默认展开 -->
@@ -176,7 +193,7 @@
               </el-tag>
               <span class="confidence mono">信心 {{ (stock.decision.confidence * 100).toFixed(0) }}%</span>
             </template>
-            <el-tag v-else size="small" type="info">进行中 / 待决策</el-tag>
+            <el-tag v-else size="small" type="info">判断中 / 待形成计划</el-tag>
           </div>
 
           <el-alert v-if="stock.decision?.error" type="error"
@@ -212,7 +229,7 @@
                 <el-tag size="small" type="info" effect="plain" class="hold-count">
                   {{ holdStocks(slot).length }} 只
                 </el-tag>
-                <span class="hold-fold-hint dim">默认折叠 · 未触发交易</span>
+                <span class="hold-fold-hint dim">默认折叠 · 未生成交易计划</span>
               </div>
             </template>
             <div
@@ -260,7 +277,7 @@
     />
     <el-empty
       v-else-if="!loading && !(detail.models || []).length && isLive"
-      description="流水线启动中，Agent 完成后将显示在此…"
+      description="决策流水线启动中，独立判断完成后将显示在此…"
     />
   </div>
 </template>
@@ -268,9 +285,9 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
-import { marked } from 'marked'
 import { ElMessage } from 'element-plus'
 import api from '../api/index.js'
+import { renderMarkdown } from '../utils/markdown.js'
 
 const route = useRoute()
 const detail = ref({})
@@ -284,11 +301,14 @@ const holdOpen = reactive({})
 let pollTimer = null
 
 const AGENT_NAMES = {
-  market: '大盘环境',
-  technical: '技术分析', fundamental: '基本面', news: '新闻情绪',
-  bull_1: '多头 · 第1轮', bear_1: '空头 · 第1轮',
-  bull_2: '多头 · 第2轮', bear_2: '空头 · 第2轮',
-  trader: '交易员', risk: '风控', reflect: '反思',
+  independent_judgment: '独立判断', judgment: '独立判断',
+  final_trader: '最终交易员', trader: '最终交易员（旧记录）',
+  risk_review: '风险复核', risk: '风险复核（旧记录）',
+  market: '冻结市场事实',
+  technical: '历史技术论证', fundamental: '历史基本面论证', news: '历史新闻论证',
+  bull_1: '历史论证 · 1A', bear_1: '历史论证 · 1B',
+  bull_2: '历史论证 · 2A', bear_2: '历史论证 · 2B',
+  reflect: '历史复盘（不参与当前判断）',
 }
 const agentName = (key) => AGENT_NAMES[key] || key
 const actionType = (a) => ({ buy: 'danger', sell: 'success', hold: 'info' }[a] || 'info')
@@ -298,8 +318,8 @@ const reasonAlertType = (a) => ({ buy: 'error', sell: 'success', hold: 'info' }[
 function decisionActionText(decision) {
   if (!decision) return ''
   const a = decision.action
-  if (a === 'buy') return '买入'
-  if (a === 'sell') return '卖出'
+  if (a === 'buy') return '候选买入'
+  if (a === 'sell') return '候选卖出'
   if (a === 'hold') {
     return (decision.target_position_pct || 0) > 0.001 ? '继续持有' : '观望'
   }
@@ -312,7 +332,7 @@ const statusType = (s) => ({
 const statusText = (s) => ({
   running: '运行中', done: '完成', failed: '失败', cancelled: '已取消',
 }[s] || s || '…')
-const render = (text) => marked.parse(text || '')
+const render = renderMarkdown
 
 function isQuietHold(stock) {
   const d = stock?.decision
@@ -376,7 +396,7 @@ const timelineSteps = computed(() => {
   const steps = []
   if (slot.market_report) {
     steps.push({
-      title: '大盘环境',
+      title: '冻结市场事实',
       state: 'done',
       time: '',
       output: slot.market_report,
@@ -398,7 +418,7 @@ const timelineSteps = computed(() => {
     }
     if (stock.decision && !stock.decision.error) {
       steps.push({
-        title: `${stock.name || stock.code} · 最终决策`,
+        title: `${stock.name || stock.code} · 条件计划结论`,
         state: 'done',
         time: '',
         preview: `${decisionActionText(stock.decision)} ${stock.decision.reason || ''}`.slice(0, 120),
@@ -408,7 +428,7 @@ const timelineSteps = computed(() => {
   }
   if (slot.reflection) {
     steps.push({
-      title: '反思',
+      title: '历史复盘（不参与当前判断）',
       state: 'done',
       output: slot.reflection,
       preview: String(slot.reflection).slice(0, 80),

@@ -1,4 +1,6 @@
 """本地计算技术指标 (pandas)。"""
+from typing import Any
+
 import pandas as pd
 
 
@@ -57,3 +59,47 @@ def indicators_text(kline: pd.DataFrame, days: int = 60) -> str:
             f"{row['成交量']}, {row['涨跌幅']}"
         )
     return "\n".join(lines)
+
+
+def latest_indicator_snapshot(kline: pd.DataFrame) -> dict[str, Any]:
+    """Return a compact, JSON-safe latest technical snapshot.
+
+    The long text table remains useful for audit, but strategy gates must not
+    parse prose.  This structure is therefore the machine-readable source used
+    by the entry setup contract.
+    """
+    if kline is None or kline.empty:
+        return {}
+    df = compute_indicators(kline)
+    if df.empty:
+        return {}
+    last = df.iloc[-1]
+
+    def number(column: str) -> float | None:
+        value = last.get(column)
+        if value is None or pd.isna(value):
+            return None
+        return float(value)
+
+    close = pd.to_numeric(df["收盘"], errors="coerce")
+
+    def trailing_return(periods: int) -> float | None:
+        clean = close.dropna()
+        if len(clean) <= periods:
+            return None
+        base = float(clean.iloc[-periods - 1])
+        return None if base <= 0 else float(clean.iloc[-1] / base - 1.0)
+
+    return {
+        "close": number("收盘"),
+        "ma5": number("MA5"),
+        "ma10": number("MA10"),
+        "ma20": number("MA20"),
+        "dif": number("DIF"),
+        "dea": number("DEA"),
+        "macd": number("MACD"),
+        "rsi14": number("RSI14"),
+        "volume_ratio_5d": number("VOL_RATIO"),
+        "return_5d": trailing_return(5),
+        "return_20d": trailing_return(20),
+    }

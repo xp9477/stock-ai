@@ -1,4 +1,6 @@
 """RSS 新闻解析单测（无网络）。"""
+from datetime import datetime, timedelta, timezone
+
 from app.data.news_rss import _parse_rss, _strip_html, news_for_stock
 
 
@@ -36,10 +38,11 @@ def test_news_for_stock_matches(monkeypatch):
     from app.data import news_rss
 
     def fake_headlines():
+        now = datetime.now(timezone.utc).isoformat()
         return [
-            {"title": "600519 贵州茅台上涨", "content": "白酒", "time": "t",
+            {"title": "600519 贵州茅台上涨", "content": "白酒", "time": now,
              "url": "u", "source": "s"},
-            {"title": "无关宏观", "content": "美联储", "time": "t",
+            {"title": "无关宏观", "content": "美联储", "time": now,
              "url": "u", "source": "s"},
         ]
 
@@ -51,11 +54,27 @@ def test_news_for_stock_matches(monkeypatch):
     assert miss and miss[0]["match"] == "general"
 
 
+def test_stock_news_excludes_stale_items(monkeypatch):
+    from app.data import news_rss
+
+    stale = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+    monkeypatch.setattr(news_rss, "fetch_all_headlines", lambda: [{
+        "title": "600519 贵州茅台旧闻", "content": "旧内容", "time": stale,
+        "url": "u", "source": "s",
+    }])
+
+    assert news_for_stock(
+        "600519", "贵州茅台", limit=5, include_general=False) == []
+
+
 def test_market_get_news_uses_rss(monkeypatch):
     """决策流水线与 factsheet 应同源 RSS，而非东财。"""
     from app.data import market, news_rss
 
-    def fake_for_stock(code, name="", limit=10):
+    calls = []
+
+    def fake_for_stock(code, name="", limit=10, *, include_general=True):
+        calls.append(include_general)
         return [{"title": f"rss-{code}", "content": name, "time": "t",
                  "url": "u", "source": "test", "match": "stock"}]
 
@@ -65,6 +84,7 @@ def test_market_get_news_uses_rss(monkeypatch):
         market.get_news.cache_clear()
     items = market.get_news("600519", name="贵州茅台")
     assert items and items[0]["title"] == "rss-600519"
+    assert calls == [False]
 
 
 def test_fetch_respects_rss_disabled(monkeypatch):

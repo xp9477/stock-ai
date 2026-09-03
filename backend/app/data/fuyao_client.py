@@ -14,6 +14,7 @@ import pandas as pd
 import requests
 
 from ..runtime_settings import get_setting
+from .cache import ttl_cache
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,7 @@ def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     return body.get("data") or {}
 
 
+@ttl_cache(30 * 60)
 def daily_bars(
     code: str,
     start: date | str,
@@ -179,6 +181,7 @@ def financial_indicators(code: str, report: str) -> dict[str, Any]:
     return out
 
 
+@ttl_cache(6 * 3600)
 def roe_history(code: str, years: int = 4) -> pd.DataFrame:
     """近若干年季报/年报 ROE，带近似公告日（用于 PIT asof）。
 

@@ -11,8 +11,9 @@ from typing import Any, Literal
 from .agents import prompts
 
 SettingType = Literal["int", "float", "bool", "str", "text", "percent", "time", "secret"]
-# normal=随时改; confirm=保存前强确认; frozen=仅影响新开账户/重置后（改参不改已有赛季）
+# normal=随时改; confirm=保存前强确认; frozen=仅影响新的证据纪元
 DangerLevel = Literal["normal", "confirm", "frozen"]
+EvidenceRole = Literal["contract", "provisional", "invariant", "operational"]
 
 
 @dataclass(frozen=True)
@@ -32,21 +33,31 @@ class SettingDef:
     # 敏感字段：API 只返回脱敏，空写=不修改
     secret: bool = False
     danger: DangerLevel = "normal"
+    # contract=用户资金契约；provisional=必须接受历史/前瞻验证；
+    # invariant=工程正确性；operational=密钥、调度等运维项。
+    evidence_role: EvidenceRole = "operational"
+    # 前端数字框：费率这类小小数必须显式给出，不能默认两位。
+    step: float | None = None
+    precision: int | None = None
 
 
 # 分组元信息（UI Tab 顺序）
 GROUPS: list[dict[str, str]] = [
     {"id": "secrets", "label": "密钥", "description": "LLM / 数据源 API（脱敏；DB 覆盖优先于 .env）"},
-    {"id": "datasources", "label": "数据源", "description": "扶摇/新浪/腾讯/Tushare/RSS：启停、超时、失败策略与健康状态"},
-    {"id": "account", "label": "账户", "description": "初始资金等（冻结项仅影响新开/重置账户）"},
+    {"id": "datasources", "label": "数据源", "description": "扶摇/新浪/Tushare/RSS：启停、超时、失败策略与健康状态"},
+    {"id": "notifications", "label": "通知", "description": "Bark 人工介入提醒：候选计划、风险复审与运行异常"},
+    {"id": "account", "label": "账户", "description": "官方策略初始资金契约（只读）"},
+    {"id": "capital", "label": "资金契约", "description": "用户明确授权的资金与损失边界；不参与收益调参"},
+    {"id": "signal", "label": "信号策略", "description": "候选参数，必须版本化并接受历史/前瞻验证"},
+    {"id": "execution", "label": "执行契约", "description": "人工确认与成交安全不变量"},
     {"id": "trading", "label": "撮合", "description": "佣金/印花税/过户费（改后影响后续可比性）"},
     {"id": "selector", "label": "选股", "description": "规则初筛阈值、股池与淘汰"},
     {"id": "prompt", "label": "Prompt", "description": "各 Agent 系统提示词"},
     {"id": "risk", "label": "风控", "description": "止盈止损、仓位硬顶"},
     {"id": "factor", "label": "因子", "description": "S3 因子窗口、中性化与 Top N"},
-    {"id": "models", "label": "参赛账户", "description": "摘要只读 · 管理请到参赛账户页"},
+    {"id": "models", "label": "模型与策略", "description": "LLM 顾问与唯一官方 ensemble 策略"},
     {"id": "schedule", "label": "调度", "description": "定时决策 / 选股 / 监控"},
-    {"id": "race", "label": "赛马", "description": "样本门槛（可验证 edge）"},
+    {"id": "validation", "label": "证据门槛", "description": "历史/前瞻样本的最低验证要求"},
     {"id": "logs", "label": "日志", "description": "全局日志保留与级别"},
     {"id": "debug", "label": "调试", "description": "决策流水线调试开关"},
 ]
@@ -63,7 +74,7 @@ _DEFS: list[SettingDef] = [
         key="secrets.llm_api_key",
         group="secrets", type="secret", default="",
         label="LLM API Key",
-        description="所有参赛 LLM 共用；留空保存=不修改。恢复默认后回退 .env",
+        description="所有判断 LLM 共用；留空保存=不修改。恢复默认后回退 .env",
         secret=True,
     ),
     SettingDef(
@@ -86,6 +97,64 @@ _DEFS: list[SettingDef] = [
         label="Tushare Token",
         description="可选备份数据源，默认不用",
         secret=True,
+    ),
+
+    # ---------- 人工介入通知 ----------
+    SettingDef(
+        key="notifications.bark.enabled",
+        group="notifications", type="bool", default=False,
+        label="启用 Bark 通知",
+        description="仅通知需要人工介入的候选计划、风险复审和运行异常；普通观望不通知",
+    ),
+    SettingDef(
+        key="notifications.bark.server_url",
+        group="notifications", type="str", default="https://api.day.app",
+        label="Bark Server",
+        description="官方服务或自建服务根地址；系统使用 POST /push",
+    ),
+    SettingDef(
+        key="notifications.bark.device_key",
+        group="notifications", type="secret", default="",
+        label="Bark Device Key",
+        description="Bark App 测试 URL 中的设备 Key；API 永不回传明文",
+        secret=True,
+    ),
+    SettingDef(
+        key="notifications.bark.open_url",
+        group="notifications", type="str", default="",
+        label="手机可访问的系统地址",
+        description="例如 http://192.168.1.20:18000；留空则通知不附点击跳转",
+    ),
+    SettingDef(
+        key="notifications.bark.group",
+        group="notifications", type="str", default="stock-ai",
+        label="通知分组",
+        description="Bark 历史消息中的分组名称",
+    ),
+    SettingDef(
+        key="notifications.bark.timeout_sec",
+        group="notifications", type="int", default=8,
+        label="推送超时", unit="秒",
+        description="推送失败只记日志，不影响决策或持仓",
+        min_value=2, max_value=30,
+    ),
+    SettingDef(
+        key="notifications.bark.notify_candidates",
+        group="notifications", type="bool", default=True,
+        label="候选计划待审批",
+        description="出现买入/卖出候选计划时发送时效性通知",
+    ),
+    SettingDef(
+        key="notifications.bark.notify_risk_reviews",
+        group="notifications", type="bool", default=True,
+        label="持仓风险与复审",
+        description="止盈止损警戒、深亏或 LLM 建议卖出时通知",
+    ),
+    SettingDef(
+        key="notifications.bark.notify_failures",
+        group="notifications", type="bool", default=True,
+        label="运行失败与降级",
+        description="决策/选股失败，或模型与数据降级时通知",
     ),
 
     # ---------- 数据源（固定角色；启停/超时/失败策略）----------
@@ -127,24 +196,6 @@ _DEFS: list[SettingDef] = [
         group="datasources", type="str", default="hard",
         label="新浪 · 失败策略",
         description="作为选股兜底时：hard=双源皆失败则报错; skip=返回空候选",
-    ),
-    SettingDef(
-        key="datasources.tencent.enabled",
-        group="datasources", type="bool", default=True,
-        label="腾讯 · 启用",
-        description="实时行情与日 K（qt.gtimg.cn）",
-    ),
-    SettingDef(
-        key="datasources.tencent.timeout_sec",
-        group="datasources", type="int", default=10,
-        label="腾讯 · 超时", unit="秒",
-        min_value=2, max_value=60,
-    ),
-    SettingDef(
-        key="datasources.tencent.fail_policy",
-        group="datasources", type="str", default="hard",
-        label="腾讯 · 失败策略",
-        description="实时行情失败时 hard=抛错/空报价; skip=静默空",
     ),
     SettingDef(
         key="datasources.tushare.enabled",
@@ -242,73 +293,32 @@ _DEFS: list[SettingDef] = [
 
     # ---------- Prompt（v0 先开放 SELECTOR；其余注册便于后续扩展）----------
     SettingDef(
+        key="prompt.independent_judgment",
+        group="prompt", type="text", default=prompts.INDEPENDENT_JUDGMENT,
+        label="独立判断模型",
+        description="所有模型读取同一冻结事实；不得看到持仓、成本或盈亏",
+        evidence_role="provisional",
+    ),
+    SettingDef(
+        key="prompt.final_trader",
+        group="prompt", type="text", default=prompts.FINAL_TRADER,
+        label="最终交易员",
+        description="读取独立判断与授权账户状态，输出条件计划而非订单",
+        evidence_role="provisional",
+    ),
+    SettingDef(
+        key="prompt.risk_review",
+        group="prompt", type="text", default=prompts.RISK_REVIEW,
+        label="风险审查",
+        description="读取完整账户回撤与损失预算，只审查建议、不成交",
+        evidence_role="provisional",
+    ),
+    SettingDef(
         key="prompt.selector",
         group="prompt", type="text", default=prompts.SELECTOR,
         label="选股 Agent (SELECTOR)",
         description="AI 选股 system prompt；改后下次选股立即生效",
-    ),
-    SettingDef(
-        key="prompt.technical",
-        group="prompt", type="text", default=prompts.TECHNICAL,
-        label="技术分析 (TECHNICAL)",
-        description="决策流水线 · 技术面分析师",
-        editable=True,
-    ),
-    SettingDef(
-        key="prompt.fundamental",
-        group="prompt", type="text", default=prompts.FUNDAMENTAL,
-        label="基本面 (FUNDAMENTAL)",
-        description="决策流水线 · 基本面分析师",
-        editable=True,
-    ),
-    SettingDef(
-        key="prompt.news",
-        group="prompt", type="text", default=prompts.NEWS,
-        label="新闻情绪 (NEWS)",
-        description="决策流水线 · 新闻分析师",
-        editable=True,
-    ),
-    SettingDef(
-        key="prompt.bull",
-        group="prompt", type="text", default=prompts.BULL,
-        label="多头 (BULL)",
-        description="决策流水线 · 多头研究员",
-        editable=True,
-    ),
-    SettingDef(
-        key="prompt.bear",
-        group="prompt", type="text", default=prompts.BEAR,
-        label="空头 (BEAR)",
-        description="决策流水线 · 空头研究员",
-        editable=True,
-    ),
-    SettingDef(
-        key="prompt.trader",
-        group="prompt", type="text", default=prompts.TRADER,
-        label="交易员 (TRADER)",
-        description="决策流水线 · 综合决策",
-        editable=True,
-    ),
-    SettingDef(
-        key="prompt.risk",
-        group="prompt", type="text", default=prompts.RISK,
-        label="风控审核 (RISK)",
-        description="决策流水线 · 风控经理",
-        editable=True,
-    ),
-    SettingDef(
-        key="prompt.market",
-        group="prompt", type="text", default=prompts.MARKET,
-        label="大盘环境 (MARKET)",
-        description="决策流水线 · 市场环境分析师",
-        editable=True,
-    ),
-    SettingDef(
-        key="prompt.reflect",
-        group="prompt", type="text", default=prompts.REFLECT,
-        label="复盘 (REFLECT)",
-        description="决策流水线 · 交易复盘",
-        editable=True,
+        evidence_role="provisional",
     ),
     SettingDef(
         key="prompt.review",
@@ -336,15 +346,16 @@ _DEFS: list[SettingDef] = [
     SettingDef(
         key="risk.deep_loss_pct",
         group="risk", type="percent", default=-0.15,
-        label="深度亏损线",
-        description="达到后可强制砍仓",
+        label="严重复审线",
+        description="达到后产生高优先级复审；不会自动卖出",
         min_value=-0.8, max_value=-0.05,
     ),
     SettingDef(
         key="risk.deep_loss_auto_execute",
-        group="risk", type="bool", default=True,
-        label="深亏自动强平",
-        description="触发深度亏损时是否不经 LLM 直接卖出",
+        group="risk", type="bool", default=False,
+        label="深亏自动强平（已禁用）",
+        description="保留旧配置兼容；交易链路永远忽略此值，任何卖出均须人工确认",
+        editable=False,
     ),
     SettingDef(
         key="risk.shallow_line_alert_only",
@@ -368,10 +379,11 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="risk.max_total_position_pct",
-        group="risk", type="percent", default=0.90,
+        group="risk", type="percent", default=0.80,
         label="总仓位上限",
         description="持仓市值 / 总资产",
         min_value=0.1, max_value=1.0,
+        evidence_role="provisional",
     ),
     SettingDef(
         key="risk.stop_loss_alert_pct",
@@ -397,8 +409,9 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="factor.lookback_mid",
-        group="factor", type="int", default=20,
+        group="factor", type="int", default=60,
         label="中动量窗口", unit="日",
+        description="默认 60 日，必须与反转窗口不同，避免动量与反转精确互消",
         min_value=5, max_value=120,
     ),
     SettingDef(
@@ -434,22 +447,171 @@ _DEFS: list[SettingDef] = [
         description="沪/深/创业/科创伪行业哑变量中性化",
     ),
 
+    # ---------- 资金契约 / 信号策略 / 执行契约 ----------
+    SettingDef(
+        key="capital.authorized_capital",
+        group="capital", type="float", default=100_000.0,
+        label="Canary 授权资金", unit="元",
+        description="策略最多可管理的资金；个人其余本金不得注入模型上下文",
+        min_value=10_000, max_value=400_000,
+        editable=False, danger="frozen", evidence_role="contract",
+    ),
+    SettingDef(
+        key="capital.max_stock_exposure",
+        group="capital", type="float", default=80_000.0,
+        label="股票敞口上限", unit="元",
+        description="所有股票持仓市值合计硬上限；不会因为 LLM 建议而放宽",
+        min_value=0, max_value=400_000,
+        editable=False, danger="confirm", evidence_role="contract",
+    ),
+    SettingDef(
+        key="capital.drawdown_alert_1",
+        group="capital", type="float", default=5_000.0,
+        label="一级回撤告警", unit="元",
+        description="只产生告警，不自动减仓",
+        min_value=0, max_value=100_000,
+        editable=False, danger="confirm", evidence_role="contract",
+    ),
+    SettingDef(
+        key="capital.drawdown_alert_2",
+        group="capital", type="float", default=10_000.0,
+        label="二级回撤告警", unit="元",
+        description="只产生告警，不自动减仓",
+        min_value=0, max_value=200_000,
+        editable=False, danger="confirm", evidence_role="contract",
+    ),
+    SettingDef(
+        key="capital.canary_stop_drawdown",
+        group="capital", type="float", default=15_000.0,
+        label="Canary 终止回撤", unit="元",
+        description="达到后禁止新增风险，但不自动清仓；仍允许人工确认卖出",
+        min_value=1_000, max_value=300_000,
+        editable=False, danger="frozen", evidence_role="contract",
+    ),
+    SettingDef(
+        key="signal.max_positions",
+        group="signal", type="int", default=3,
+        label="最大持仓只数（候选）",
+        description="provisional 参数；必须通过确定性历史验证后才能晋升",
+        min_value=1, max_value=20,
+        danger="confirm", evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.entry_top_pct",
+        group="signal", type="percent", default=0.20,
+        label="入场候选因子分位",
+        description="综合因子排名进入前多少才允许新建仓；provisional，需回测晋升",
+        min_value=0.05, max_value=0.50,
+        danger="confirm", evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.entry_watch_pct",
+        group="signal", type="percent", default=0.35,
+        label="观察名单因子分位",
+        description="接近入场门禁但确认不足时进入观察层；不得直接生成新建仓计划",
+        min_value=0.10, max_value=0.70,
+        evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.entry_min_confirmations",
+        group="signal", type="int", default=3,
+        label="最少趋势确认数",
+        description="短/中期动量、站上 MA20、MACD 四项中至少满足的数量",
+        min_value=1, max_value=4,
+        danger="confirm", evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.entry_max_rsi",
+        group="signal", type="float", default=75.0,
+        label="入场 RSI 过热线",
+        description="达到该 RSI14 时禁止新建仓，避免追入短期过热标的",
+        min_value=55.0, max_value=95.0,
+        danger="confirm", evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.gap_lookback_days",
+        group="signal", type="int", default=60,
+        label="开盘缺口回看窗口", unit="交易日",
+        min_value=20, max_value=240,
+        evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.gap_percentile",
+        group="signal", type="float", default=0.95,
+        label="动态缺口异常分位",
+        min_value=0.80, max_value=0.999,
+        evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.gap_min_samples",
+        group="signal", type="int", default=40,
+        label="缺口门禁最少样本", unit="交易日",
+        min_value=10, max_value=200,
+        evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.hard_price_deviation_pct",
+        group="signal", type="percent", default=0.05,
+        label="隔夜信号绝对失效线（候选）",
+        description="相对分析参考价达到该偏离时旧计划失效；不是止损线",
+        min_value=0.01, max_value=0.20,
+        danger="confirm", evidence_role="provisional",
+    ),
+    SettingDef(
+        key="signal.default_valid_until",
+        group="signal", type="time", default="10:30",
+        label="隔夜计划默认失效时间",
+        description="仅作 LLM 未给出更早期限时的硬上限",
+        evidence_role="provisional",
+    ),
+    SettingDef(
+        key="execution.require_manual_confirmation",
+        group="execution", type="bool", default=True,
+        label="逐笔人工确认",
+        description="安全冻结：每个候选计划必须由本地用户逐笔确认；旧数据库覆盖不会关闭它",
+        editable=False, danger="frozen", evidence_role="invariant",
+    ),
+    SettingDef(
+        key="execution.auto_fill_tickets",
+        group="execution", type="bool", default=False,
+        label="自动成交（安全冻结）",
+        description="在持久订单/成交账本和精确对账完成前强制关闭；票据不会自动提交 EMT 或本地撮合",
+        editable=False, danger="frozen", evidence_role="invariant",
+    ),
+    SettingDef(
+        key="execution.require_human_information_check",
+        group="execution", type="bool", default=True,
+        label="人工核对正式公告",
+        description="正式公告源尚未接入，必须逐笔确认已核对；旧数据库覆盖不会关闭它",
+        editable=False, danger="frozen", evidence_role="invariant",
+    ),
+    SettingDef(
+        key="execution.max_quote_age_seconds",
+        group="execution", type="int", default=60,
+        label="执行报价最大年龄", unit="秒",
+        description="审批瞬间的报价超过该年龄即 fail closed",
+        min_value=5, max_value=300,
+        danger="confirm", evidence_role="invariant",
+    ),
+
     # ---------- 账户 / 撮合（P1 全收口）----------
     SettingDef(
         key="account.initial_cash",
-        group="account", type="float", default=1_000_000.0,
+        group="account", type="float", default=100_000.0,
         label="初始资金", unit="元",
-        description="仅对新创建账户 /「重置全部账户」生效；已有账户余额不变",
+        description="官方 ensemble 策略账户的资金契约；清库式账户重置已禁用",
         min_value=10_000, max_value=1e9,
-        danger="frozen",
+        editable=False, danger="frozen",
+        evidence_role="contract",
     ),
     SettingDef(
         key="trading.commission_rate",
         group="trading", type="float", default=0.00025,
         label="佣金费率",
-        description="双边佣金比例（如 0.00025=万一）",
+        description="双边佣金比例（默认 0.00025=万2.5；万一=0.0001）",
         min_value=0.0, max_value=0.01,
         danger="confirm",
+        step=0.00001, precision=6,
     ),
     SettingDef(
         key="trading.commission_min",
@@ -457,21 +619,34 @@ _DEFS: list[SettingDef] = [
         label="佣金最低", unit="元",
         min_value=0.0, max_value=100.0,
         danger="confirm",
+        step=0.1, precision=2,
     ),
     SettingDef(
         key="trading.stamp_tax_rate",
         group="trading", type="float", default=0.0005,
         label="印花税（卖出）",
-        description="仅卖出收取",
+        description="仅卖出收取（默认 0.0005=万5）",
         min_value=0.0, max_value=0.01,
         danger="confirm",
+        step=0.00001, precision=6,
     ),
     SettingDef(
         key="trading.transfer_fee_rate",
         group="trading", type="float", default=0.00001,
         label="过户费",
+        description="成交金额比例（默认 0.00001=万0.1）",
         min_value=0.0, max_value=0.001,
         danger="confirm",
+        step=0.00001, precision=6,
+    ),
+    SettingDef(
+        key="trading.slippage_bps",
+        group="trading", type="float", default=10.0,
+        label="回测保守滑点", unit="bp",
+        description="买入上浮、卖出下浮；10bp=0.10%，纳入每个实验配置指纹",
+        min_value=0.0, max_value=100.0,
+        danger="confirm", evidence_role="provisional",
+        step=1.0, precision=1,
     ),
 
     # ---------- 调度 ----------
@@ -483,10 +658,17 @@ _DEFS: list[SettingDef] = [
         requires_scheduler_reload=True,
     ),
     SettingDef(
+        key="schedule.morning_decision_time",
+        group="schedule", type="time", default="16:00",
+        label="上午 AI 决策（已停用）",
+        description="兼容旧配置键；调度器不再注册盘中决策任务",
+        editable=False, danger="frozen", requires_scheduler_reload=True,
+    ),
+    SettingDef(
         key="schedule.daily_decision_time",
-        group="schedule", type="time", default="14:35",
-        label="每日 AI 决策时间",
-        description="交易日 cron，格式 HH:MM",
+        group="schedule", type="time", default="16:00",
+        label="收盘后 AI 决策时间",
+        description="收盘后冻结事实并生成下一交易日候选计划；分析阶段绝不出票或成交",
         requires_scheduler_reload=True,
     ),
     SettingDef(
@@ -497,30 +679,30 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="schedule.stock_select_time",
-        group="schedule", type="time", default="14:05",
+        group="schedule", type="time", default="15:30",
         label="自动选股时间",
-        description="交易日 cron，格式 HH:MM",
+        description="收盘后准备候选股与完整日线数据，交易日 cron，格式 HH:MM",
         requires_scheduler_reload=True,
     ),
     SettingDef(
         key="schedule.monitor_interval_minutes",
-        group="schedule", type="int", default=15,
+        group="schedule", type="int", default=5,
         label="盘中监控间隔", unit="分钟",
         min_value=5, max_value=60,
         requires_scheduler_reload=True,
     ),
 
-    # ---------- 赛马 ----------
+    # ---------- 验证证据门槛（key 保留 race.* 以兼容历史配置） ----------
     SettingDef(
         key="race.min_trade_days",
-        group="race", type="int", default=60,
+        group="validation", type="int", default=60,
         label="最少交易日",
         description="样本门槛：交易日天数",
         min_value=1, max_value=365,
     ),
     SettingDef(
         key="race.min_closed_trades",
-        group="race", type="int", default=100,
+        group="validation", type="int", default=100,
         label="最少平仓笔数",
         description="样本门槛：已闭环成交笔数",
         min_value=1, max_value=10000,
@@ -528,11 +710,11 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="race.max_live_rule_arms",
-        group="race", type="int", default=10,
-        label="可竞赛规则臂上限",
-        description="不含锚（池内等权）；含 S2 与研究晋升。满额需先退役再晋升",
+        group="validation", type="int", default=10,
+        label="历史规则臂上限（已退役）",
+        description="仅保留旧配置兼容；资本化规则臂已退役，不再创建新账户",
         min_value=2, max_value=50,
-        danger="confirm",
+        editable=False, danger="confirm",
     ),
 
     # ---------- 日志 ----------
@@ -566,8 +748,8 @@ _DEFS: list[SettingDef] = [
     SettingDef(
         key="research.inject_promoted_to_llm",
         group="debug", type="bool", default=False,
-        label="研究晋升规格注入 LLM",
-        description="开启后决策流水线向交易员提示注入已晋升研究策略摘要（可参考不强制跟单）",
+        label="不可变研究证据注入 LLM",
+        description="开启后只注入能重新通过 experiment/holdout 指纹校验的晋升证据；历史 rule 记录不会进入决策上下文",
     ),
     SettingDef(
         key="research.grid_max_combos",
@@ -595,9 +777,11 @@ def _patch_danger() -> None:
                     editable=d.editable,
                     requires_scheduler_reload=d.requires_scheduler_reload,
                     secret=d.secret, danger="confirm",
+                    evidence_role=d.evidence_role,
+                    step=d.step, precision=d.precision,
                 ))
                 continue
-        if d.group == "race" and d.danger == "normal":
+        if d.group == "validation" and d.danger == "normal":
             patched.append(SettingDef(
                 key=d.key, group=d.group, type=d.type, default=d.default,
                 label=d.label, description=d.description,
@@ -605,6 +789,8 @@ def _patch_danger() -> None:
                 editable=d.editable,
                 requires_scheduler_reload=d.requires_scheduler_reload,
                 secret=d.secret, danger="confirm",
+                evidence_role=d.evidence_role,
+                step=d.step, precision=d.precision,
             ))
             continue
         if d.group == "factor" and d.key == "factor.top_n" and d.danger == "normal":
@@ -615,6 +801,8 @@ def _patch_danger() -> None:
                 editable=d.editable,
                 requires_scheduler_reload=d.requires_scheduler_reload,
                 secret=d.secret, danger="confirm",
+                evidence_role=d.evidence_role,
+                step=d.step, precision=d.precision,
             ))
             continue
         patched.append(d)

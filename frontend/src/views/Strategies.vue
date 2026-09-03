@@ -4,28 +4,26 @@
       <div>
         <h1 class="page-title">策略</h1>
         <p class="page-sub">
-          在跑臂对照台 · 夏普主序 · 样本达标才授冠
+          历史规则账户只读档案 · 不再创建资金账户或执行调仓
           <router-link class="link" to="/research">研究 / 回测 →</router-link>
         </p>
       </div>
       <div class="head-actions">
         <el-button size="small" :loading="loading" @click="load">刷新</el-button>
-        <el-button size="small" type="warning" :loading="rebalancing" @click="rebalance">立即调仓</el-button>
       </div>
     </div>
 
-    <div v-if="needsFirstRebalance" class="flow-hint panel">
+    <div class="flow-hint panel">
       <div class="flow-hint-text">
-        规则账户尚未建仓。点「立即调仓」按当前股池生成持仓，之后才会出现收益与夏普。
+        资本化规则赛马已退役。旧账户、持仓和订单仅作为历史证据保留；新的机械基准使用零资金 shadow，不产生订单。
       </div>
-      <el-button size="small" type="warning" :loading="rebalancing" @click="rebalance">立即调仓</el-button>
     </div>
 
     <div class="stat-grid">
       <div class="stat">
-        <div class="stat-label">调仓节奏</div>
-        <div class="stat-value" style="font-size:15px">{{ board.schedule || '周一 14:50' }}</div>
-        <div class="stat-hint">{{ board.is_rebalance_day ? '今天是调仓日' : '非周一不自动调' }}</div>
+        <div class="stat-label">资本执行</div>
+        <div class="stat-value" style="font-size:15px">已退役</div>
+        <div class="stat-hint">无自动任务 · 无手动调仓</div>
       </div>
       <div class="stat">
         <div class="stat-label">S2 持仓 N</div>
@@ -40,11 +38,9 @@
         <div class="stat-hint">未达标灰显，不授冠</div>
       </div>
       <div class="stat">
-        <div class="stat-label">当前冠军</div>
-        <div class="stat-value" style="font-size:15px">
-          {{ championName || '—' }}
-        </div>
-        <div class="stat-hint">{{ championName ? '样本达标 · 夏普第一' : '尚无达标可竞赛臂' }}</div>
+        <div class="stat-label">证据角色</div>
+        <div class="stat-value" style="font-size:15px">历史只读</div>
+        <div class="stat-hint">不参与官方账户收益排行</div>
       </div>
     </div>
 
@@ -67,14 +63,14 @@
             <div class="arm-titles">
               <div class="arm-name">
                 {{ arm.name || arm.model_id }}
-                <span v-if="arm.crown" class="crown-badge">冠</span>
+                <span v-if="arm.crown" class="crown-badge">旧</span>
               </div>
               <div class="arm-tags">
                 <span class="lane-pill" :class="roleClass(arm)">{{ roleLabel(arm) }}</span>
                 <span class="lane-pill src">{{ sourceLabel(arm) }}</span>
                 <el-tag v-if="arm.enabled === false" size="small" type="info">停用</el-tag>
                 <el-tag v-else-if="arm.exists && !arm.sample_ok" size="small" type="warning">样本不足</el-tag>
-                <el-tag v-else-if="arm.exists" size="small" type="success">在跑</el-tag>
+                <el-tag v-else-if="arm.exists" size="small" type="info">历史</el-tag>
               </div>
             </div>
           </div>
@@ -89,22 +85,6 @@
             {{ arm.trade_days || 0 }}日 · {{ arm.closed_trades || 0 }}笔平仓
             · 最近调仓 {{ arm.last_rebalance_at || '—' }}
           </div>
-          <el-button
-            v-if="arm.exists && arm.role !== 'anchor'"
-            size="small"
-            type="warning"
-            plain
-            :loading="oneLoading === arm.model_id"
-            @click="rebalanceOne(arm.model_id)"
-          >单独调仓</el-button>
-          <el-button
-            v-else-if="arm.exists"
-            size="small"
-            type="warning"
-            plain
-            :loading="oneLoading === arm.model_id"
-            @click="rebalanceOne(arm.model_id)"
-          >调仓（锚）</el-button>
         </article>
       </div>
 
@@ -114,11 +94,11 @@
         stripe
         v-loading="loading"
         :row-class-name="rowClass"
-        empty-text="暂无规则策略"
+        empty-text="没有历史规则账户"
       >
         <el-table-column label="" width="48">
           <template #default="{ row }">
-            <span v-if="row.crown" class="crown-badge">冠</span>
+            <span v-if="row.crown" class="crown-badge">旧</span>
             <span v-else-if="row.role === 'anchor'" class="mono dim">锚</span>
           </template>
         </el-table-column>
@@ -181,18 +161,6 @@
             <span class="mono dim">{{ row.last_rebalance_at || '—' }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="110" fixed="right">
-          <template #default="{ row }">
-            <el-button
-              v-if="row.exists"
-              size="small"
-              type="warning"
-              plain
-              :loading="oneLoading === row.model_id"
-              @click="rebalanceOne(row.model_id)"
-            >调仓</el-button>
-          </template>
-        </el-table-column>
       </el-table>
     </section>
 
@@ -252,7 +220,7 @@
 
 <script setup>
 import { computed, onMounted, ref } from 'vue'
-import { ElMessage, ElMessageBox } from 'element-plus'
+import { ElMessage } from 'element-plus'
 import api from '../api/index.js'
 import { useIsMobile } from '../composables/useIsMobile.js'
 
@@ -260,27 +228,14 @@ const { isMobile } = useIsMobile()
 const board = ref({ arms: [], race: {} })
 const factors = ref({ items: [], top_n: [] })
 const loading = ref(false)
-const rebalancing = ref(false)
-const oneLoading = ref('')
 const factorLoading = ref(false)
 const factorsLoaded = ref(false)
 
 const arms = computed(() => board.value.arms || [])
-const championName = computed(() => {
-  const id = board.value.champion_model_id
-  if (!id) return ''
-  const a = arms.value.find((x) => x.model_id === id)
-  return a?.name || id
-})
-const needsFirstRebalance = computed(() => {
-  const live = arms.value.filter((a) => a.exists && a.enabled !== false)
-  if (!live.length) return false
-  return live.every((a) => !(a.position_count > 0) && !a.last_rebalance_at)
-})
 
 function roleLabel(arm) {
   if (arm.role === 'anchor') return '锚'
-  return '竞赛'
+  return '历史'
 }
 function roleClass(arm) {
   return arm.role === 'anchor' ? 'anchor' : 'rule'
@@ -343,49 +298,6 @@ async function loadFactors() {
     ElMessage.error(err.message || '因子截面加载失败（数据源超时可稍后重试）')
   } finally {
     factorLoading.value = false
-  }
-}
-
-async function rebalance() {
-  try {
-    await ElMessageBox.confirm(
-      '对全部启用规则策略立即调仓（会真实买卖模拟盘）。',
-      '确认规则调仓',
-      { type: 'warning', confirmButtonText: '开始调仓', cancelButtonText: '取消' },
-    )
-  } catch {
-    return
-  }
-  rebalancing.value = true
-  try {
-    const res = await api.rulesRebalance()
-    const results = res.results || []
-    const ok = results.filter((r) => r.ok).length
-    const fail = results.filter((r) => r.ok === false)
-    if (fail.length) {
-      ElMessage.warning(`调仓 ${ok}/${results.length} 成功。失败：${fail.map((r) => r.model_id).join('、')}`)
-    } else {
-      ElMessage.success(`规则组调仓完成（${ok} 个）`)
-    }
-    await load()
-  } catch (err) {
-    ElMessage.error(err.message)
-  } finally {
-    rebalancing.value = false
-  }
-}
-
-async function rebalanceOne(id) {
-  oneLoading.value = id
-  try {
-    const r = await api.rulesRebalanceOne(id)
-    if (r.ok === false) ElMessage.warning(r.error || '调仓未完成')
-    else ElMessage.success(`${id} 调仓完成`)
-    await load()
-  } catch (err) {
-    ElMessage.error(err.message)
-  } finally {
-    oneLoading.value = ''
   }
 }
 

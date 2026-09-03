@@ -70,6 +70,12 @@ def compute_price_factors(bars: pd.DataFrame) -> pd.DataFrame:
     except Exception:  # noqa: BLE001
         turn_w = 20
 
+    if rev_w in {short, mid}:
+        raise ValueError(
+            "factor.lookback_rev must differ from momentum windows; "
+            "otherwise reversal exactly cancels momentum"
+        )
+
     df["mom_short"] = close.pct_change(short)
     df["mom_mid"] = close.pct_change(mid)
     ret = close.pct_change()

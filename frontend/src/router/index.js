@@ -9,8 +9,8 @@ export default createRouter({
     { path: '/watchlist', name: 'watchlist', component: () => import('../views/Watchlist.vue'), meta: { title: '股池' } },
     { path: '/runs', name: 'runs', component: () => import('../views/Runs.vue'), meta: { title: '决策' } },
     { path: '/runs/:id', name: 'run-detail', component: () => import('../views/RunDetail.vue'), meta: { title: '决策详情' } },
-    { path: '/orders', name: 'orders', component: () => import('../views/Orders.vue'), meta: { title: '成交' } },
-    { path: '/models', name: 'models', component: () => import('../views/Models.vue'), meta: { title: '参赛账户' } },
+    { path: '/orders', name: 'orders', component: () => import('../views/Orders.vue'), meta: { title: '交易计划' } },
+    { path: '/models', name: 'models', component: () => import('../views/Models.vue'), meta: { title: '模型与策略' } },
     { path: '/settings', name: 'settings', component: () => import('../views/Settings.vue'), meta: { title: '设置' } },
   ],
 })

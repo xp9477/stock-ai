@@ -1,5 +1,5 @@
 """脏报价防护 + 非交易时段监控。"""
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from unittest.mock import patch
 
 from app.agents import monitor
@@ -20,6 +20,28 @@ def test_sanitize_quote_accepts_normal_price():
         out = market.sanitize_quote(q, code="002475", avg_cost=55.9)
         assert out is not None
         assert out["price"] == 56.0
+
+
+def test_trade_calendar_failure_is_fail_closed():
+    with patch("app.data.market._trade_dates", side_effect=RuntimeError("offline")):
+        assert market.is_trade_date() is False
+
+
+def test_continuous_and_closing_session_boundaries():
+    with patch("app.data.market.is_trade_date", return_value=True):
+        assert market.is_trading_session(datetime(2026, 8, 10, 9, 29)) is False
+        assert market.is_trading_session(datetime(2026, 8, 10, 9, 30)) is True
+        assert market.is_trading_session(datetime(2026, 8, 10, 12, 0)) is False
+        assert market.is_trading_session(datetime(2026, 8, 10, 14, 59)) is True
+        assert market.is_trading_session(datetime(2026, 8, 10, 15, 1)) is False
+
+
+def test_aware_utc_session_time_is_converted_to_shanghai():
+    with patch("app.data.market.is_trade_date", return_value=True):
+        assert market.is_trading_session(
+            datetime(2026, 8, 10, 1, 35, tzinfo=timezone.utc)) is True
+        assert market.is_trading_session(
+            datetime(2026, 8, 10, 8, 0, tzinfo=timezone.utc)) is False
 
 
 def test_run_monitor_skips_outside_session(db, model_a):

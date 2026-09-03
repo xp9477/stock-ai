@@ -1,9 +1,18 @@
 """S3 因子与回测引擎单测（纯合成数据，不依赖网络）。"""
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
+import pytest
 
-from app.backtest.engine import run_equal_weight_buyhold, run_factor_weekly
+from app.backtest.engine import (
+    _rebalance_dates,
+    run_equal_weight_buyhold,
+    run_factor_weekly,
+)
+from app.backtest.execution import ExecutionCostModel, rebalance_equal_weight
 from app.backtest.metrics import compute_metrics, mark_sample_ok
+from app.backtest.spec_runner import run_spec_backtest
 from app.factors.definitions import FACTOR_NAMES, board_of_code, compute_all_factors, compute_price_factors
 from app.factors.score import composite_scores, select_top_n
 from app.ledger import factsheet_hash
@@ -128,3 +137,124 @@ def test_factsheet_hash_stable():
     h1 = factsheet_hash({"a": 1, "b": 2})
     h2 = factsheet_hash({"b": 2, "a": 1})
     assert h1 == h2 and len(h1) == 16
+
+
+def test_factor_rebalance_uses_previous_close_signal():
+    dates = [pd.Timestamp("2024-01-05"), pd.Timestamp("2024-01-08")]
+    rows = []
+    for dt in dates:
+        monday = dt.weekday() == 0
+        rows.extend([
+            {"date": dt, "code": "000001", "close": 10.0,
+             "mom_short": -5.0 if monday else 5.0, "mom_mid": -5.0 if monday else 5.0},
+            {"date": dt, "code": "000002", "close": 10.0,
+             "mom_short": 5.0 if monday else -5.0, "mom_mid": 5.0 if monday else -5.0},
+        ])
+    result = run_spec_backtest(pd.DataFrame(rows), {
+        "name": "two-factor-contract",
+        "mode": "factor_cross_section",
+        "factors": ["mom_short", "mom_mid"],
+        "top_n": 1,
+        "rebalance": "W-MON",
+        "events": [],
+    }, initial_cash=100_000)
+    assert result.holdings_log[0]["date"] == "2024-01-08"
+    assert result.holdings_log[0]["signal_date"] == "2024-01-05"
+    assert result.holdings_log[0]["codes"] == ["000001"]
+
+
+def test_rebalance_anchors_map_to_observed_sessions():
+    sessions = pd.to_datetime([
+        "2024-01-04", "2024-01-05", "2024-01-08", "2024-01-09",
+        "2024-02-01", "2024-02-02",
+    ])
+    assert _rebalance_dates(sessions, "W-MON") == {
+        pd.Timestamp("2024-01-04"), pd.Timestamp("2024-01-08"),
+        pd.Timestamp("2024-02-01"),
+    }
+    assert _rebalance_dates(sessions, "W-FRI") == {
+        pd.Timestamp("2024-01-05"), pd.Timestamp("2024-01-09"),
+        pd.Timestamp("2024-02-02"),
+    }
+    assert _rebalance_dates(sessions, "MS") == {
+        pd.Timestamp("2024-01-04"), pd.Timestamp("2024-02-01"),
+    }
+    assert _rebalance_dates(sessions, "ME") == {
+        pd.Timestamp("2024-01-09"), pd.Timestamp("2024-02-02"),
+    }
+
+
+def test_missing_quote_carries_last_value_instead_of_erasing_holding():
+    panel = pd.DataFrame([
+        {"date": "2024-01-02", "code": "000001", "close": 10.0},
+        {"date": "2024-01-02", "code": "000002", "close": 10.0},
+        {"date": "2024-01-03", "code": "000001", "close": 10.0},
+        {"date": "2024-01-04", "code": "000001", "close": 10.0},
+        {"date": "2024-01-04", "code": "000002", "close": 11.0},
+    ])
+    result = run_equal_weight_buyhold(panel, initial_cash=100_000)
+    assert result.equity.iloc[1] == pytest.approx(result.equity.iloc[0])
+    assert result.equity.iloc[2] > result.equity.iloc[1]
+
+
+def test_factor_windows_cannot_create_exact_momentum_reversal_cancellation():
+    values = {
+        "factor.lookback_short": 5,
+        "factor.lookback_mid": 20,
+        "factor.vol_window": 20,
+        "factor.lookback_rev": 20,
+        "factor.turnover_window": 20,
+    }
+    with patch(
+        "app.factors.definitions.get_setting", side_effect=values.__getitem__,
+    ), pytest.raises(ValueError, match="exactly cancels"):
+        compute_price_factors(_synth_bars(80))
+
+
+def test_execution_costs_follow_actual_turnover_and_round_lots():
+    model = ExecutionCostModel(
+        commission_rate=0.00025,
+        commission_min=5.0,
+        transfer_fee_rate=0.00001,
+        stamp_tax_rate=0.0005,
+        slippage_bps=10.0,
+    )
+    prices = pd.Series({"000001": 10.0, "000002": 20.0})
+    first = rebalance_equal_weight(
+        cash=100_000.0, holdings={}, execution_prices=prices,
+        valuation_prices=prices, target_codes=["000001", "000002"],
+        cost_model=model,
+    )
+    assert first.fees >= 10.0
+    assert first.turnover > 0.9
+    assert all(int(quantity) % 100 == 0 for quantity in first.holdings.values())
+
+    unchanged = rebalance_equal_weight(
+        cash=first.cash, holdings=first.holdings, execution_prices=prices,
+        valuation_prices=prices, target_codes=["000001", "000002"],
+        cost_model=model,
+    )
+    assert unchanged.traded_notional == pytest.approx(0.0)
+    assert unchanged.fees == pytest.approx(0.0)
+    assert unchanged.holdings == first.holdings
+
+
+def test_untradeable_position_is_retained_not_fictionally_liquidated():
+    model = ExecutionCostModel(
+        commission_rate=0.00025,
+        commission_min=5.0,
+        transfer_fee_rate=0.00001,
+        stamp_tax_rate=0.0005,
+        slippage_bps=10.0,
+    )
+    result = rebalance_equal_weight(
+        cash=0.0,
+        holdings={"000001": 1000.0},
+        execution_prices=pd.Series({"000001": float("nan")}),
+        valuation_prices=pd.Series({"000001": 10.0}),
+        target_codes=[],
+        cost_model=model,
+    )
+    assert result.holdings == {"000001": 1000.0}
+    assert result.cash == 0.0
+    assert result.untradeable_codes == ("000001",)

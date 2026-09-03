@@ -42,6 +42,7 @@ def _env_fallback(key: str) -> Any | None:
         "trading.stamp_tax_rate": settings.stamp_tax_rate,
         "trading.transfer_fee_rate": settings.transfer_fee_rate,
         "schedule.enabled": settings.schedule_enabled,
+        "schedule.morning_decision_time": settings.morning_decision_time,
         "schedule.daily_decision_time": settings.daily_decision_time,
         "schedule.stock_select_enabled": settings.stock_select_enabled,
         "schedule.stock_select_time": settings.stock_select_time,
@@ -155,6 +156,11 @@ def _load_override_map(db: Session | None = None) -> dict[str, str]:
 
 
 def _resolve_one(key: str, defn: SettingDef, overrides: dict[str, str]) -> Any:
+    # Non-editable entries are code-owned invariants/contracts.  Old database
+    # overrides (or a stale .env value) must not silently weaken them after an
+    # upgrade merely because the row predates the read-only flag.
+    if not defn.editable:
+        return _coerce(defn, defn.default)
     if key in overrides:
         try:
             return _coerce(defn, overrides[key])
@@ -192,7 +198,8 @@ def get_setting(key: str, db: Session | None = None) -> Any:
 
 
 def is_overridden(key: str, db: Session | None = None) -> bool:
-    return key in _load_override_map(db)
+    defn = get_def(key)
+    return defn.editable and key in _load_override_map(db)
 
 
 def secret_source(key: str, db: Session | None = None) -> str:
@@ -227,9 +234,12 @@ def list_settings(group: str | None = None, db: Session | None = None) -> list[d
             "requires_scheduler_reload": defn.requires_scheduler_reload,
             "min_value": defn.min_value,
             "max_value": defn.max_value,
+            "step": defn.step,
+            "precision": defn.precision,
             "secret": _is_secret(defn),
-            "overridden": defn.key in overrides,
+            "overridden": defn.editable and defn.key in overrides,
             "danger": getattr(defn, "danger", "normal") or "normal",
+            "evidence_role": getattr(defn, "evidence_role", "operational") or "operational",
         }
         if _is_secret(defn):
             configured = bool(str(raw or "").strip())
@@ -243,8 +253,10 @@ def list_settings(group: str | None = None, db: Session | None = None) -> list[d
             item["default"] = defn.default
             item["configured"] = True
             item["masked"] = ""
-            item["source"] = "override" if defn.key in overrides else (
+            item["source"] = "fixed" if not defn.editable else (
+                "override" if defn.key in overrides else (
                 "env" if _env_fallback(defn.key) is not None else "default"
+                )
             )
         out.append(item)
     return out
@@ -328,7 +340,7 @@ def _clear_data_caches() -> None:
     try:
         from .data import market, news_rss
         for fn in (
-            market._tx_quote_raw, market.get_daily_kline, market.get_news,
+            market.get_quote, market.get_daily_kline, market.get_news,
             market.get_index_daily, market.get_hs300_history, market._trade_dates,
             market.get_market_snapshot, market.get_screen_universe,
             news_rss.fetch_all_headlines,
