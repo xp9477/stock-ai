@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import tempfile
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+LOG = logging.getLogger(__name__)
 
 
 ASSET_FIELDS = (
@@ -217,15 +221,38 @@ class BridgeState:
             }
 
     def write_snapshot(self) -> None:
+        """Atomically publish the snapshot. Never raise into SDK callback threads.
+
+        Callbacks and the polling loop can write at the same time. A shared
+        ``emt_snapshot.json.tmp`` name races: one thread ``os.replace``s the
+        file away, the other ``chmod``s a path that no longer exists and kills
+        the Python main thread while native SDK threads keep the process alive.
+        """
+
         payload = self.snapshot()
-        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = self.snapshot_path.with_suffix(self.snapshot_path.suffix + ".tmp")
-        with temp_path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, self.snapshot_path)
+        try:
+            self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f"{self.snapshot_path.name}.",
+                suffix=".tmp",
+                dir=self.snapshot_path.parent,
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(tmp_path, 0o600)
+                os.replace(tmp_path, self.snapshot_path)
+            except Exception:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
+        except OSError:
+            LOG.exception("failed to write broker snapshot")
 
     def append_event(self, event_type: str, payload: dict[str, Any]) -> None:
         record = {

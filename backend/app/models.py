@@ -572,7 +572,12 @@ class RunMarketArtifact(Base):
 
 
 class ShadowBenchmarkSnapshot(Base):
-    """Frozen, zero-capital equal-weight benchmark for one analytical run."""
+    """Frozen, zero-capital forward-validation arms for one analytical run.
+
+    ``weights_json`` and ``benchmark_key`` remain the compatibility view of
+    the eligible-universe equal-weight arm.  ``arm_definitions_json`` freezes
+    the richer policy comparison without creating accounts, orders, or cash.
+    """
 
     __tablename__ = "shadow_benchmark_snapshots"
 
@@ -590,7 +595,16 @@ class ShadowBenchmarkSnapshot(Base):
     universe_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     weights_json: Mapped[str] = mapped_column(Text)
     reference_prices_json: Mapped[str] = mapped_column(Text)
+    reference_quote_evidence_json: Mapped[str] = mapped_column(Text, default="{}")
+    reference_price_basis: Mapped[str] = mapped_column(
+        String(64), default="signal_cutoff_quote_legacy", index=True)
     reference_data_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
+    arm_definitions_json: Mapped[str] = mapped_column(Text, default="{}")
+    arm_definition_fingerprint: Mapped[str] = mapped_column(
+        String(64), default="", index=True)
+    cost_model_json: Mapped[str] = mapped_column(Text, default="{}")
+    measurement_status: Mapped[str] = mapped_column(
+        String(64), default="legacy_not_decision_grade", index=True)
     idempotency_key: Mapped[str] = mapped_column(
         String(128), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -598,7 +612,7 @@ class ShadowBenchmarkSnapshot(Base):
 
 
 class ShadowBenchmarkMark(Base):
-    """Append-only observed mark for a frozen zero-capital benchmark."""
+    """Append-only 1/5/20-session mark for frozen validation arms."""
 
     __tablename__ = "shadow_benchmark_marks"
 
@@ -609,6 +623,12 @@ class ShadowBenchmarkMark(Base):
     observed_prices_json: Mapped[str] = mapped_column(Text)
     data_fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     benchmark_return_pct: Mapped[float] = mapped_column(Float)
+    horizon_trading_days: Mapped[int] = mapped_column(Integer, default=0, index=True)
+    target_session_date: Mapped[str] = mapped_column(String(10), default="", index=True)
+    calendar_source: Mapped[str] = mapped_column(String(80), default="")
+    arm_results_json: Mapped[str] = mapped_column(Text, default="{}")
+    measurement_status: Mapped[str] = mapped_column(
+        String(64), default="legacy_gross_only", index=True)
     idempotency_key: Mapped[str] = mapped_column(
         String(128), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(
@@ -944,4 +964,3 @@ def _install_audit_triggers_after_create(_target, connection, **_kwargs) -> None
 
 
 event.listen(Base.metadata, "after_create", _install_audit_triggers_after_create)
-

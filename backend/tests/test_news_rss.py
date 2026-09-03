@@ -71,7 +71,10 @@ def test_market_get_news_uses_rss(monkeypatch):
     """决策流水线与 factsheet 应同源 RSS，而非东财。"""
     from app.data import market, news_rss
 
-    def fake_for_stock(code, name="", limit=10):
+    calls = []
+
+    def fake_for_stock(code, name="", limit=10, *, include_general=True):
+        calls.append(include_general)
         return [{"title": f"rss-{code}", "content": name, "time": "t",
                  "url": "u", "source": "test", "match": "stock"}]
 
@@ -81,6 +84,7 @@ def test_market_get_news_uses_rss(monkeypatch):
         market.get_news.cache_clear()
     items = market.get_news("600519", name="贵州茅台")
     assert items and items[0]["title"] == "rss-600519"
+    assert calls == [False]
 
 
 def test_fetch_respects_rss_disabled(monkeypatch):

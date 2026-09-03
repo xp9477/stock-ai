@@ -140,19 +140,37 @@ def review_preopen_information(
 
     RSS remains supplemental.  Until an official disclosure provider exists,
     the gate passes only when the local user explicitly confirms an external
-    official-announcement check.  A changed direct-news fingerprint always
-    requires a new analysis, even with that confirmation.
+    official-announcement check.  Only an additive direct-stock-news item is
+    material here.  Feed truncation, expiry, or a temporarily missing source
+    must not masquerade as "new" information.
     """
     snapshot = news_rss.stock_news_gate_snapshot(
         plan.code, plan.name, force_refresh=force_refresh)
     policy = _json_object(plan.policy_snapshot_json)
+    original_scope = str(policy.get("news_scope") or "")
     original_fingerprint = str(policy.get("news_fingerprint") or "")
     current_fingerprint = str(snapshot.get("fingerprint") or "")
-    changed = bool(original_fingerprint and current_fingerprint != original_fingerprint)
-    item_ids = [str(i.get("content_hash") or i.get("url") or i.get("title") or "")
-                for i in snapshot.get("items") or []]
+    current_item_ids = {
+        str(i.get("content_hash") or i.get("url") or i.get("title") or "")
+        for i in snapshot.get("items") or []
+        if i.get("content_hash") or i.get("url") or i.get("title")
+    }
+    has_direct_baseline = (
+        original_scope == "direct_stock_only_v1"
+        and isinstance(policy.get("news_item_ids"), list)
+    )
+    original_item_ids = {
+        str(item_id) for item_id in policy.get("news_item_ids") or []
+        if str(item_id)
+    } if has_direct_baseline else set()
+    new_item_ids = sorted(current_item_ids - original_item_ids)
 
-    if not original_fingerprint:
+    if not has_direct_baseline:
+        outcome = REVIEW_REQUIRED
+        reason_code = "unverifiable_analysis_news_scope"
+        reason = "原始分析未冻结直接个股新闻集合，无法可靠做增量比较，必须重新分析"
+        next_status = outcome
+    elif not original_fingerprint:
         outcome = REVIEW_REQUIRED
         reason_code = "missing_analysis_news_fingerprint"
         reason = "原始分析缺少资讯指纹，无法证明盘前信息未变化，必须重新分析"
@@ -162,7 +180,7 @@ def review_preopen_information(
         reason_code = "rss_coverage_unavailable"
         reason = "盘前补充资讯源不可用，旧计划不能继续"
         next_status = outcome
-    elif changed:
+    elif new_item_ids:
         outcome = REVIEW_REQUIRED
         reason_code = "new_direct_news"
         reason = "分析截止后出现新的个股相关新闻，旧计划需要重新分析"
@@ -196,8 +214,11 @@ def review_preopen_information(
             "official_coverage": bool(snapshot.get("official_coverage")),
             "human_official_confirmed": human_official_confirmed,
             "analysis_news_fingerprint_present": bool(original_fingerprint),
+            "analysis_news_scope": original_scope,
+            "analysis_news_item_count": len(original_item_ids),
+            "current_news_item_count": len(current_item_ids),
         },
-        new_information_ids=item_ids if changed else [],
+        new_information_ids=new_item_ids,
         input_hash=current_fingerprint,
         idempotency_key=idempotency_key,
         next_status=next_status,
@@ -480,7 +501,12 @@ def maybe_auto_issue_ticket(
     *,
     now: datetime | None = None,
 ) -> ExecutionIntent | None:
-    """Mint a ticket when manual confirmation is off. Never places an order."""
+    """Legacy auto-ticket hook, kept fail-closed for future orchestration.
+
+    It may only run inside the plan's valid trading window and it never claims
+    that a human checked official disclosures.  Production safe defaults keep
+    this path disabled until a separately audited execution worker exists.
+    """
     if bool(get_setting("execution.require_manual_confirmation")):
         return None
     existing = (
@@ -497,10 +523,10 @@ def maybe_auto_issue_ticket(
             expected_lock_version=plan.lock_version,
             idempotency_key=f"auto-approve:plan:{plan.id}",
             confirmed=True,
-            human_official_confirmed=True,
+            human_official_confirmed=False,
             now=now,
-            require_session=False,
-            enforce_valid_from=False,
+            require_session=True,
+            enforce_valid_from=True,
             approved_by="system",
             commit=True,
         )
@@ -608,89 +634,17 @@ def maybe_auto_fill_ticket(
     plan: TradePlan,
     intent: ExecutionIntent,
 ) -> ExecutionIntent:
-    """Execute a ticket on the EMT simulation account, or locally if no EMT."""
-    if not bool(get_setting("execution.auto_fill_tickets")):
-        return intent
-    if intent.status != "ticket_ready" or intent.authorized_qty <= 0:
-        return intent
+    """Safety pause: an execution ticket never becomes an order here.
 
-    from ..config import settings as app_settings
-    from . import emt_orders
-
-    if emt_orders.inbox_ready():
-        return _fill_via_emt(db, plan, intent)
-
-    if app_settings.broker_reference_required:
-        logger.warning("自动成交跳过 plan=%s: EMT 委托通道未就绪", plan.id)
-        return intent
-
-    from ..ledger import record_close_from_sell, record_open, strategy_key_for_model
-    from . import broker
-
-    quote = market.get_trade_quote(plan.code)
-    if quote is None:
-        logger.warning("自动成交跳过 plan=%s: 无安全报价", plan.id)
-        return intent
-    price = float(quote["price"])
-    pct_change = float(quote.get("pct_change") or 0.0)
-    if plan.side == "buy" and plan.max_buy_price and price > float(plan.max_buy_price) + 1e-9:
-        logger.info("自动成交跳过 plan=%s: 现价 %.3f 高于最高买价", plan.id, price)
-        return intent
-
-    from ..models import Model
-    model = db.get(Model, plan.model_pk)
-    sk = strategy_key_for_model(plan.model_pk, model.type if model else "ensemble")
-    if plan.side == "buy":
-        result = broker.buy(
-            db, plan.model_pk, plan.run_id, plan.code, plan.name,
-            price, pct_change, intent.authorized_qty * price,
-            plan.thesis or "", autocommit=False,
-        )
-        if result.ok and result.order:
-            record_open(
-                db, strategy_key=sk, model_pk=plan.model_pk,
-                code=plan.code, name=plan.name,
-                qty=result.order.qty, price=price, signal_source="ai",
-                reason=plan.thesis or "", order_id=result.order.id,
-                autocommit=False,
-            )
-    elif plan.side == "sell":
-        pos = broker.get_position(db, plan.model_pk, plan.code)
-        avg_cost = pos.avg_cost if pos else 0.0
-        result = broker.sell(
-            db, plan.model_pk, plan.run_id, plan.code, plan.name,
-            price, pct_change, intent.authorized_qty, autocommit=False,
-        )
-        if result.ok and result.order:
-            record_close_from_sell(
-                db, strategy_key=sk, model_pk=plan.model_pk,
-                code=plan.code, name=plan.name,
-                qty=result.order.qty, price=price, signal_source="ai",
-                order_id=result.order.id, avg_cost=avg_cost, autocommit=False,
-            )
-    else:
-        return intent
-
-    if result.ok and result.order:
-        intent.status = "executed"
-        intent.order_id = result.order.id
-        plan.status = "executed"
-        plan.status_reason_code = "auto_filled"
-        plan.status_reason = (
-            f"模拟盘已自动成交 {result.order.qty} 股 @ {price:.3f}"
-        )
-        plan.lock_version += 1
-        db.commit()
-        logger.info(
-            "模拟盘自动成交 plan=%s %s %s x%s @ %s",
-            plan.id, plan.side, plan.code, result.order.qty, price,
-        )
-    else:
-        db.commit()
-        logger.info(
-            "模拟盘自动成交未成功 plan=%s: %s",
-            plan.id, result.reason if result else "unknown",
-        )
+    The file-based EMT request channel cannot yet prove exactly-once order
+    submission or match partial fills to a durable local order ledger.  Keep
+    the compatibility hook as a no-op until that state machine exists.
+    """
+    del db  # explicit: this safety path performs no persistence or side effect
+    logger.info(
+        "自动成交安全冻结 plan=%s intent=%s；仅保留人工票据",
+        plan.id, intent.id,
+    )
     return intent
 
 

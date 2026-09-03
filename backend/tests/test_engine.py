@@ -59,6 +59,8 @@ def _inputs():
         "tech": "技术事实",
         "fund": "基本面事实",
         "stock_news_items": [{"title": "公司公告摘要", "content_hash": "n1"}],
+        "news_item_ids": ["n1"],
+        "news_scope": "direct_stock_only_v1",
         "factsheet": {"score": 0.8},
         "factsheet_hash": "f" * 64,
         "news_fingerprint": "n" * 64,
@@ -161,7 +163,10 @@ def test_final_and_risk_models_create_plan_without_execution(
          patch("app.agents.engine.market.is_trade_date", return_value=True), \
          patch("app.agents.engine.market.get_quote", return_value=quote), \
          patch("app.trading.portfolio.market.get_trade_quote", return_value=quote), \
-         patch("app.trading.plan_service.maybe_auto_issue_ticket", return_value=None):
+         patch(
+             "app.trading.plan_service.maybe_auto_issue_ticket",
+             side_effect=AssertionError("analysis must not mint execution tickets"),
+         ):
         decision, plan = engine._create_ensemble_candidate(
             db,
             run_id=run.id,

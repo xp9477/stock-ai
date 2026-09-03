@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import importlib
 import logging
+import os
 import signal
 import sys
 import threading
@@ -43,31 +44,83 @@ def load_vendor_module(sdk_dir: Path):
     return importlib.import_module("vnemttrader")
 
 
+def prepare_vendor_workdir(log_dir: Path) -> Path:
+    """Give the native SDK a writable cwd (it writes ``lshw.txt`` here).
+
+    systemd runs this unit with ProtectSystem=strict and a read-only bind of
+    the source tree, so leaving cwd at the code mount makes login fail with
+    ``cannot create lshw.txt: Read-only file system``.
+    """
+
+    log_dir.mkdir(parents=True, exist_ok=True)
+    os.chdir(log_dir)
+    return log_dir
+
+
+def _callback(name: str):
+    """Keep Boost.Python from seeing a Python exception as a dead interpreter."""
+
+    def decorator(fn):
+        def wrapped(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except Exception:  # noqa: BLE001
+                LOG.exception("EMT callback %s failed", name)
+        return wrapped
+    return decorator
+
+
 def build_api(vendor, state: BridgeState, disconnected: threading.Event | None = None):
     class ReadOnlyTraderApi(vendor.TraderApi):
-        def onDisconnected(self, reason):
+        @_callback("onConnected")
+        def onConnected(self):
+            # EMT v2.27 wrapper: onConnected(). Missing this is
+            # ``TypeError: 'NoneType' object is not callable`` during login.
+            state.set_connected(True)
+
+        @_callback("onDisconnected")
+        def onDisconnected(self, *args):
+            # Wrapper signature is onDisconnected(session, reason); older
+            # bindings may pass only reason. Use the last integer as the code.
+            reason = args[-1] if args else 0
             state.set_connected(False, reason_code=int(reason or 0))
             if disconnected is not None:
                 disconnected.set()
 
+        @_callback("onError")
         def onError(self, error):
             state.record_error(error)
 
+        @_callback("onOrderEvent")
         def onOrderEvent(self, data, error, _session):
             state.record_order_event(data, error)
 
+        @_callback("onTradeEvent")
         def onTradeEvent(self, data, _session):
             state.record_trade_event(data)
 
+        @_callback("onHoldingChangeEvent")
+        def onHoldingChangeEvent(self, data, _session):
+            row = data if isinstance(data, dict) else {}
+            state.append_event("holding_change", {
+                "ticker": row.get("ticker"),
+                "market": row.get("market"),
+                "total_qty": row.get("total_qty"),
+            })
+
+        @_callback("onQueryAsset")
         def onQueryAsset(self, data, error, reqid, last, _session):
             state.record_query(reqid=reqid, data=data, error=error, last=bool(last))
 
+        @_callback("onQueryPosition")
         def onQueryPosition(self, data, error, reqid, last, _session):
             state.record_query(reqid=reqid, data=data, error=error, last=bool(last))
 
+        @_callback("onQueryOrder")
         def onQueryOrder(self, data, error, reqid, last, _session):
             state.record_query(reqid=reqid, data=data, error=error, last=bool(last))
 
+        @_callback("onQueryTrade")
         def onQueryTrade(self, data, error, reqid, last, _session):
             state.record_query(reqid=reqid, data=data, error=error, last=bool(last))
 
@@ -98,7 +151,7 @@ def run(config: BridgeConfig) -> None:
         snapshot_path=config.snapshot_path,
         journal_path=config.journal_path,
     )
-    config.log_dir.mkdir(parents=True, exist_ok=True)
+    prepare_vendor_workdir(config.log_dir)
     disconnected = threading.Event()
     api = build_api(vendor, state, disconnected)
     api.createTraderApi(config.client_id, str(config.log_dir), 4)
@@ -127,18 +180,21 @@ def run(config: BridgeConfig) -> None:
     generation = 1
     try:
         while not stop.is_set() and not disconnected.is_set():
-            if state.generation_in_flight():
-                state.fail_in_flight("previous reconciliation did not complete")
-            if config.sim_orders:
-                try:
-                    process_inbox(
-                        api=api, session=session,
-                        inbox=config.order_inbox, outbox=config.order_outbox,
-                    )
-                except Exception:  # noqa: BLE001
-                    LOG.exception("EMT sim inbox processing failed")
-            issue_reconciliation(api, state, session, generation)
-            generation += 1
+            try:
+                if state.generation_in_flight():
+                    state.fail_in_flight("previous reconciliation did not complete")
+                if config.sim_orders:
+                    try:
+                        process_inbox(
+                            api=api, session=session,
+                            inbox=config.order_inbox, outbox=config.order_outbox,
+                        )
+                    except Exception:  # noqa: BLE001
+                        LOG.exception("EMT sim inbox processing failed")
+                issue_reconciliation(api, state, session, generation)
+                generation += 1
+            except Exception:  # noqa: BLE001
+                LOG.exception("EMT reconciliation cycle failed")
             for _ in range(config.refresh_seconds):
                 if config.sim_orders:
                     try:
@@ -153,7 +209,10 @@ def run(config: BridgeConfig) -> None:
         if disconnected.is_set() and not stop.is_set():
             raise RuntimeError("EMT connection was lost; service restart required")
     finally:
-        state.set_connected(False, reason_code=0)
+        try:
+            state.set_connected(False, reason_code=0)
+        except Exception:  # noqa: BLE001
+            LOG.exception("failed to publish disconnected snapshot")
         try:
             api.logout(session)
         finally:
@@ -168,6 +227,9 @@ def main() -> int:
     except (BridgeConfigError, RuntimeError) as exc:
         # Never interpolate vendor config or credential-bearing objects here.
         LOG.error("EMT read-only bridge stopped: %s", str(exc))
+        return 1
+    except Exception:  # noqa: BLE001
+        LOG.exception("EMT read-only bridge crashed")
         return 1
     return 0
 

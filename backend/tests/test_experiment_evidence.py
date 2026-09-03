@@ -65,6 +65,32 @@ def _run(db, panel=None) -> BacktestExperiment:
     )
 
 
+def test_factor_validation_allows_warmup_but_requires_usable_complete_dates():
+    panel = _panel(days=6)
+    panel.loc[panel["date"] < panel["date"].sort_values().unique()[2], "mom_short"] = float("nan")
+    evidence.validate_spec_data(panel, SPEC)
+
+    incomplete = panel.copy()
+    incomplete.loc[incomplete["code"] == "600000", "quality_roe"] = float("nan")
+    with pytest.raises(ValueError, match="two usable dates"):
+        evidence.validate_spec_data(incomplete, SPEC)
+
+
+def test_single_declared_factor_is_a_valid_experiment_contract(db):
+    spec = {**SPEC, "factors": ["mom_short"], "top_n": 1}
+    panel = _panel(days=10)
+    evidence.validate_spec_data(panel, spec)
+    result = evidence.run_reproducible_experiment(
+        db,
+        panel=panel,
+        spec=spec,
+        universe=["600000", "000001"],
+        data_cutoff_at=datetime(2024, 3, 1, tzinfo=timezone.utc),
+        development_ratio=0.6,
+    )
+    assert result.status == "development_completed"
+
+
 def test_experiment_freezes_all_fingerprints_and_is_idempotent(db):
     first = _run(db)
     shuffled = _panel().sample(frac=1.0, random_state=7)

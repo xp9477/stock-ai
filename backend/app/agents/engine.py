@@ -193,15 +193,18 @@ def prepare_stock_inputs(
         fund_input = f"股票: {name}({code})\n\n(基本面数据获取失败: {err})"
 
     stock_news_items: list[dict[str, Any]] = []
+    news_item_ids: list[str] = []
     news_fingerprint = ""
     try:
         news_items = market.get_news(code, name=name)
         stock_news_items = list(news_items)
+        news_item_ids = sorted({
+            str(item.get("content_hash") or item.get("url") or item.get("title") or "")
+            for item in stock_news_items
+            if item.get("content_hash") or item.get("url") or item.get("title")
+        })
         news_fingerprint = hashlib.sha256(
-            "\n".join(sorted(
-                str(item.get("content_hash") or item.get("url") or item.get("title") or "")
-                for item in stock_news_items
-            )).encode("utf-8")
+            "\n".join(news_item_ids).encode("utf-8")
         ).hexdigest()
         if news_items:
             news_input = f"股票: {name}({code})\n近期新闻(RSS):\n" + "\n".join(
@@ -260,6 +263,8 @@ def prepare_stock_inputs(
         "factsheet_hash": factsheet_hash(sheet) if sheet else "",
         "research_context": research_block,
         "stock_news_items": stock_news_items,
+        "news_item_ids": news_item_ids,
+        "news_scope": "direct_stock_only_v1",
         "news_fingerprint": news_fingerprint,
         "reference_price": quote.get("price"),
         "reference_price_at": quote.get("quote_asof") or datetime.now().isoformat(),
@@ -682,6 +687,8 @@ def _create_ensemble_candidate(
         "classification": "provisional",
         "snapshot_hash": snapshot_hash,
         "entry_setup": entry_setup,
+        "news_scope": inputs.get("news_scope") or "",
+        "news_item_ids": inputs.get("news_item_ids") or [],
         "news_fingerprint": inputs.get("news_fingerprint") or "",
         "gap_lookback_days": int(get_setting("signal.gap_lookback_days")),
         "gap_percentile": float(get_setting("signal.gap_percentile")),
@@ -725,11 +732,10 @@ def _create_ensemble_candidate(
         idempotency_key=f"run:{run_id}:ensemble:{ensemble.id}:code:{code}",
         commit=False,
     )
+    # Analysis and execution are separate state machines.  A newly-created
+    # plan is for the next proven trading window and must never be ticketed or
+    # submitted from the analysis pipeline that created it.
     db.commit()
-    from ..trading.plan_service import maybe_auto_fill_ticket, maybe_auto_issue_ticket
-    intent = maybe_auto_issue_ticket(db, plan)
-    if intent is not None:
-        maybe_auto_fill_ticket(db, plan, intent)
     return decision, plan
 
 
@@ -1002,9 +1008,11 @@ def run_pipeline(trigger: str = "manual") -> int | None:
             "stock_total": stock_total,
             "llm_models": len(llm_models),
             "ensembles": len(ensembles),
-            "buy": 0,
-            "sell": 0,
+            "buy": action_counts.get("buy", 0),
+            "sell": action_counts.get("sell", 0),
             "hold": action_counts.get("hold", 0),
+            # Analysis no longer executes.  Keep an explicit, honest count
+            # instead of a value that could silently disagree with a broker.
             "trade_n": 0,
             "decision_n": len(decs),
             "degraded": degraded,

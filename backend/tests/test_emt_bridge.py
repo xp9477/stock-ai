@@ -1,10 +1,13 @@
 import json
+import logging
+import os
+import threading
 from pathlib import Path
 
 import pytest
 
 from emt_bridge.config import BridgeConfig, BridgeConfigError
-from emt_bridge.main import ensure_supported_python
+from emt_bridge.main import build_api, ensure_supported_python, prepare_vendor_workdir
 from emt_bridge.orders import market_for_code, process_inbox
 from emt_bridge.state import BridgeState
 
@@ -134,6 +137,113 @@ def test_query_error_fails_closed_and_journal_whitelists_fields(tmp_path):
     assert "password" not in json.dumps(event)
 
 
+class _Vendor:
+    class TraderApi:
+        pass
+
+
+def _state(tmp_path) -> BridgeState:
+    return BridgeState(
+        account_ref="emt-sim-primary",
+        snapshot_path=tmp_path / "snapshot.json",
+        journal_path=tmp_path / "events.jsonl",
+    )
+
+
+def test_on_connected_is_implemented_and_marks_connected(tmp_path):
+    state = _state(tmp_path)
+    api = build_api(_Vendor, state)
+    assert callable(getattr(api, "onConnected"))
+    api.onConnected()
+    snapshot = state.snapshot()
+    assert snapshot["connected"] is True
+    assert json.loads((tmp_path / "snapshot.json").read_text(encoding="utf-8"))["connected"] is True
+
+
+def test_on_disconnected_accepts_session_and_reason(tmp_path):
+    state = _state(tmp_path)
+    disconnected = threading.Event()
+    api = build_api(_Vendor, state, disconnected)
+    state.set_connected(True)
+    api.onDisconnected(99, 7)
+    snapshot = state.snapshot()
+    assert snapshot["connected"] is False
+    assert snapshot["query_errors"] == ["broker disconnected (7)"]
+    assert disconnected.is_set()
+
+
+def test_on_disconnected_accepts_reason_only(tmp_path):
+    state = _state(tmp_path)
+    api = build_api(_Vendor, state)
+    state.set_connected(True)
+    api.onDisconnected(3)
+    assert state.snapshot()["query_errors"] == ["broker disconnected (3)"]
+
+
+def test_callback_exception_is_swallowed(tmp_path, monkeypatch, caplog):
+    state = _state(tmp_path)
+    api = build_api(_Vendor, state)
+    caplog.set_level(logging.ERROR)
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("callback boom")
+
+    monkeypatch.setattr(state, "set_connected", boom)
+    api.onConnected()
+    assert "EMT callback onConnected failed" in caplog.text
+
+
+def test_concurrent_snapshot_writes_do_not_raise(tmp_path):
+    state = _state(tmp_path)
+    errors: list[BaseException] = []
+
+    def worker(seed: int) -> None:
+        try:
+            for i in range(40):
+                state.set_connected(bool((seed + i) % 2))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    payload = json.loads((tmp_path / "snapshot.json").read_text(encoding="utf-8"))
+    assert payload["schema_version"] == 1
+    leftover = list(tmp_path.glob("snapshot.json.*.tmp"))
+    assert leftover == []
+
+
+def test_snapshot_write_failure_is_logged_not_raised(tmp_path, monkeypatch, caplog):
+    state = _state(tmp_path)
+    caplog.set_level(logging.ERROR)
+
+    def boom(*_args, **_kwargs):
+        raise FileNotFoundError("emt_snapshot.json.tmp")
+
+    monkeypatch.setattr("emt_bridge.state.os.replace", boom)
+    state.write_snapshot()
+    assert "failed to write broker snapshot" in caplog.text
+    assert not (tmp_path / "snapshot.json").exists()
+    leftover = list(tmp_path.glob("snapshot.json.*.tmp"))
+    assert leftover == []
+
+
+def test_prepare_vendor_workdir_is_writable(tmp_path):
+    original = Path.cwd()
+    target = tmp_path / "vendor-logs"
+    try:
+        prepare_vendor_workdir(target)
+        assert Path.cwd() == target.resolve()
+        probe = target / "lshw.txt"
+        probe.write_text("ok", encoding="utf-8")
+        assert probe.read_text(encoding="utf-8") == "ok"
+    finally:
+        os.chdir(original)
+
+
 def test_market_for_code_matches_snapshot_convention():
     assert market_for_code("000001") == 1
     assert market_for_code("300001") == 1
@@ -141,7 +251,7 @@ def test_market_for_code_matches_snapshot_convention():
     assert market_for_code("688001") == 2
 
 
-def test_process_inbox_submits_limit_order_and_writes_outbox(tmp_path):
+def test_process_inbox_rejects_stale_order_during_safety_pause(tmp_path):
     inbox = tmp_path / "inbox"
     outbox = tmp_path / "outbox"
     inbox.mkdir()
@@ -153,22 +263,14 @@ def test_process_inbox_submits_limit_order_and_writes_outbox(tmp_path):
         "quantity": 100,
         "price": 10.5,
     }), encoding="utf-8")
-    captured = {}
-
     class Api:
         def insertOrder(self, payload, session):
-            captured["payload"] = payload
-            captured["session"] = session
-            return 4242
+            raise AssertionError("safety-paused bridge must not call insertOrder")
 
     handled = process_inbox(api=Api(), session=9, inbox=inbox, outbox=outbox)
     assert handled == 1
-    assert captured["session"] == 9
-    assert captured["payload"]["ticker"] == "600000"
-    assert captured["payload"]["market"] == 2
-    assert captured["payload"]["side"] == 1
-    assert captured["payload"]["quantity"] == 100
     result = json.loads((outbox / f"{request_id}.json").read_text(encoding="utf-8"))
-    assert result["accepted"] is True
-    assert result["order_emt_id"] == 4242
+    assert result["accepted"] is False
+    assert result["order_emt_id"] == 0
+    assert result["error"] == "automatic_execution_safety_paused"
     assert not (inbox / f"{request_id}.json").exists()

@@ -409,8 +409,9 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="factor.lookback_mid",
-        group="factor", type="int", default=20,
+        group="factor", type="int", default=60,
         label="中动量窗口", unit="日",
+        description="默认 60 日，必须与反转窗口不同，避免动量与反转精确互消",
         min_value=5, max_value=120,
     ),
     SettingDef(
@@ -565,24 +566,24 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="execution.require_manual_confirmation",
-        group="execution", type="bool", default=False,
+        group="execution", type="bool", default=True,
         label="逐笔人工确认",
-        description="关闭后，候选计划在信息/价格/资金门禁通过时自动生成票据；模拟盘可再自动成交",
-        evidence_role="operational",
+        description="安全冻结：每个候选计划必须由本地用户逐笔确认；旧数据库覆盖不会关闭它",
+        editable=False, danger="frozen", evidence_role="invariant",
     ),
     SettingDef(
         key="execution.auto_fill_tickets",
-        group="execution", type="bool", default=True,
-        label="模拟盘自动成交",
-        description="票据生成后向 EMT 模拟盘报单，成交后用快照回写本系统持仓。无 EMT 时才用本地撮合。",
-        evidence_role="operational",
+        group="execution", type="bool", default=False,
+        label="自动成交（安全冻结）",
+        description="在持久订单/成交账本和精确对账完成前强制关闭；票据不会自动提交 EMT 或本地撮合",
+        editable=False, danger="frozen", evidence_role="invariant",
     ),
     SettingDef(
         key="execution.require_human_information_check",
-        group="execution", type="bool", default=False,
+        group="execution", type="bool", default=True,
         label="人工核对正式公告",
-        description="关闭后不再要求勾选「已核对官方公告」；新闻指纹变化仍会阻断旧计划",
-        evidence_role="operational",
+        description="正式公告源尚未接入，必须逐笔确认已核对；旧数据库覆盖不会关闭它",
+        editable=False, danger="frozen", evidence_role="invariant",
     ),
     SettingDef(
         key="execution.max_quote_age_seconds",
@@ -638,6 +639,15 @@ _DEFS: list[SettingDef] = [
         danger="confirm",
         step=0.00001, precision=6,
     ),
+    SettingDef(
+        key="trading.slippage_bps",
+        group="trading", type="float", default=10.0,
+        label="回测保守滑点", unit="bp",
+        description="买入上浮、卖出下浮；10bp=0.10%，纳入每个实验配置指纹",
+        min_value=0.0, max_value=100.0,
+        danger="confirm", evidence_role="provisional",
+        step=1.0, precision=1,
+    ),
 
     # ---------- 调度 ----------
     SettingDef(
@@ -649,16 +659,16 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="schedule.morning_decision_time",
-        group="schedule", type="time", default="09:35",
-        label="上午 AI 决策时间",
-        description="集合竞价结束后，用最新价格与隔夜信息生成上午候选计划；绝不直接成交",
-        requires_scheduler_reload=True,
+        group="schedule", type="time", default="16:00",
+        label="上午 AI 决策（已停用）",
+        description="兼容旧配置键；调度器不再注册盘中决策任务",
+        editable=False, danger="frozen", requires_scheduler_reload=True,
     ),
     SettingDef(
         key="schedule.daily_decision_time",
-        group="schedule", type="time", default="14:10",
-        label="下午 AI 决策时间",
-        description="午后用变化后的行情与信息重新生成候选计划；绝不直接成交",
+        group="schedule", type="time", default="16:00",
+        label="收盘后 AI 决策时间",
+        description="收盘后冻结事实并生成下一交易日候选计划；分析阶段绝不出票或成交",
         requires_scheduler_reload=True,
     ),
     SettingDef(
@@ -669,9 +679,9 @@ _DEFS: list[SettingDef] = [
     ),
     SettingDef(
         key="schedule.stock_select_time",
-        group="schedule", type="time", default="08:50",
+        group="schedule", type="time", default="15:30",
         label="自动选股时间",
-        description="开盘前准备候选股与当日数据，交易日 cron，格式 HH:MM",
+        description="收盘后准备候选股与完整日线数据，交易日 cron，格式 HH:MM",
         requires_scheduler_reload=True,
     ),
     SettingDef(

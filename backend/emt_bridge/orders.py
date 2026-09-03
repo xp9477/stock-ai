@@ -15,6 +15,7 @@ from typing import Any
 
 
 LOG = logging.getLogger("emt_bridge.orders")
+ORDER_SUBMISSION_ENABLED = False
 
 # EMT v2.x / XTP-compatible integers. Snapshot rows use market=1 for 000001 (SZ).
 EMT_MKT_SZ_A = 1
@@ -118,6 +119,21 @@ def process_inbox(*, api, session: int, inbox: Path, outbox: Path) -> int:
                 "accepted": False,
                 "order_emt_id": 0,
                 "error": "invalid_request",
+                "submitted_at": datetime.now(timezone.utc).isoformat(),
+            })
+            path.unlink(missing_ok=True)
+            handled += 1
+            continue
+        if not ORDER_SUBMISSION_ENABLED:
+            LOG.warning(
+                "rejecting EMT order %s: automatic execution safety pause",
+                request["request_id"],
+            )
+            write_result(outbox, {
+                "request_id": request["request_id"],
+                "accepted": False,
+                "order_emt_id": 0,
+                "error": "automatic_execution_safety_paused",
                 "submitted_at": datetime.now(timezone.utc).isoformat(),
             })
             path.unlink(missing_ok=True)

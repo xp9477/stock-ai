@@ -126,6 +126,8 @@ def _plan(db, model_a):
         expires_at=current + timedelta(hours=1),
         invalidation_conditions={"material_news": "review_required"},
         policy_snapshot={
+            "news_scope": "direct_stock_only_v1",
+            "news_item_ids": [],
             "news_fingerprint": "baseline",
             "gap_lookback_days": 60,
             "gap_percentile": 0.95,

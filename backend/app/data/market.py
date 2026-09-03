@@ -1,6 +1,7 @@
 """数据层：扶摇提供个股行情/日 K，新浪提供指数/交易日历，RSS 提供新闻。"""
 import logging
 from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import akshare as ak
 import pandas as pd
@@ -182,9 +183,13 @@ def get_stock_info(code: str) -> dict:
 
 @ttl_cache(600)
 def get_news(code: str, name: str = "") -> list[dict]:
-    """个股相关新闻（公开 RSS，与 factsheet 同源）。
+    """个股直接相关新闻（公开 RSS，与 factsheet 同源）。
 
     受 datasources.rss.* 控制：禁用时按 fail_policy 返回空或抛错。
+
+    通用宏观头条不得混入这里。这个返回值会冻结进交易计划的信息
+    基线，若把 general fallback 当作个股新闻，盘前门禁就会把空的直接
+    新闻集合误报成“新增个股新闻”。
     """
     from . import datasources as ds
     from . import news_rss
@@ -193,7 +198,8 @@ def get_news(code: str, name: str = "") -> list[dict]:
         if ds.fail_policy("rss", "skip") == "hard":
             raise RuntimeError("新闻 RSS 已禁用（设置 → 数据源）")
         return []
-    return news_rss.news_for_stock(code, name=name, limit=10)
+    return news_rss.news_for_stock(
+        code, name=name, limit=10, include_general=False)
 
 
 @ttl_cache(1800)
@@ -259,7 +265,7 @@ def _trade_dates() -> set:
 
 
 def is_trade_date(day: date | None = None) -> bool:
-    day = day or date.today()
+    day = day or datetime.now(ZoneInfo("Asia/Shanghai")).date()
     try:
         return day.strftime("%Y-%m-%d") in _trade_dates()
     except Exception as err:  # noqa: BLE001
@@ -273,10 +279,13 @@ def is_trading_session(now: datetime | None = None) -> bool:
     """A 股连续竞价大致时段。非交易日 / 夜盘一律 False。"""
     from datetime import time as dtime
 
-    now = now or datetime.now()
+    shanghai = ZoneInfo("Asia/Shanghai")
+    now = now or datetime.now(shanghai)
+    if now.tzinfo is not None:
+        now = now.astimezone(shanghai).replace(tzinfo=None)
     if not is_trade_date(now.date()):
         return False
-    t = now.time()
+    t = now.time().replace(tzinfo=None)
     return (
         dtime(9, 30) <= t <= dtime(11, 30)
         or dtime(13, 0) <= t <= dtime(15, 0)

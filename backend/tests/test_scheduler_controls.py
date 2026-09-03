@@ -40,7 +40,6 @@ def test_reload_jobs_stops_scheduler_when_master_switch_is_off():
 def test_register_jobs_never_schedules_capitalized_rule_rebalance():
     fake = RecordingScheduler()
     params = {
-        "morning_decision_time": "09:35",
         "decision_time": "16:00",
         "select_enabled": True,
         "select_time": "15:30",
@@ -50,7 +49,7 @@ def test_register_jobs_never_schedules_capitalized_rule_rebalance():
         scheduler._register_jobs(fake)
 
     assert set(fake.job_ids) == {
-        "decision_morning", "decision_afternoon", "stock_select", "monitor",
+        "decision_afternoon", "stock_select", "monitor",
     }
     assert "rule_rebalance" not in fake.job_ids
-    assert fake.removed == ["daily_decision", "rule_rebalance"]
+    assert fake.removed == ["daily_decision", "decision_morning", "rule_rebalance"]

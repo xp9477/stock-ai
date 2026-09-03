@@ -39,6 +39,7 @@ REPRODUCIBILITY_SETTING_KEYS = (
     "trading.commission_min",
     "trading.transfer_fee_rate",
     "trading.stamp_tax_rate",
+    "trading.slippage_bps",
     "factor.lookback_short",
     "factor.lookback_mid",
     "factor.lookback_rev",
@@ -101,6 +102,7 @@ def source_code_fingerprint() -> str:
     relative_paths = (
         "backtest/evidence.py",
         "backtest/engine.py",
+        "backtest/execution.py",
         "backtest/metrics.py",
         "backtest/spec_runner.py",
         "backtest/validation.py",
@@ -233,19 +235,44 @@ def panel_from_artifact(experiment: BacktestExperiment) -> pd.DataFrame:
 
 
 def validate_spec_data(panel: pd.DataFrame, spec: dict[str, Any]) -> None:
-    """Reject silent factor substitution or partial factor coverage."""
+    """Validate that a factor experiment has usable complete cross-sections.
+
+    Rolling factors naturally contain warm-up NaNs, so whole-column finite
+    coverage is neither realistic nor desirable.  A date is usable only when
+    enough stocks have finite values for *all* declared factors; this matches
+    the eligibility rule used by the backtest runner.
+    """
     if spec.get("mode") != "factor_cross_section":
         return
-    factors = list(spec.get("factors") or [])
+    factors = list(dict.fromkeys(spec.get("factors") or []))
     if not factors:
         raise ValueError("factor experiment has no declared factors")
     missing = [factor for factor in factors if factor not in panel.columns]
     if missing:
         raise ValueError("panel missing declared factors: " + ", ".join(missing))
+
+    numeric = pd.DataFrame(index=panel.index)
     for factor in factors:
-        values = pd.to_numeric(panel[factor], errors="coerce").to_numpy(dtype=float)
-        if not np.isfinite(values).all():
-            raise ValueError(f"panel has incomplete coverage for factor: {factor}")
+        numeric[factor] = pd.to_numeric(panel[factor], errors="coerce")
+    finite_all = np.isfinite(numeric.to_numpy(dtype=float)).all(axis=1)
+
+    universe_size = int(panel["code"].astype(str).nunique())
+    try:
+        requested_top_n = max(1, int(spec.get("top_n") or 1))
+    except (TypeError, ValueError):
+        requested_top_n = 1
+    # At least two securities are needed for a meaningful cross-sectional
+    # comparison.  Larger baskets must have enough eligible names to fill the
+    # requested basket, capped by the frozen universe itself.
+    required_stocks = min(universe_size, max(2, requested_top_n))
+    eligible = panel.loc[finite_all, ["date", "code"]]
+    eligible_counts = eligible.groupby("date")["code"].nunique()
+    usable_dates = eligible_counts[eligible_counts >= required_stocks]
+    if len(usable_dates) < 2:
+        raise ValueError(
+            "factor panel needs at least two usable dates with "
+            f"{required_stocks} stocks finite for all declared factors"
+        )
 
 
 def _result_payload(strategy: BacktestResult, anchor: BacktestResult) -> dict[str, Any]:
@@ -400,6 +427,8 @@ def run_reproducible_experiment(
         raise ValueError("development/holdout split is not viable")
     if development["date"].nunique() < 2 or holdout["date"].nunique() < 2:
         raise ValueError("development and holdout each need at least two dates")
+    validate_spec_data(development, spec)
+    validate_spec_data(holdout, spec)
 
     experiment, created = _create_experiment(
         db,
@@ -585,6 +614,7 @@ def _run_selected_holdout(
             normalized, development_ratio=experiment.development_ratio)
         if holdout.empty or holdout["date"].nunique() < 2:
             raise ValueError("selected campaign holdout is not viable")
+        validate_spec_data(holdout, spec)
         strategy = run_spec_backtest(holdout, spec)
         anchor = run_equal_weight_buyhold(holdout)
         result = _record_result(

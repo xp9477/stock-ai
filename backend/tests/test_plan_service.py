@@ -56,7 +56,7 @@ def _quote(price=101.0):
 
 def _plan(
     db, model_a, *, news_fingerprint="baseline", action="buy",
-    target_pct=0.2, code="600519",
+    target_pct=0.2, code="600519", news_item_ids=None, news_scope="direct_stock_only_v1",
 ):
     model_a.type = "ensemble"
     model_a.is_official_strategy = True
@@ -81,6 +81,8 @@ def _plan(
         expires_at=NOW + timedelta(hours=1),
         invalidation_conditions={"material_news": "review_required"},
         policy_snapshot={
+            "news_scope": news_scope,
+            "news_item_ids": list(news_item_ids or []),
             **({"news_fingerprint": news_fingerprint}
                if news_fingerprint is not None else {}),
             "gap_lookback_days": 60,
@@ -122,15 +124,16 @@ def test_official_disclosure_check_is_explicitly_fail_closed(db, model_a):
     assert plan.status == "blocked_information"
 
 
-def test_information_gate_passes_without_human_check_when_disabled(db, model_a):
+def test_information_gate_blocks_without_required_human_check_by_default(db, model_a):
     plan = _plan(db, model_a)
     with patch(
         "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
         return_value=_news(),
     ):
         check = review_preopen_information(db, plan, human_official_confirmed=False)
-    assert check.outcome == "pass"
-    assert plan.status == "preopen_validated"
+    assert check.outcome == "blocked_information"
+    assert check.reason_code == "official_disclosure_unverified"
+    assert plan.status == "blocked_information"
 
 
 def test_new_direct_news_requires_reanalysis_even_after_human_check(db, model_a):
@@ -142,6 +145,35 @@ def test_new_direct_news_requires_reanalysis_even_after_human_check(db, model_a)
         check = review_preopen_information(db, plan, human_official_confirmed=True)
     assert check.outcome == "review_required"
     assert plan.status == "review_required"
+
+
+def test_disappearing_news_does_not_masquerade_as_new_information(db, model_a):
+    plan = _plan(
+        db, model_a, news_fingerprint="old-fingerprint", news_item_ids=["old-item"])
+    with patch(
+        "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
+        return_value={**_news("empty-now"), "items": []},
+    ):
+        check = review_preopen_information(
+            db, plan, human_official_confirmed=True)
+    assert check.outcome == "pass"
+    assert check.reason_code == "information_gate_passed"
+    assert check.new_information_ids_json == "[]"
+
+
+def test_legacy_general_news_baseline_is_not_reported_as_new_direct_news(db, model_a):
+    plan = _plan(
+        db, model_a, news_fingerprint="general-headline-hash",
+        news_scope="", news_item_ids=[],
+    )
+    with patch(
+        "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
+        return_value={**_news("direct-empty-hash"), "items": []},
+    ):
+        check = review_preopen_information(
+            db, plan, human_official_confirmed=True)
+    assert check.outcome == "review_required"
+    assert check.reason_code == "unverifiable_analysis_news_scope"
 
 
 def test_missing_analysis_news_fingerprint_requires_reanalysis(db, model_a):
@@ -212,95 +244,96 @@ def test_human_approval_creates_ticket_but_no_order_or_position(db, model_a):
     assert "canary_status" in intent.risk_snapshot_json
 
 
-def test_auto_issue_ticket_skips_human_confirmation(db, model_a):
+def test_safe_default_never_auto_issues_ticket(db, model_a):
     plan = _plan(db, model_a)
+    intent = maybe_auto_issue_ticket(db, plan, now=NOW)
+
+    assert intent is None
+    assert plan.status == "candidate"
+    assert db.query(ExecutionIntent).count() == 0
+    assert db.query(GateCheck).count() == 0
+    assert db.query(Order).count() == 0
+
+
+def test_legacy_auto_issue_still_enforces_future_valid_from(db, model_a):
+    from app.runtime_settings import get_setting as runtime_get_setting
+
+    plan = _plan(db, model_a)
+    plan.valid_from_at = NOW + timedelta(days=1)
+    plan.expires_at = NOW + timedelta(days=1, hours=1)
+    db.commit()
+
+    def auto_setting(key):
+        if key in {
+            "execution.require_manual_confirmation",
+            "execution.require_human_information_check",
+        }:
+            return False
+        return runtime_get_setting(key)
+
     with patch(
+        "app.trading.plan_service.get_setting", side_effect=auto_setting,
+    ), patch(
         "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
         return_value=_news(),
     ), patch(
         "app.trading.plan_service.market.get_execution_quote",
         return_value=_quote(),
-    ), patch(
+    ) as execution_quote, patch(
         "app.trading.plan_service.market.get_daily_kline",
         return_value=_bars(),
     ):
         intent = maybe_auto_issue_ticket(db, plan, now=NOW)
 
-    assert intent is not None
-    assert intent.status == "ticket_ready"
-    assert intent.approved_by == "system"
-    assert plan.status == "ticket_ready"
-    assert plan.status_reason_code == "auto_approved"
-    assert db.query(Order).count() == 0
+    assert intent is None
+    assert execution_quote.call_args.kwargs["require_session"] is True
+    assert db.query(ExecutionIntent).count() == 0
+    price_gate = db.query(GateCheck).filter_by(gate_type="pretrade_quote").one()
+    assert price_gate.reason_code == "plan_not_yet_valid"
 
 
-def test_auto_fill_ticket_creates_local_order_and_position(db, model_a):
+def test_auto_fill_safety_pause_creates_no_local_order_or_position(db, model_a):
     plan = _plan(db, model_a)
     quote = _quote(101.0)
     with patch(
         "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
         return_value=_news(),
-    ), patch(
-        "app.trading.plan_service.market.get_execution_quote",
-        return_value=quote,
-    ), patch(
-        "app.trading.plan_service.market.get_daily_kline",
-        return_value=_bars(),
-    ), patch(
-        "app.trading.plan_service.market.get_trade_quote",
-        return_value={**quote, "pct_change": 0.5},
     ):
-        intent = maybe_auto_issue_ticket(db, plan, now=NOW)
+        intent = approve_plan(
+            db, plan, expected_lock_version=plan.lock_version,
+            idempotency_key="manual-ticket-no-autofill", confirmed=True,
+            human_official_confirmed=True, quote=quote, daily_bars=_bars(),
+            now=NOW, require_session=False,
+        )
         filled = maybe_auto_fill_ticket(db, plan, intent)
 
-    assert filled.status == "executed"
-    assert plan.status == "executed"
-    assert db.query(Order).filter(Order.status == "filled").count() == 1
-    pos = db.query(Position).filter_by(model_pk=model_a.id, code="600519").one()
-    assert pos.total_qty > 0
+    assert filled.status == "ticket_ready"
+    assert plan.status == "ticket_ready"
+    assert db.query(Order).count() == 0
+    assert db.query(Position).count() == 0
 
 
-def test_auto_fill_uses_emt_inbox_when_broker_reference_required(db, model_a, monkeypatch):
-    from app.config import settings
-
-    monkeypatch.setattr(settings, "broker_reference_required", True)
+def test_auto_fill_safety_pause_never_submits_emt_order(db, model_a):
     plan = _plan(db, model_a)
     quote = _quote(101.0)
-    from app.trading.broker_snapshot import BrokerSnapshot
-    snap = BrokerSnapshot(
-        provider="emt", mode="simulation", read_only=True, connected=True,
-        reconciled=True, account_ref="emt-sim-primary",
-        observed_at=NOW,
-        asset={"total_asset": 200000.0, "buying_power": 189900.0},
-        positions=({"ticker": "600519", "total_qty": 100, "sellable_qty": 0,
-                    "avg_price": 101.0, "unrealized_pnl": 0.0},),
-        orders=(), trades=(), query_errors=(),
-    )
     with patch(
         "app.trading.plan_service.news_rss.stock_news_gate_snapshot",
         return_value=_news(),
-    ), patch(
-        "app.trading.plan_service.market.get_execution_quote",
-        return_value=quote,
-    ), patch(
-        "app.trading.plan_service.market.get_daily_kline",
-        return_value=_bars(),
     ), patch(
         "app.trading.emt_orders.submit_simulation_order",
         return_value={"accepted": True, "order_emt_id": 88, "error": ""},
-    ) as submit, patch(
-        "app.trading.broker_snapshot.load_broker_snapshot",
-        return_value=snap,
-    ), patch(
-        "app.trading.broker_snapshot.reconcile_snapshot_projection",
-        return_value={"position_count": 1},
-    ):
-        intent = maybe_auto_issue_ticket(db, plan, now=NOW)
+    ) as submit:
+        intent = approve_plan(
+            db, plan, expected_lock_version=plan.lock_version,
+            idempotency_key="manual-ticket-no-emt", confirmed=True,
+            human_official_confirmed=True, quote=quote, daily_bars=_bars(),
+            now=NOW, require_session=False,
+        )
         filled = maybe_auto_fill_ticket(db, plan, intent)
 
-    assert submit.called
-    assert filled.status == "executed"
-    assert plan.status_reason_code == "emt_filled"
+    assert submit.called is False
+    assert filled.status == "ticket_ready"
+    assert plan.status == "ticket_ready"
     assert db.query(Order).count() == 0
 
 

@@ -47,6 +47,24 @@ def test_old_override_cannot_weaken_fixed_capital_contract(db):
     assert items["capital.authorized_capital"]["overridden"] is False
 
 
+def test_old_override_cannot_reenable_automatic_execution(db):
+    db.add(SettingOverride(
+        key="execution.require_manual_confirmation", value="false"))
+    db.add(SettingOverride(
+        key="execution.require_human_information_check", value="false"))
+    db.add(SettingOverride(
+        key="execution.auto_fill_tickets", value="true"))
+    db.commit()
+    invalidate_cache()
+
+    assert get_setting("execution.require_manual_confirmation", db) is True
+    assert get_setting("execution.require_human_information_check", db) is True
+    assert get_setting("execution.auto_fill_tickets", db) is False
+    items = {item["key"]: item for item in list_settings(group="execution", db=db)}
+    assert items["execution.auto_fill_tickets"]["source"] == "fixed"
+    assert items["execution.auto_fill_tickets"]["overridden"] is False
+
+
 def test_default_get_setting(db):
     """无覆盖时等于注册表默认（用测试库，避免污染真实 DB）。"""
     from unittest.mock import patch

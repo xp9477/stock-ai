@@ -12,13 +12,14 @@ class Settings(BaseSettings):
     initial_cash: float = 100_000.0
 
     schedule_enabled: bool = True
-    morning_decision_time: str = "09:35"
-    daily_decision_time: str = "14:10"
+    # Legacy compatibility only: no morning decision job is registered.
+    morning_decision_time: str = "16:00"
+    daily_decision_time: str = "16:00"
     monitor_interval_minutes: int = 5
 
     # 自动选股 / 候选池（确定性资格筛选后上限 30）
     stock_select_enabled: bool = True
-    stock_select_time: str = "08:50"
+    stock_select_time: str = "15:30"
     pool_max: int = 30
 
     # 盘中只告警/复审，任何卖出都必须人工确认。
@@ -53,7 +54,7 @@ class Settings(BaseSettings):
     factor_rebalance: str = "W-MON"  # pandas 周频锚到周一
     factor_top_n: int = 10
     factor_lookback_short: int = 5
-    factor_lookback_mid: int = 20
+    factor_lookback_mid: int = 60
     factor_vol_window: int = 20
 
     # 历史验证证据门槛（字段名保留 race_* 兼容旧环境变量）
