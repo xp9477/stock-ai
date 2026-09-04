@@ -55,7 +55,7 @@ def test_default_models_replace_grok_45_with_gpt_sol_high():
     assert ids == [
         "grok-4.6",
         "gpt-5.6-sol",
-        "gemini-3.7-flash-high",
+        "gemini-3.8-flash-high",
     ]
 
 
@@ -96,7 +96,7 @@ def test_seed_replaces_grok_45_with_gpt_when_grok_46_already_exists(db):
 
 def test_seed_puts_grok_46_first_among_default_advisors(db):
     first = Model(name="GPT 5.6 Sol High", model_id="gpt-5.6-sol", type="llm")
-    second = Model(name="Gemini 3.7 Flash", model_id="gemini-3.7-flash-high", type="llm")
+    second = Model(name="Gemini 3.8 Flash High", model_id="gemini-3.8-flash-high", type="llm")
     third = Model(name="Grok 4.6", model_id="grok-4.6", type="llm")
     db.add_all([first, second, third])
     db.commit()
@@ -108,7 +108,27 @@ def test_seed_puts_grok_46_first_among_default_advisors(db):
     db.refresh(third)
     assert first.model_id == "grok-4.6"
     assert second.model_id == "gpt-5.6-sol"
-    assert third.model_id == "gemini-3.7-flash-high"
+    assert third.model_id == "gemini-3.8-flash-high"
+
+
+def test_seed_replaces_legacy_gemini_36_with_38(db):
+    legacy_36 = Model(name="Gemini 3.6 Flash", model_id="gemini-3.6-flash-high", type="llm", enabled=True)
+    db.add(legacy_36)
+    db.commit()
+    seed_models(db)
+    db.refresh(legacy_36)
+    assert legacy_36.model_id == "gemini-3.8-flash-high"
+    assert legacy_36.name == "Gemini 3.8 Flash High"
+
+
+def test_seed_replaces_legacy_gemini_37_with_38(db):
+    legacy_37 = Model(name="Gemini 3.7 Flash", model_id="gemini-3.7-flash-high", type="llm", enabled=True)
+    db.add(legacy_37)
+    db.commit()
+    seed_models(db)
+    db.refresh(legacy_37)
+    assert legacy_37.model_id == "gemini-3.8-flash-high"
+    assert legacy_37.name == "Gemini 3.8 Flash High"
 
 
 def test_cannot_create_a_second_capitalized_ensemble_account(db):

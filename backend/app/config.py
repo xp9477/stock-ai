@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     # External broker SDKs run in an isolated read-only bridge.  The web app
     # consumes only its normalized, atomically-written simulation snapshot.
     broker_snapshot_path: str = "/data/broker/emt_snapshot.json"
-    broker_snapshot_max_age_seconds: int = 60
+    broker_snapshot_max_age_seconds: int = 120
     # Accepted personal-capital boundary. A broker query can be technically
     # complete yet still be the vendor's huge seeded demo portfolio; that
     # state must never become decision reference data.

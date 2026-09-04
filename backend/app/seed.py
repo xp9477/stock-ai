@@ -10,13 +10,14 @@ from .models import Account, Model
 DEFAULT_MODELS = [
     {"name": "Grok 4.6", "model_id": "grok-4.6"},
     {"name": "GPT 5.6 Sol High", "model_id": "gpt-5.6-sol"},
-    {"name": "Gemini 3.7 Flash", "model_id": "gemini-3.7-flash-high"},
+    {"name": "Gemini 3.8 Flash High", "model_id": "gemini-3.8-flash-high"},
 ]
 
 LEGACY_MODEL_REPLACEMENTS = {
     "claude-opus-4-6-thinking": ("Grok 4.6", "grok-4.6"),
     "gpt-5.6-sol-high": ("GPT 5.6 Sol High", "gpt-5.6-sol"),
-    "gemini-3.6-flash-high": ("Gemini 3.7 Flash", "gemini-3.7-flash-high"),
+    "gemini-3.6-flash-high": ("Gemini 3.8 Flash High", "gemini-3.8-flash-high"),
+    "gemini-3.7-flash-high": ("Gemini 3.8 Flash High", "gemini-3.8-flash-high"),
 }
 
 # Grok 4.5 已从网关下线。已有 4.6 时，这个顾问位改成 GPT Sol High；
@@ -64,6 +65,11 @@ def replacement_for(model: Model, sibling_ids: set[str] | None = None) -> tuple[
     mid = normalize_model_id(model.model_id)
     explicit = LEGACY_MODEL_REPLACEMENTS.get(mid)
     if explicit:
+        name, target_id = explicit
+        if sibling_ids:
+            other_ids = {normalize_model_id(s) for s in sibling_ids if s != model.model_id}
+            if normalize_model_id(target_id) in other_ids:
+                return None
         return explicit
     if is_retired_grok_45(mid):
         siblings = {normalize_model_id(item) for item in (sibling_ids or set())}
@@ -116,7 +122,9 @@ def seed_models(db: Session):
         replacement = replacement_for(model, sibling_ids)
         if replacement:
             old_id = model.model_id
+            sibling_ids.discard(old_id)
             model.name, model.model_id = replacement
+            sibling_ids.add(model.model_id)
             logger.warning("已替换停用模型 %s → %s (%s)", old_id, model.model_id, model.name)
 
     _align_default_advisor_order(db, llm_models)

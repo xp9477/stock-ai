@@ -1,5 +1,6 @@
 """数据层：扶摇提供个股行情/日 K，新浪提供指数/交易日历，RSS 提供新闻。"""
 import logging
+import time
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -11,21 +12,18 @@ from .cache import ttl_cache
 logger = logging.getLogger(__name__)
 
 
-@ttl_cache(30)
-def get_quote(code: str) -> dict | None:
-    """扶摇单股行情快照。找不到或价格无效时返回 ``None``。"""
-    from . import fuyao_client as fuyao
+_QUOTE_CACHE_TTL = 30.0
+_quote_cache: dict[str, tuple[float, dict | None]] = {}
 
-    if not fuyao.available():
-        return None
-    try:
-        items = fuyao.prices_snapshot([code])
-    except Exception as err:  # noqa: BLE001
-        logger.warning("扶摇快照失败 %s: %s", code, err)
-        return None
-    if not items:
-        return None
-    it = items[0]
+
+def _normalize_code(c: str) -> str:
+    s = str(c or "").strip()
+    if "." in s:
+        s = s.split(".")[0]
+    return s.zfill(6)[-6:] if s.isdigit() else s
+
+
+def _parse_quote(code: str, it: dict) -> dict | None:
     price = it.get("last_price") or it.get("close_price") or it.get("price")
     if price is None:
         return None
@@ -59,14 +57,101 @@ def get_quote(code: str) -> dict | None:
         "source": "fuyao",
         "prev_close": float(prev_close) if prev_close is not None else None,
         "open": float(open_price) if open_price is not None else None,
-        # 扶摇 snapshot 当前不返回交易所时间；明确标记为客户端接收时间，
-        # 避免把它误称为交易所时间戳。
         "quote_asof": received_at,
         "quote_asof_source": "client_received_at",
         "received_at": received_at,
         "tradable": volume > 0,
         "trade_status": "tradable" if volume > 0 else "suspended_or_unavailable",
     }
+
+
+def prefetch_quotes(codes: list[str]) -> dict[str, dict | None]:
+    """批量预取并共享 30 秒逐代码行情缓存。"""
+    from . import fuyao_client as fuyao
+
+    if not codes:
+        return {}
+
+    clean_codes = [str(c).strip() for c in codes if str(c).strip()]
+    unique_codes = list(dict.fromkeys(clean_codes))
+
+    now = time.time()
+    missing: list[str] = []
+    result: dict[str, dict | None] = {}
+
+    for c in unique_codes:
+        norm_c = _normalize_code(c)
+        hit = _quote_cache.get(c) or _quote_cache.get(norm_c)
+        if hit is not None and (now - hit[0]) < _QUOTE_CACHE_TTL:
+            result[c] = hit[1]
+        else:
+            missing.append(c)
+
+    if not missing:
+        return result
+
+    if not fuyao.available():
+        for c in missing:
+            result[c] = None
+        return result
+
+    for i in range(0, len(missing), 50):
+        chunk = missing[i:i + 50]
+        try:
+            items = fuyao.prices_snapshot(chunk)
+        except Exception as err:  # noqa: BLE001
+            logger.warning("扶摇批量快照失败: %s", err)
+            items = []
+
+        items_by_code: dict[str, dict] = {}
+        for it in items or []:
+            raw_c = (
+                it.get("ticker")
+                or (fuyao.from_thscode(it["thscode"]) if it.get("thscode") else None)
+                or it.get("code")
+            )
+            if raw_c:
+                norm = _normalize_code(str(raw_c))
+                items_by_code[norm] = it
+                items_by_code[str(raw_c).strip()] = it
+
+        if len(chunk) == 1 and len(items or []) == 1:
+            c0 = chunk[0]
+            c0_norm = _normalize_code(c0)
+            if c0 not in items_by_code and c0_norm not in items_by_code:
+                items_by_code[c0] = items[0]
+                items_by_code[c0_norm] = items[0]
+
+        fetch_time = time.time()
+        for c in chunk:
+            norm_c = _normalize_code(c)
+            it = items_by_code.get(c) or items_by_code.get(norm_c)
+            parsed = _parse_quote(c, it) if it is not None else None
+            _quote_cache[c] = (fetch_time, parsed)
+            _quote_cache[norm_c] = (fetch_time, parsed)
+            result[c] = parsed
+
+    return result
+
+
+def get_quote(code: str) -> dict | None:
+    """扶摇单股行情快照。找不到或价格无效时返回 ``None``。"""
+    now = time.time()
+    hit = _quote_cache.get(code)
+    if hit is None:
+        hit = _quote_cache.get(_normalize_code(code))
+    if hit is not None and (now - hit[0]) < _QUOTE_CACHE_TTL:
+        return hit[1]
+
+    prefetch_quotes([code])
+    hit = _quote_cache.get(code)
+    if hit is None:
+        hit = _quote_cache.get(_normalize_code(code))
+    return hit[1] if hit is not None else None
+
+
+get_quote.cache_clear = _quote_cache.clear
+prefetch_quotes.cache_clear = _quote_cache.clear
 
 
 def get_trade_quote(

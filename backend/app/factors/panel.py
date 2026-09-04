@@ -25,6 +25,7 @@ def load_stock_factors(
     use_tushare: bool = False,  # 保留参数兼容旧调用，忽略
     roe_years: int = 4,
     fetch_latest_valuation: bool = True,
+    roe_limit: int | None = None,
 ) -> pd.DataFrame:
     """单票因子时间序列（含 code 列）。主源：扶摇。"""
     del use_tushare
@@ -58,7 +59,7 @@ def load_stock_factors(
 
     fina = pd.DataFrame()
     try:
-        fina = fuyao.roe_history(code, years=roe_years)
+        fina = fuyao.roe_history(code, years=roe_years, limit=roe_limit)
     except Exception as err:  # noqa: BLE001
         logger.warning("roe_history %s: %s", code, err)
 
@@ -74,6 +75,7 @@ def build_factor_panel(
     use_tushare: bool = False,
     roe_years: int = 4,
     fetch_latest_valuation: bool = True,
+    roe_limit: int | None = None,
 ) -> pd.DataFrame:
     """长表：date, code, factors..."""
     del use_tushare
@@ -82,7 +84,8 @@ def build_factor_panel(
         try:
             f = load_stock_factors(
                 code, start=start, end=end, roe_years=roe_years,
-                fetch_latest_valuation=fetch_latest_valuation)
+                fetch_latest_valuation=fetch_latest_valuation,
+                roe_limit=roe_limit)
             if not f.empty:
                 frames.append(f)
         except Exception as err:  # noqa: BLE001
@@ -100,14 +103,13 @@ def latest_factor_snapshot(
     """最新截面 + 综合分。"""
     del use_tushare
     asof = asof or date.today()
-    start = asof - timedelta(days=120)
-    # Live ranking only needs the latest two reported ROE observations.  One
-    # year is sufficient and avoids fetching four years of quarterly reports
-    # for every twice-daily decision run.  Historical panel builders retain the
-    # four-year default.
+    start = asof - timedelta(days=400)
+    # 400 天起点与 factsheet 保持一致，复用 daily_bars 30 分钟缓存；
+    # roe_limit=2 仅拉取最近 2 期可用 ROE，避免请求爆发。
     panel = build_factor_panel(
         codes, start=start, end=asof, roe_years=1,
         fetch_latest_valuation=False,
+        roe_limit=2,
     )
     if panel.empty:
         return pd.DataFrame()

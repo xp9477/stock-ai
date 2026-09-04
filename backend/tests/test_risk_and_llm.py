@@ -84,8 +84,9 @@ def test_reasoning_effort_is_high_only_for_grok():
     assert llm.reasoning_effort_for("Grok-4.6") == "high"
     assert llm.reasoning_effort_for("grok-4.5") == "high"
     assert llm.reasoning_effort_for("gpt-5.6-sol-high") is None
-    assert llm.resolve_model_id("gemini-3.6-flash-high") == "gemini-3.7-flash-high"
-    assert llm.reasoning_effort_for("gemini-3.7-flash-high") is None
+    assert llm.resolve_model_id("gemini-3.6-flash-high") == "gemini-3.8-flash-high"
+    assert llm.resolve_model_id("gemini-3.7-flash-high") == "gemini-3.8-flash-high"
+    assert llm.reasoning_effort_for("gemini-3.8-flash-high") is None
 
 
 def test_chat_sends_reasoning_effort_for_grok_only():

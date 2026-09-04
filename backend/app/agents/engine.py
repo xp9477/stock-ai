@@ -791,11 +791,15 @@ def run_pipeline(trigger: str = "manual") -> int | None:
         # Existing positions remain in the analysis universe so they can be
         # sold, but only those that independently pass the same deterministic
         # eligibility gate enter the mechanical shadow universe.
+        watchlist_items = db.query(Watchlist).all()
+        # 资格过滤前对持仓+watchlist 一次批量预取，使后续 get_quote 命中 30s 缓存
+        market.prefetch_quotes(list(targets.keys()) + [item.code for item in watchlist_items])
+
         for code in list(targets):
             eligible_quote, _reason = market.strategy_eligible_quote(code)
             if eligible_quote is not None:
                 eligible_quotes[code] = dict(eligible_quote)
-        for item in db.query(Watchlist).all():
+        for item in watchlist_items:
             if item.code in targets:
                 continue
             eligible_quote, reason = market.strategy_eligible_quote(item.code)

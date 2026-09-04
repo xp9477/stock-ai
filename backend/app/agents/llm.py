@@ -54,9 +54,9 @@ def resolve_model_id(model: str) -> str:
     if mid == "gpt-5.6-sol-high":
         logger.warning("模型 %s 网关不存在，改用 gpt-5.6-sol", model)
         return "gpt-5.6-sol"
-    if mid == "gemini-3.6-flash-high":
-        logger.warning("模型 %s 已替换为 gemini-3.7-flash-high", model)
-        return "gemini-3.7-flash-high"
+    if mid in ("gemini-3.6-flash-high", "gemini-3.7-flash-high"):
+        logger.warning("模型 %s 已替换为 gemini-3.8-flash-high", model)
+        return "gemini-3.8-flash-high"
     return str(model or "")
 
 

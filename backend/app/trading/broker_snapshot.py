@@ -106,7 +106,7 @@ def _validate_asset(value: object) -> dict[str, Any]:
 def load_broker_snapshot(
     path: str | Path,
     *,
-    max_age_seconds: int = 60,
+    max_age_seconds: int = 120,
     now: datetime | None = None,
 ) -> BrokerSnapshot:
     """Load a complete simulation snapshot or fail closed.
@@ -172,7 +172,7 @@ def load_broker_snapshot(
 def broker_snapshot_status(
     path: str | Path,
     *,
-    max_age_seconds: int = 60,
+    max_age_seconds: int = 120,
     max_total_asset: float | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:

@@ -69,7 +69,7 @@ def test_rejects_unauthorized_snapshot_modes(tmp_path, field, value, message):
 
 def test_rejects_stale_or_future_snapshot(tmp_path):
     now = datetime.now(timezone.utc)
-    stale = valid_snapshot(now - timedelta(seconds=61))
+    stale = valid_snapshot(now - timedelta(seconds=121))
     with pytest.raises(BrokerSnapshotError, match="stale"):
         load_broker_snapshot(write_snapshot(tmp_path, stale), now=now)
 

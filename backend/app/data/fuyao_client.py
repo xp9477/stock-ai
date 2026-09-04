@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -56,6 +58,25 @@ def _ms_to_date(ms: int | float) -> str:
     return datetime.fromtimestamp(ms / 1000, tz=TZ_SH).strftime("%Y-%m-%d")
 
 
+_RATE_LOCK = threading.Lock()
+_LAST_REQUEST_TIME: float = 0.0
+MIN_REQUEST_INTERVAL: float = 0.25  # 最小请求间隔（秒），将突发限制在约 4 请求/秒
+MAX_RETRIES: int = 3
+BASE_BACKOFF_SECONDS: float = 0.5
+MAX_BACKOFF_SECONDS: float = 10.0
+
+
+def _throttle() -> None:
+    """单进程线程安全节流，抑制高频突发请求。"""
+    global _LAST_REQUEST_TIME
+    with _RATE_LOCK:
+        now = time.monotonic()
+        elapsed = now - _LAST_REQUEST_TIME
+        if elapsed < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - elapsed)
+        _LAST_REQUEST_TIME = time.monotonic()
+
+
 def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     if not available():
         raise RuntimeError("FUYAO_API_KEY 未配置")
@@ -65,8 +86,54 @@ def _get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         raise RuntimeError("扶摇数据源已禁用（设置 → 数据源）")
     to = ds.timeout_sec("fuyao", 30)
     url = f"{BASE_URL}{path}"
-    resp = requests.get(url, headers=_headers(), params=params or {}, timeout=to)
-    resp.raise_for_status()
+
+    max_retries = MAX_RETRIES
+    base_backoff = BASE_BACKOFF_SECONDS
+    max_backoff = MAX_BACKOFF_SECONDS
+
+    resp: requests.Response | None = None
+    for attempt in range(max_retries + 1):
+        _throttle()
+        try:
+            resp = requests.get(url, headers=_headers(), params=params or {}, timeout=to)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            if attempt < max_retries:
+                delay = min(base_backoff * (2 ** attempt), max_backoff)
+                logger.warning(
+                    "扶摇网络异常 path=%s err=%s 第 %d 次重试，等待 %.2f 秒",
+                    path, exc, attempt + 1, delay,
+                )
+                time.sleep(delay)
+                continue
+            raise
+
+        if resp.status_code == 429 or resp.status_code in (500, 502, 503, 504):
+            if attempt < max_retries:
+                delay = None
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            parsed = float(retry_after)
+                            if parsed > 0:
+                                delay = min(parsed, max_backoff)
+                        except (ValueError, TypeError):
+                            delay = None
+                if delay is None:
+                    delay = min(base_backoff * (2 ** attempt), max_backoff)
+                logger.warning(
+                    "扶摇请求受限或服务异常 status=%d path=%s 第 %d 次重试，等待 %.2f 秒",
+                    resp.status_code, path, attempt + 1, delay,
+                )
+                time.sleep(delay)
+                continue
+
+        resp.raise_for_status()
+        break
+
+    if resp is None:
+        raise RuntimeError(f"扶摇请求未生成响应 path={path}")
+
     body = resp.json()
     code = body.get("code")
     if code != 0:
@@ -181,35 +248,60 @@ def financial_indicators(code: str, report: str) -> dict[str, Any]:
     return out
 
 
-@ttl_cache(6 * 3600)
-def roe_history(code: str, years: int = 4) -> pd.DataFrame:
+@ttl_cache(24 * 3600)
+def roe_history(code: str, years: int = 4, limit: int | None = None) -> pd.DataFrame:
     """近若干年季报/年报 ROE，带近似公告日（用于 PIT asof）。
 
     扶摇指标接口按 report 取单期，无 ann_date；用报告期末 + 滞后期近似，
     偏保守（宁可晚用、不偷看）。
+    当指定 limit 时，只取最近已可用的 limit 个报告期，减少财务接口请求爆发。
     """
     today = date.today()
-    reports: list[str] = []
+    candidate_reports: list[tuple[str, date, date]] = []
+    lag = {1: 45, 2: 60, 3: 45, 4: 90}
+    end_md = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+
     for y in range(today.year - years, today.year + 1):
         for q in (1, 2, 3, 4):
             if y == today.year and q > (today.month - 1) // 3 + 1:
                 break
-            reports.append(f"{y}-{q}")
-
-    # 报告期结束日 + 滞后天数 → 近似可用日
-    lag = {1: 45, 2: 60, 3: 45, 4: 90}
-    end_md = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
-
-    rows = []
-    for rep in reports:
-        try:
-            y_s, q_s = rep.split("-")
-            y, q = int(y_s), int(q_s)
+            rep = f"{y}-{q}"
             m, d = end_md[q]
             end = date(y, m, d)
             ann = end + timedelta(days=lag[q])
             if ann > today + timedelta(days=30):
                 continue
+            candidate_reports.append((rep, end, ann))
+
+    if not candidate_reports:
+        return pd.DataFrame()
+
+    if limit is not None and limit > 0:
+        rows = []
+        for rep, end, ann in reversed(candidate_reports):
+            try:
+                ind = financial_indicators(code, rep)
+                if ind.get("roe") is None:
+                    continue
+                rows.append({
+                    "ann_date": ann.strftime("%Y%m%d"),
+                    "end_date": end.strftime("%Y%m%d"),
+                    "report": rep,
+                    "roe": ind["roe"],
+                    "roa": ind.get("roa"),
+                })
+                if len(rows) >= limit:
+                    break
+            except Exception as err:  # noqa: BLE001
+                logger.debug("roe %s %s: %s", code, rep, err)
+                continue
+        if not rows:
+            return pd.DataFrame()
+        return pd.DataFrame(rows).sort_values("ann_date").reset_index(drop=True)
+
+    rows = []
+    for rep, end, ann in candidate_reports:
+        try:
             ind = financial_indicators(code, rep)
             if ind.get("roe") is None:
                 continue
